@@ -6,6 +6,7 @@ export class AuthResponseDto {
     name: string;
     email: string;
     role: UserRole;
+    balance: number;
     createdAt: Date;
     updatedAt: Date;
   };
@@ -17,6 +18,7 @@ export class UserResponseDto {
   name: string;
   email: string;
   role: UserRole;
+  balance: number;
   createdAt: Date;
   updatedAt: Date;
 }

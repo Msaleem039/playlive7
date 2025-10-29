@@ -38,6 +38,7 @@ export class UsersController {
       name: updatedUser.name,
       email: updatedUser.email,
       role: updatedUser.role,
+      balance: updatedUser.balance,
       createdAt: updatedUser.createdAt,
       updatedAt: updatedUser.updatedAt,
     };

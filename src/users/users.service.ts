@@ -19,11 +19,20 @@ export class UsersService {
     });
   }
 
+  async findByRole(role: UserRole): Promise<User | null> {
+    return this.prisma.user.findFirst({
+      where: { role },
+    });
+  }
+
   async create(data: {
     name: string;
     email: string;
     password: string;
     role?: UserRole;
+    balance?: number;
+    parentId?: string;
+    commissionPercentage?: number;
   }): Promise<User> {
     return this.prisma.user.create({
       data,
@@ -37,6 +46,13 @@ export class UsersService {
     });
   }
 
+  async updateCommission(id: string, commissionPercentage: number): Promise<User> {
+    return this.prisma.user.update({
+      where: { id },
+      data: { commissionPercentage },
+    });
+  }
+
   async getCurrentUser(id: string): Promise<UserResponseDto> {
     const user = await this.prisma.user.findUnique({
       where: { id },
@@ -45,6 +61,7 @@ export class UsersService {
         name: true,
         email: true,
         role: true,
+        balance: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -64,6 +81,7 @@ export class UsersService {
         name: true,
         email: true,
         role: true,
+        balance: true,
         createdAt: true,
         updatedAt: true,
       },
