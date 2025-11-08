@@ -151,3 +151,20 @@ enum TransferStatus {
   FAILED
   CANCELLED
 }
+
+enum TransferLogType {
+  TOPUP
+  TOPDOWN
+}
+
+model TransferLog {
+  id        String          @id @default(cuid())
+  fromUserId String
+  toUserId   String
+  amount     Float
+  remarks    String?
+  type       TransferLogType
+  createdAt  DateTime       @default(now())
+
+  @@map("transfer_logs")
+}

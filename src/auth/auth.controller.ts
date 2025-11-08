@@ -1,6 +1,5 @@
-import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Req } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
@@ -14,11 +13,6 @@ import type { User } from '@prisma/client';
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
-
-  @Post('register')
-  async register(@Body(ValidationPipe) registerDto: RegisterDto): Promise<AuthResponseDto> {
-    return this.authService.register(registerDto);
-  }
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
@@ -87,26 +81,12 @@ export class AuthController {
       ]
     };
   }
-
-  /**
-   * Create initial SuperAdmin (public endpoint for setup)
-   * Only works if no SuperAdmin exists in the system
-   */
-  @Post('create-superadmin')
-  async createSuperAdmin(@Body(ValidationPipe) createUserDto: CreateUserDto): Promise<AuthResponseDto> {
-    return this.authService.createSuperAdmin(createUserDto);
-  }
-
-  /**
-   * Create additional SuperAdmin (requires existing SuperAdmin)
-   */
-  @Post('create-additional-superadmin')
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.SUPER_ADMIN)
-  async createAdditionalSuperAdmin(
-    @Body(ValidationPipe) createUserDto: CreateUserDto,
-    @CurrentUser() currentUser: User,
-  ): Promise<AuthResponseDto> {
-    return this.authService.createUser(createUserDto, currentUser);
+  
+  @Get('subordinates')
+  @UseGuards(JwtAuthGuard)
+  async getSubordinates(@CurrentUser() currentUser: User) {
+    return this.authService.getSubordinates(currentUser.id);
   }
 }
+
+

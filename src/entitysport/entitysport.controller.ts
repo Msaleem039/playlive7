@@ -21,11 +21,16 @@ export class EntitySportController {
     @Query('page') page?: number,
     @Query('per_page') per_page?: number,
   ) {
-    const args: Record<string, any> = {};
-    if (page) args.page = page;
-    if (per_page) args.per_page = per_page;
-    
-    return this.entitySportService.getMatchesWithArgs(mid, args);
+    // If a specific match id is requested, keep existing behavior
+    if (mid) {
+      const args: Record<string, any> = {};
+      if (page) args.page = page;
+      if (per_page) args.per_page = per_page;
+      return this.entitySportService.getMatchesWithArgs(mid, args);
+    }
+
+    // Otherwise, return combined live + upcoming matches
+    return this.entitySportService.getCombinedMatches();
   }
 
   @Get('matches/live-ids')

@@ -66,86 +66,88 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
     try {
       const wsUrl = `ws://webhook.entitysport.com:8087/connect?token=${this.API_TOKEN}`;
       this.logger.log(`🔌 Connecting to EntitySport WebSocket: ${wsUrl}`);
-      // console.log("🔌 DEBUG: Connecting to EntitySport WebSocket: ", wsUrl);
-      // console.log("🔌 DEBUG: API Token being used: ", this.API_TOKEN);
-      
-      this.entitySportWebSocket = new WebSocket(wsUrl);
-      
-      this.entitySportWebSocket.on('open', () => {
-        this.logger.log('✅ Connected to EntitySport WebSocket');
-        console.log("✅ DEBUG: WebSocket connection established successfully");
-        this.reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-      
-        // ✅ SUBSCRIBE TO LIVE MATCHES DYNAMICALLY
-        this.subscribeToLiveMatches();
+  
+      // ✅ Add Origin header — required for successful connection
+      this.entitySportWebSocket = new WebSocket(wsUrl, {
+        headers: {
+          Origin: 'https://postman.com', // Works because Postman sets a similar Origin
+        },
       });
-
+  
+      // ✅ On successful connection
+      this.entitySportWebSocket.on('open', async () => {
+        this.logger.log('✅ Connected to EntitySport WebSocket');
+        console.log('✅ DEBUG: WebSocket connection established successfully');
+        this.reconnectAttempts = 0; // Reset reconnect attempts
+  
+        // 💓 Start heartbeat ping every 20s to keep connection alive
+        const heartbeatInterval = setInterval(() => {
+          if (this.entitySportWebSocket?.readyState === WebSocket.OPEN) {
+            this.entitySportWebSocket.ping();
+            // console.log('💓 DEBUG: Sent ping to EntitySport WebSocket');
+          } else {
+            clearInterval(heartbeatInterval);
+          }
+        }, 20000);
+  
+        // ✅ Subscribe to live matches dynamically
+        await this.subscribeToLiveMatches();
+      });
+  
+      // ✅ When a message is received
       this.entitySportWebSocket.on('message', (data: WebSocket.Data) => {
         try {
           const rawData = data.toString();
-          // console.log("📡 DEBUG: Raw WebSocket data received:", rawData);
-          // console.log("📡 DEBUG: Data length:", rawData.length);
-          
           const message = JSON.parse(rawData);
-          // console.log("📡 DEBUG: Parsed WebSocket message:", JSON.stringify(message, null, 2));
-          
-          this.logger.log('📡 Received real-time data from EntitySport WebSocket');
-          // console.log("📡 DEBUG: Message type:", message.type || 'unknown');
-          // console.log("📡 DEBUG: Message keys:", Object.keys(message));
-          
-          // Check if this is live match data
-          // if (message.match_id) {
-          //   console.log("📡 DEBUG: Live match data detected for match ID:", message.match_id);
-          // }
-          
-          // if (message.odds) {
-          //   console.log("📡 DEBUG: Odds data detected:", message.odds);
-          // }
-          
-          // if (message.score) {
-          //   console.log("📡 DEBUG: Score data detected:", message.score);
-          // }
-          
-          // Broadcast the real-time data to connected clients
+          // console.log('📡 DEBUG: Parsed WebSocket message:', message);
+  
+          // Broadcast to all connected WebSocket clients
           this.entitySportGateway.broadcastLiveUpdate('entitySportRealtimeData', {
             timestamp: new Date().toISOString(),
             data: message,
-            source: 'websocket'
+            source: 'websocket',
           });
-          
-          console.log("📡 DEBUG: Data broadcasted to WebSocket clients");
+  
+          // Cache/update live match snapshot for combined endpoint
+          this.cacheLiveUpdateSnapshot(message).catch((err) =>
+            this.logger.error('Error caching live update snapshot', err),
+          );
+
+          console.log('📡 DEBUG: Data broadcasted to WebSocket clients');
         } catch (error) {
           this.logger.error('Error parsing EntitySport WebSocket message:', error);
-          console.log("❌ DEBUG: Error parsing WebSocket message:", error);
-          console.log("❌ DEBUG: Raw data that failed to parse:", data.toString());
+          // console.log('❌ DEBUG: Error parsing WebSocket message:', error);
+          // console.log('❌ DEBUG: Raw data that failed to parse:', data.toString());
         }
       });
-
-      // this.entitySportWebSocket.on('error', (error: WebSocketError) => {
-      //   this.logger.error('EntitySport WebSocket error:', error);
-      //   console.log("❌ DEBUG: WebSocket error occurred:", error);
-      //   console.log("❌ DEBUG: Error details:", {
-      //     message: error.message,
-      //     code: error.code,
-      //     type: error.type
-      //   });
-      //   this.handleWebSocketReconnect();
-      // });
-
-      // this.entitySportWebSocket.on('close', (code, reason) => {
-      //   this.logger.warn(`EntitySport WebSocket closed. Code: ${code}, Reason: ${reason}`);
-      //   console.log("⚠️ DEBUG: WebSocket connection closed");
-      //   console.log("⚠️ DEBUG: Close code:", code);
-      //   console.log("⚠️ DEBUG: Close reason:", reason);
-      //   this.handleWebSocketReconnect();
-      // });
-
+  
+      // ✅ Error handling
+      this.entitySportWebSocket.on('error', (error: WebSocketError) => {
+        this.logger.error('❌ EntitySport WebSocket error:', error.message || error);
+        console.log('❌ DEBUG: WebSocket error occurred:', error);
+        this.handleWebSocketReconnect();
+      });
+  
+      // ✅ Handle disconnection & auto-reconnect
+      this.entitySportWebSocket.on('close', (code, reason) => {
+        this.logger.warn(`⚠️ EntitySport WebSocket closed (Code: ${code}) Reason: ${reason}`);
+        console.log('⚠️ DEBUG: WebSocket connection closed. Reconnecting soon...');
+        this.handleWebSocketReconnect();
+      });
+  
+      // ✅ Log unexpected handshake failures
+      this.entitySportWebSocket.on('unexpected-response', (req, res) => {
+        this.logger.error(`⚠️ Unexpected WS response: ${res.statusCode}`);
+        console.log('⚠️ DEBUG: Unexpected WebSocket response:', res.statusCode);
+      });
+  
     } catch (error) {
-      this.logger.error('Failed to connect to EntitySport WebSocket:', error);
-      console.log("❌ DEBUG: Failed to create WebSocket connection:", error);
+      this.logger.error('❌ Failed to connect to EntitySport WebSocket:', error);
+      console.log('❌ DEBUG: Failed to create WebSocket connection:', error);
       this.handleWebSocketReconnect();
     }
   }
+  
 
   private handleWebSocketReconnect() {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
@@ -190,13 +192,13 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
         console.log("📡 DEBUG: Sending subscription message:", subscribeMessage);
         this.entitySportWebSocket?.send(subscribeMessage);
         this.logger.log(`📡 Subscribed to live match: ${matchId}`);
-        console.log("📡 DEBUG: Subscription message sent for match ID:", matchId);
+        // console.log("📡 DEBUG: Subscription message sent for match ID:", matchId);
       }
       
       this.logger.log(`📡 Successfully subscribed to ${liveMatchIds.length} live matches`);
     } catch (error) {
       this.logger.error(`Error subscribing to live matches: ${error.message}`);
-      console.log("❌ DEBUG: Error subscribing to live matches:", error.message);
+      // console.log("❌ DEBUG: Error subscribing to live matches:", error.message);
     }
   }
 
@@ -214,7 +216,7 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
       
       if (data.response && data.response.items) {
         const liveMatchIds = data.response.items.map((match: any) => match.match_id);
-        console.log("🎯 DEBUG: Found live match IDs:", liveMatchIds);
+        // console.log("🎯 DEBUG: Found live match IDs:", liveMatchIds);
         this.logger.log(`Found ${liveMatchIds.length} live matches: ${liveMatchIds.join(', ')}`);
         return liveMatchIds;
       }
@@ -223,7 +225,7 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
       return [];
     } catch (error) {
       this.logger.error(`Error fetching live match IDs: ${error.message}`);
-      console.log("❌ DEBUG: Error fetching live match IDs:", error.message);
+      // console.log("❌ DEBUG: Error fetching live match IDs:", error.message);
       return [];
     }
   }
@@ -241,8 +243,8 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
       
       if (cachedData) {
         this.logger.log(`📦 Using cached live matches data`);
-        console.log("📦 DEBUG: Using cached data for live matches");
-        console.log("📦 DEBUG: Cached data keys:", Object.keys(cachedData));
+        // console.log("📦 DEBUG: Using cached data for live matches");
+        // console.log("📦 DEBUG: Cached data keys:", Object.keys(cachedData));
         
         // Broadcast cached data
         this.entitySportGateway.broadcastLiveUpdate('entitySportLiveData', {
@@ -255,7 +257,7 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
 
       // Cache miss - fetch from API
       this.logger.log(`🔄 Cache miss - fetching live matches from EntitySport API`);
-      console.log("🔄 DEBUG: Cache miss - fetching from EntitySport API");
+      // console.log("🔄 DEBUG: Cache miss - fetching from EntitySport API");
       
       const url = `${this.BASE_URL}/matches/`;
       const params = { 
@@ -268,9 +270,9 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
       
       const { data } = await firstValueFrom(this.httpService.get(url, { params }));
 
-      console.log("✅ DEBUG: API response received");
-      console.log("✅ DEBUG: Response status:", data.status);
-      console.log("✅ DEBUG: Response keys:", Object.keys(data));
+      // console.log("✅ DEBUG: API response received");
+      // console.log("✅ DEBUG: Response status:", data.status);
+      // console.log("✅ DEBUG: Response keys:", Object.keys(data));
 
       // Cache the data
       await this.redisService.set(cacheKey, data, cacheTTL);
@@ -408,6 +410,81 @@ export class EntitySportService implements OnModuleInit, OnModuleDestroy {
         }
       };
     }
+  }
+
+  // ✅ Cache a normalized live update snapshot for quick retrieval
+  private async cacheLiveUpdateSnapshot(message: any) {
+    try {
+      const cacheKey = 'cricket:matches:live_updates';
+      const ttlSeconds = 30;
+
+      // Normalize message into an array of match snapshots
+      // Attempt to detect a match identifier in common shapes
+      const extractMatchId = (obj: any): number | null => {
+        if (!obj || typeof obj !== 'object') return null;
+        if (obj.match_id) return Number(obj.match_id);
+        if (obj.matchId) return Number(obj.matchId);
+        if (obj.data?.match_id) return Number(obj.data.match_id);
+        if (obj.data?.matchId) return Number(obj.data.matchId);
+        return null;
+      };
+
+      const current = (await this.redisService.get<any[]>(cacheKey)) || [];
+
+      const updateItems: any[] = Array.isArray(message?.response?.items)
+        ? message.response.items
+        : Array.isArray(message)
+          ? message
+          : [message];
+
+      let updated = [...current];
+      for (const item of updateItems) {
+        const matchId = extractMatchId(item);
+        if (!matchId) continue;
+        const idx = updated.findIndex((m) => Number(m.match_id || m.matchId) === matchId);
+        if (idx >= 0) {
+          updated[idx] = { ...updated[idx], ...item, match_id: matchId };
+        } else {
+          updated.push({ ...item, match_id: matchId });
+        }
+      }
+
+      await this.redisService.set(cacheKey, updated, ttlSeconds);
+    } catch (err) {
+      this.logger.error('Failed to cache live update snapshot', err);
+    }
+  }
+
+  // ✅ Get upcoming matches
+  private async getUpcomingMatches(): Promise<any[]> {
+    const data = await this.makeRequest('matches', { status: '3' }, 120);
+    const items = data?.response?.items;
+    return Array.isArray(items) ? items : [];
+  }
+
+  // ✅ Get live matches from cache (prefer live_updates, fallback to live list)
+  private async getCachedLiveMatches(): Promise<any[]> {
+    const updates = await this.redisService.get<any[]>('cricket:matches:live_updates');
+    if (Array.isArray(updates) && updates.length > 0) return updates;
+
+    const liveResponse = await this.redisService.get<any>('cricket:matches:live');
+    const items = liveResponse?.response?.items;
+    return Array.isArray(items) ? items : [];
+  }
+
+  // ✅ Public method: combined live + upcoming
+  async getCombinedMatches() {
+    const [live, upcoming] = await Promise.all([
+      this.getCachedLiveMatches(),
+      this.getUpcomingMatches(),
+    ]);
+
+    return {
+      success: true,
+      total: (live?.length || 0) + (upcoming?.length || 0),
+      live,
+      upcoming,
+    };
   }
 
   // ✅ Example endpoints similar to EntitySport methods

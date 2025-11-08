@@ -6,12 +6,13 @@ import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { AdminModule } from './admin/admin.module';
-import { TransferModule } from './transfer/transfer.module';
+
 import { RolesModule } from './roles/roles.module';
 import { BettingGateway } from './betting/betting.gateway';
 import { EntitySportModule } from './entitysport/entitysport.module';
 import { BetfairController } from './betting/beffair.controller';
 import { RedisModule } from './redis/redis.module';
+import { BalanceTransferModule } from './balancetransfer/balancetransfer.module';
 
 @Module({
   imports: [
@@ -23,10 +24,11 @@ import { RedisModule } from './redis/redis.module';
     AuthModule,
     UsersModule,
     AdminModule,
-    TransferModule,
+
     RolesModule,
     EntitySportModule,
     RedisModule,
+    BalanceTransferModule,
   ],
   controllers: [AppController, BetfairController],
   providers: [AppService, BettingGateway],

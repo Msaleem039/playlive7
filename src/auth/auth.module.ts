@@ -5,13 +5,13 @@ import { ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { UsersModule } from '../users/users.module';
-import { TransferModule } from '../transfer/transfer.module';
+import { PrismaModule } from '../prisma/prisma.module';
 import { JwtStrategy } from './jwt.strategy';
 
 @Module({
   imports: [
     UsersModule, // Import UsersModule to access UsersService
-    TransferModule, // Import TransferModule to access TransferService
+    PrismaModule, // Import PrismaModule to access PrismaService
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => ({
