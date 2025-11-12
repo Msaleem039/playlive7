@@ -1,4 +1,4 @@
-import { Controller, Get, UseGuards, Patch, Body, Param, ParseEnumPipe } from '@nestjs/common';
+import { Controller, Get, UseGuards, Patch, Body, Param, ParseEnumPipe, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -25,6 +25,30 @@ export class UsersController {
     return this.usersService.getAllUsers();
   }
 
+  @Get(':id')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getUserById(
+    @Param('id') id: string,
+    @CurrentUser() currentUser: User,
+  ) {
+    const user = await this.usersService.getUserDetail(id);
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (currentUser.role === UserRole.AGENT && user.parentId !== currentUser.id) {
+      throw new ForbiddenException('You do not have access to this user');
+    }
+
+    if (currentUser.role === UserRole.ADMIN && user.role === UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('You do not have access to this user');
+    }
+
+    return user;
+  }
+
   @Patch(':id/role')
   @UseGuards(RolesGuard)
   @Roles(UserRole.SUPER_ADMIN)
@@ -36,7 +60,7 @@ export class UsersController {
     return {
       id: updatedUser.id,
       name: updatedUser.name,
-      email: updatedUser.email,
+      username: updatedUser.username,
       role: updatedUser.role,
       balance: updatedUser.balance,
       createdAt: updatedUser.createdAt,

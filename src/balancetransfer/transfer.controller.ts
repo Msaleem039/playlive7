@@ -2,6 +2,7 @@
 import {
   Controller,
   Post,
+  Get,
   Param,
   Body,
   UseGuards,
@@ -35,6 +36,12 @@ export class BalanceTransferController {
     @CurrentUser() currentUser: User,
   ) {
     return this.transferService.topDownBalance(currentUser, targetUserId, dto);
+  }
+
+  // 📊 Dashboard summary endpoint
+  @Get('dashboard-summary')
+  async getDashboardSummary(@CurrentUser() currentUser: User) {
+    return this.transferService.getDashboardSummary(currentUser);
   }
 }
 

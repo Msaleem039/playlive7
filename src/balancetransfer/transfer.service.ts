@@ -165,5 +165,93 @@ import {
   
       throw new ForbiddenException('Clients are not allowed to perform this action');
     }
+
+    // =======================================================
+    // 📊 DASHBOARD SUMMARY FOR CURRENT USER
+    // =======================================================
+    async getDashboardSummary(currentUser: User) {
+      const userId = currentUser.id;
+
+      // 1️⃣ Get subordinates
+      type Subordinate = {
+        id: string;
+        username: string;
+        role: UserRole;
+        balance: number;
+      };
+
+      const subordinates = await this.prisma.user.findMany({
+        where: { parentId: userId },
+        select: {
+          id: true,
+          username: true,
+          role: true,
+          balance: true,
+        },
+      }) as Subordinate[];
+
+      const subordinateIds = subordinates.map(s => s.id);
+
+      // 2️⃣ Get transfer logs where current user is involved
+      const transfers = await this.prisma.transferLog.findMany({
+        where: {
+          OR: [
+            { fromUserId: userId },
+            { toUserId: userId },
+            { fromUserId: { in: subordinateIds } },
+            { toUserId: { in: subordinateIds } },
+          ],
+        },
+      });
+
+      // 3️⃣ Calculate total deposit (TOPUP done by this user)
+      const totalDeposit = transfers
+        .filter(t => t.type === 'TOPUP' && t.fromUserId === userId)
+        .reduce((sum, t) => sum + t.amount, 0);
+
+      // 4️⃣ Calculate total withdraw (TOPDOWN initiated by this user)
+      const totalWithdraw = transfers
+        .filter(t => t.type === 'TOPDOWN' && t.toUserId === userId)
+        .reduce((sum, t) => sum + t.amount, 0);
+
+      // 5️⃣ Client Balance (sum of all direct clients' balances)
+      const clientBalance = subordinates
+        .filter(s => s.role === UserRole.CLIENT)
+        .reduce((sum, s) => sum + s.balance, 0);
+
+      // 6️⃣ Total exposure (can be computed later — 0 for now)
+      const totalExposure = 0;
+
+      // 7️⃣ User count by role
+      const userCountByRole = Object.entries(
+        subordinates.reduce((acc, s) => {
+          acc[s.role] = (acc[s.role] || 0) + 1;
+          return acc;
+        }, {} as Record<UserRole, number>)
+      ).map(([role, count]) => ({ role, count }));
+
+      // 8️⃣ Active clients (placeholder logic)
+      const totalActiveClient = userCountByRole.find(r => r.role === UserRole.CLIENT)?.count || 0;
+
+      // 9️⃣ Top 5 winning / losing players (optional placeholders)
+      const topWinningPlayers = [];
+      const topLosingPlayers = [];
+
+      // 🔟 Top 5 markets (optional placeholders)
+      const topWinningMarkets = [];
+      const topLosingMarkets = [];
+
+      return {
+        totalDeposit,
+        totalWithdraw,
+        clientBalance,
+        totalExposure,
+        userCount: userCountByRole,
+        totalActiveClient,
+        topWinningPlayers,
+        topLosingPlayers,
+        topWinningMarkets,
+        topLosingMarkets,
+      };
+    }
   }
-  

@@ -3,6 +3,18 @@ import { PrismaService } from '../prisma/prisma.service';
 import { User, UserRole } from '@prisma/client';
 import { UserResponseDto } from '../auth/dto/auth-response.dto';
 
+type UserDetail = {
+  id: string;
+  name: string;
+  username: string;
+  role: UserRole;
+  balance: number;
+  parentId: string | null;
+  commissionPercentage: number;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
 @Injectable()
 export class UsersService {
   constructor(private prisma: PrismaService) {}
@@ -13,9 +25,9 @@ export class UsersService {
     });
   }
 
-  async findByEmail(email: string): Promise<User | null> {
+  async findByUsername(username: string): Promise<User | null> {
     return this.prisma.user.findUnique({
-      where: { email },
+      where: { username },
     });
   }
 
@@ -27,7 +39,7 @@ export class UsersService {
 
   async create(data: {
     name: string;
-    email: string;
+    username: string;
     password: string;
     role?: UserRole;
     balance?: number;
@@ -46,6 +58,13 @@ export class UsersService {
     });
   }
 
+  async updatePassword(id: string, password: string): Promise<User> {
+    return this.prisma.user.update({
+      where: { id },
+      data: { password },
+    });
+  }
+
   async updateCommission(id: string, commissionPercentage: number): Promise<User> {
     return this.prisma.user.update({
       where: { id },
@@ -59,7 +78,7 @@ export class UsersService {
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         createdAt: true,
@@ -74,12 +93,31 @@ export class UsersService {
     return user;
   }
 
+  async getUserDetail(id: string): Promise<UserDetail | null> {
+    const result = await this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        role: true,
+        balance: true,
+        parentId: true,
+        commissionPercentage: true,
+        createdAt: true,
+        updatedAt: true,
+      } as any,
+    });
+
+    return result as UserDetail | null;
+  }
+
   async getAllUsers(): Promise<UserResponseDto[]> {
     return this.prisma.user.findMany({
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         createdAt: true,

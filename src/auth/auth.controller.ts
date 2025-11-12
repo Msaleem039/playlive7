@@ -1,7 +1,8 @@
-import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Patch } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -30,9 +31,9 @@ export class AuthController {
    * - AGENT: can create CLIENT
    * - CLIENT: cannot create users
    * 
-   * @example Create Admin: { "name": "John", "email": "john@example.com", "password": "Secret123!", "role": "ADMIN", "commissionPercentage": 15 }
-   * @example Create Agent: { "name": "Jane", "email": "jane@example.com", "password": "Secret123!", "role": "AGENT", "commissionPercentage": 20 }
-   * @example Create Client: { "name": "Bob", "email": "bob@example.com", "password": "Secret123!", "role": "CLIENT" }
+   * @example Create Admin: { "name": "John", "username": "johnadmin", "password": "Secret123!", "role": "ADMIN", "commissionPercentage": 15 }
+   * @example Create Agent: { "name": "Jane", "username": "janeagent", "password": "Secret123!", "role": "AGENT", "commissionPercentage": 20 }
+   * @example Create Client: { "name": "Bob", "username": "bobclient", "password": "Secret123!", "role": "CLIENT" }
    */
   @Post('create-user')
   @UseGuards(JwtAuthGuard, RolesGuard)
@@ -42,6 +43,15 @@ export class AuthController {
     @CurrentUser() currentUser: User,
   ): Promise<AuthResponseDto> {
     return this.authService.createUser(createUserDto, currentUser);
+  }
+
+  @Patch('change-password')
+  @UseGuards(JwtAuthGuard)
+  async changePassword(
+    @CurrentUser() currentUser: User,
+    @Body(ValidationPipe) changePasswordDto: ChangePasswordDto,
+  ) {
+    return this.authService.changePassword(currentUser.id, changePasswordDto);
   }
 
   /**
@@ -72,7 +82,7 @@ export class AuthController {
       unifiedEndpoint: {
         url: 'POST /auth/create-user',
         description: 'Single endpoint to create users with any role',
-        requiredFields: ['name', 'email', 'password', 'role'],
+        requiredFields: ['name', 'username', 'password', 'role'],
         optionalFields: ['balance', 'commissionPercentage']
       },
       deprecatedEndpoints: [

@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { UserRole, type User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
@@ -17,10 +18,10 @@ export class AuthService {
   ) {}
 
   async login(loginDto: LoginDto): Promise<AuthResponseDto> {
-    const { email, password } = loginDto;
+    const { username, password } = loginDto;
 
-    // Find user by email
-    const user = await this.usersService.findByEmail(email);
+    // Find user by username
+    const user = await this.usersService.findByUsername(username);
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
@@ -39,7 +40,7 @@ export class AuthService {
       user: {
         id: user.id,
         name: user.name,
-        email: user.email,
+        username: (user as any).username,
         role: user.role,
         balance: user.balance,
         createdAt: user.createdAt,
@@ -47,6 +48,25 @@ export class AuthService {
       },
       accessToken,
     };
+  }
+
+  async changePassword(userId: string, changePasswordDto: ChangePasswordDto): Promise<{ message: string }> {
+    const { currentPassword, newPassword } = changePasswordDto;
+
+    const user = await this.usersService.findById(userId);
+    if (!user) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
+    if (!isCurrentPasswordValid) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await this.usersService.updatePassword(userId, hashedPassword);
+
+    return { message: 'Password updated successfully' };
   }
 
   // Role hierarchy validation
@@ -66,7 +86,7 @@ export class AuthService {
     console.log('createUser called with:', { createUserDto, creator });
     
     try {
-      const { name, email, password, role, balance, initialBalance, commissionPercentage } = createUserDto;
+      const { name, username, password, role, balance, initialBalance, commissionPercentage } = createUserDto;
       const resolvedBalance = (typeof balance === 'number' ? balance : undefined) ?? (typeof initialBalance === 'number' ? initialBalance : undefined) ?? 0;
 
       // Check if creator can create this role
@@ -84,11 +104,11 @@ export class AuthService {
       }
 
       // Check if user already exists
-      console.log('Checking if user exists with email:', email);
-      const existingUser = await this.usersService.findByEmail(email);
+      console.log('Checking if user exists with username:', username);
+      const existingUser = await this.usersService.findByUsername(username);
       if (existingUser) {
         console.log('User already exists:', existingUser);
-        throw new ConflictException('User with this email already exists');
+        throw new ConflictException('User with this username already exists');
       }
 
       // Hash password
@@ -101,7 +121,7 @@ export class AuthService {
         console.log('Creating SuperAdmin without hierarchy...');
         user = await this.usersService.create({
           name,
-          email,
+          username,
           password: hashedPassword,
           role: UserRole.SUPER_ADMIN,
           balance: resolvedBalance,
@@ -113,7 +133,7 @@ export class AuthService {
         console.log('Creating user with hierarchy...');
         user = await this.usersService.create({
           name,
-          email,
+          username,
           password: hashedPassword,
           role,
           balance: resolvedBalance,
@@ -132,7 +152,7 @@ export class AuthService {
         user: {
           id: user.id,
           name: user.name,
-          email: user.email,
+          username: (user as any).username,
           role: user.role,
           balance: user.balance,
           createdAt: user.createdAt,
@@ -153,12 +173,12 @@ export class AuthService {
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         createdAt: true,
         updatedAt: true,
-      },
+      } as any,
     });
   }
 
@@ -168,13 +188,13 @@ export class AuthService {
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         parentId: true,
         createdAt: true,
         updatedAt: true,
-      },
+      } as any,
     });
   }
 
@@ -184,14 +204,14 @@ export class AuthService {
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         parentId: true,
         commissionPercentage: true,
         createdAt: true,
         updatedAt: true,
-      },
+      } as any,
       orderBy: {
         createdAt: 'desc',
       },

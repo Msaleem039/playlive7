@@ -17,7 +17,7 @@ export class AdminController {
       user: {
         id: user.id,
         name: user.name,
-        email: user.email,
+        username: user.username,
         role: user.role,
       },
       timestamp: new Date().toISOString(),
@@ -32,7 +32,7 @@ export class AdminController {
       user: {
         id: user.id,
         name: user.name,
-        email: user.email,
+        username: user.username,
         role: user.role,
       },
       timestamp: new Date().toISOString(),

@@ -1,4 +1,4 @@
-import { IsEmail, IsString, MinLength, MaxLength, IsOptional, IsEnum, IsNumber, Min } from 'class-validator';
+import { IsString, MinLength, MaxLength, IsOptional, IsEnum, IsNumber, Min } from 'class-validator';
 import { UserRole } from '@prisma/client';
 
 export class RegisterDto {
@@ -7,8 +7,10 @@ export class RegisterDto {
   @MaxLength(50)
   name: string;
 
-  @IsEmail()
-  email: string;
+  @IsString()
+  @MinLength(3)
+  @MaxLength(30)
+  username: string;
 
   @IsString()
   @MinLength(6)

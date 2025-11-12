@@ -10,7 +10,7 @@ import {
   ValidationPipe,
   ParseIntPipe
 } from '@nestjs/common';
-import { IsString, IsEmail, IsOptional, IsNumber, Min, Max } from 'class-validator';
+import { IsString, IsOptional, IsNumber, Min, Max, MinLength, MaxLength } from 'class-validator';
 import { TransferService } from '../transfer/transfer.service';
 import { UsersService } from '../users/users.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -24,8 +24,10 @@ export class CreateClientDto {
   @IsString()
   name: string;
 
-  @IsEmail()
-  email: string;
+  @IsString()
+  @MinLength(3)
+  @MaxLength(30)
+  username: string;
 
   @IsString()
   password: string;
@@ -74,7 +76,7 @@ export class AgentController {
   ) {
     return this.transferService.createUserWithHierarchy(currentUser.id, {
       name: createClientDto.name,
-      email: createClientDto.email,
+      username: createClientDto.username,
       password: createClientDto.password,
       role: UserRole.CLIENT,
       commissionPercentage: createClientDto.commissionPercentage

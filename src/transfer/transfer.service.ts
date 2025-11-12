@@ -11,7 +11,7 @@ export class TransferService {
       select: {
         id: true,
         name: true,
-        email: true,
+        username: true,
         role: true,
         balance: true,
         parentId: true,
@@ -54,7 +54,7 @@ export class TransferService {
 
   async createUserWithHierarchy(parentId: string, data: {
     name: string;
-    email: string;
+    username: string;
     password: string;
     role: string;
     commissionPercentage?: number;
