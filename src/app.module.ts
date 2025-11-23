@@ -9,7 +9,7 @@ import { AdminModule } from './admin/admin.module';
 
 import { RolesModule } from './roles/roles.module';
 import { BettingGateway } from './betting/betting.gateway';
-import { EntitySportModule } from './entitysport/entitysport.module';
+import { CricketIdModule } from './cricketid/cricketid.module';
 import { BetfairController } from './betting/beffair.controller';
 import { RedisModule } from './redis/redis.module';
 import { BalanceTransferModule } from './balancetransfer/balancetransfer.module';
@@ -26,7 +26,7 @@ import { BalanceTransferModule } from './balancetransfer/balancetransfer.module'
     AdminModule,
 
     RolesModule,
-    EntitySportModule,
+    CricketIdModule,
     RedisModule,
     BalanceTransferModule,
   ],
