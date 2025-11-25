@@ -11,9 +11,18 @@ import { Server, Socket } from 'socket.io';
 import { Logger } from '@nestjs/common';
 import { CricketIdService } from './cricketid.service';
 
-@WebSocketGateway({ cors: true })
+@WebSocketGateway({
+  cors: {
+    origin: '*', // Allow all origins in production, or specify your frontend URL
+    credentials: true,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['*'],
+  },
+  transports: ['websocket', 'polling'], // Support both transports
+})
 export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
-  @WebSocketServer() server: Server;
+  @WebSocketServer() 
+  public server: Server; // Make public so webhook service can access it
   private readonly logger = new Logger(OddsGateway.name);
 
   private intervals = new Map<string, NodeJS.Timeout>();

@@ -71,6 +71,19 @@ model Bet {
   matchId   String
   amount    Float
   odds      Float
+  selectionId Int?
+  betType   String?
+  betName   String?
+  marketName String?
+  marketType String?
+  gtype     String?
+  betValue  Float?
+  betRate   Float?
+  winAmount Float?
+  lossAmount Float?
+  settlementId String?
+  toReturn  Float?
+  metadata  Json?
   status    BetStatus @default(PENDING)
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt

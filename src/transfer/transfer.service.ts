@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import * as bcrypt from 'bcrypt';
 
 @Injectable()
 export class TransferService {
@@ -52,17 +53,23 @@ export class TransferService {
     });
   }
 
-  async createUserWithHierarchy(parentId: string, data: {
-    name: string;
-    username: string;
-    password: string;
-    role: string;
-    commissionPercentage?: number;
-    balance?: number;
-  }) {
+  async createUserWithHierarchy(
+    parentId: string,
+    data: {
+      name: string;
+      username: string;
+      password: string;
+      role: string;
+      commissionPercentage?: number;
+      balance?: number;
+    },
+  ) {
+    const hashedPassword = await bcrypt.hash(data.password, 10);
+
     return this.prisma.user.create({
       data: {
         ...data,
+        password: hashedPassword,
         parentId,
         role: data.role as any,
         commissionPercentage: data.commissionPercentage ?? 100,
