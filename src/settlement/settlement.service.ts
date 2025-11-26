@@ -46,7 +46,7 @@ export class SettlementService {
       };
     }
 
-    const matchResult = await this.fetchMatchResult(matchId);
+    const matchResult = await this.fetchMatchResult(matchId, pendingBets[0]);
     if (!matchResult) {
       return {
         success: false,
@@ -166,32 +166,68 @@ export class SettlementService {
     return matches.map((item) => item.matchId);
   }
 
-  private async fetchMatchResult(matchId: string) {
+  private async fetchMatchResult(matchId: string, referenceBet?: any) {
+    const matchDetails = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: {
+        homeTeam: true,
+        awayTeam: true,
+        eventId: true,
+        eventName: true,
+        marketId: true,
+        marketName: true,
+      } as any,
+    });
+
+    const payload = {
+      event_id: Number(matchDetails?.eventId ?? matchId),
+      event_name:
+        matchDetails?.eventName ??
+        (matchDetails?.homeTeam && matchDetails?.awayTeam
+          ? `${matchDetails.homeTeam} vs ${matchDetails.awayTeam}`
+          : referenceBet?.marketName ??
+            referenceBet?.betName ??
+            'Unknown Event'),
+      market_id: Number(
+        matchDetails?.marketId ??
+          referenceBet?.selectionId ??
+          referenceBet?.marketId ??
+          matchId,
+      ),
+      market_name:
+        matchDetails?.marketName ??
+        referenceBet?.marketName ??
+        referenceBet?.betName ??
+        'MATCH_ODDS',
+    };
+  
     const params = new URLSearchParams({
       key: this.apiKey,
       sid: this.apiSid,
     });
-
+  
     const url = `${this.baseUrl}/get-result?${params.toString()}`;
-
+  
     try {
-      const response = await axios.post(
-        url,
-        { match_id: matchId },
-        {
-          headers: { 'Content-Type': 'application/json' },
-        },
-      );
-
+      const response = await axios.post(url, payload, {
+        headers: { 'Content-Type': 'application/json' },
+      });
+  
       return response.data;
     } catch (error) {
-      this.logger.error(
-        `Failed to fetch result for match ${matchId}`,
-        (error as Error).stack,
-      );
+      if (axios.isAxiosError(error)) {
+        this.logger.error(
+          `Failed to fetch result for match ${matchId} - Status: ${error.response?.status} - Data: ${JSON.stringify(error.response?.data)}`,
+        );
+      } else {
+        this.logger.error(
+          `Failed to fetch result for match ${matchId} - Unknown error: ${(error as Error).stack}`,
+        );
+      }
       return null;
     }
   }
+  
 
   private determineOutcome(bet: any, winner: string) {
     const betSelection =

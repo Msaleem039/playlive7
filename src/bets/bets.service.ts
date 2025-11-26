@@ -2,7 +2,7 @@ import { HttpException, Injectable } from '@nestjs/common';
 import axios from 'axios';
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
-import { BetStatus, TransactionType } from '@prisma/client';
+import { BetStatus, MatchStatus, TransactionType } from '@prisma/client';
 
 @Injectable()
 export class BetsService {
@@ -14,17 +14,17 @@ export class BetsService {
   async selectOneRow(table: string, idField: string, userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { balance: true },
+      select: { balance: true, id: true },
     });
 
     if (!user) {
       throw new HttpException(
         {
           success: false,
-          error: 'User not found.',
+          error: `User not found. Please ensure the user with ID '${userId}' exists in the system before placing bets.`,
           code: 'USER_NOT_FOUND',
         },
-        400,
+        404,
       );
     }
 
@@ -41,10 +41,10 @@ export class BetsService {
       throw new HttpException(
         {
           success: false,
-          error: 'User not found.',
+          error: `User not found. Please ensure the user with ID '${userId}' exists in the system before placing bets.`,
           code: 'USER_NOT_FOUND',
         },
-        400,
+        404,
       );
     }
 
@@ -297,6 +297,8 @@ export class BetsService {
     }
 
     // 5. INSERT BET
+    await this.ensureMatchExists(String(match_id), market_name, bet_name);
+
     const insertResult = await this.insertBet({
       userId: userId,
       matchId: String(match_id),
@@ -355,13 +357,22 @@ export class BetsService {
         market_type: gtype,
       };
 
-      const response = await axios.post(
-        'https://api.cricketid.xyz/placed_bets?key=dijbfuwd719e12rqhfbjdqdnkqnd11&sid=4',
-        payload,
-        { headers: { 'Content-Type': 'application/json' } },
-      );
-
-      debug.external_api_response = response.data;
+      try {
+        const response = await axios.post(
+          'https://api.cricketid.xyz/placed_bets?key=dijbfuwd719e12rqhfbjdqdnkqnd11&sid=4',
+          payload,
+          { headers: { 'Content-Type': 'application/json' } },
+        );
+        debug.external_api_response = response.data;
+      } catch (error) {
+        debug.external_api_error =
+          axios.isAxiosError(error) && error.response
+            ? {
+                status: error.response.status,
+                data: error.response.data,
+              }
+            : { message: (error as Error).message };
+      }
     } else {
       debug.external_api_response = 'Skipped – already exists';
     }
@@ -437,6 +448,24 @@ export class BetsService {
           description,
         },
       });
+    });
+  }
+
+  private async ensureMatchExists(
+    matchId: string,
+    marketName?: string,
+    betName?: string,
+  ) {
+    await this.prisma.match.upsert({
+      where: { id: matchId },
+      update: {},
+      create: {
+        id: matchId,
+        homeTeam: betName ?? 'Unknown',
+        awayTeam: marketName ?? 'Unknown',
+        startTime: new Date(),
+        status: MatchStatus.LIVE,
+      },
     });
   }
 }

@@ -56,6 +56,10 @@ model Match {
   awayTeam    String
   startTime   DateTime
   status      MatchStatus @default(UPCOMING)
+  eventId     String?
+  eventName   String?
+  marketId    String?
+  marketName  String?
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
 
