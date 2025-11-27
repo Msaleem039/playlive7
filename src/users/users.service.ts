@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { User, UserRole } from '@prisma/client';
+import { User, UserRole, BetStatus } from '@prisma/client';
 import { UserResponseDto } from '../auth/dto/auth-response.dto';
 
 type UserDetail = {
@@ -124,5 +124,31 @@ export class UsersService {
         updatedAt: true,
       },
     });
+  }
+
+  async getWalletBalanceWithLiability(userId: string) {
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId },
+    });
+
+    if (!wallet) {
+      throw new NotFoundException('Wallet not found for user');
+    }
+
+    const liability = await this.prisma.bet.aggregate({
+      where: {
+        userId,
+        status: BetStatus.PENDING,
+      },
+      _sum: {
+        lossAmount: true,
+      },
+    });
+
+    return {
+      balance: wallet.balance,
+      liability: liability._sum.lossAmount ?? 0,
+      availableBalance: wallet.balance - (liability._sum.lossAmount ?? 0),
+    };
   }
 }

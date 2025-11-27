@@ -18,11 +18,41 @@ export class UsersController {
     return this.usersService.getCurrentUser(user.id);
   }
 
+  @Get('me/wallet')
+  async getMyWalletBalance(@CurrentUser() user: User) {
+    return this.usersService.getWalletBalanceWithLiability(user.id);
+  }
+
   @Get()
   @UseGuards(RolesGuard)
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
   async getAllUsers(): Promise<UserResponseDto[]> {
     return this.usersService.getAllUsers();
+  }
+
+  @Get(':id/wallet')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getUserWalletBalance(
+    @Param('id') id: string,
+    @CurrentUser() currentUser: User,
+  ) {
+    // Verify access permissions
+    if (currentUser.role === UserRole.AGENT) {
+      const user = await this.usersService.getUserDetail(id);
+      if (!user || user.parentId !== currentUser.id) {
+        throw new ForbiddenException('You do not have access to this user');
+      }
+    }
+
+    if (currentUser.role === UserRole.ADMIN) {
+      const user = await this.usersService.getUserDetail(id);
+      if (!user || user.role === UserRole.SUPER_ADMIN) {
+        throw new ForbiddenException('You do not have access to this user');
+      }
+    }
+
+    return this.usersService.getWalletBalanceWithLiability(id);
   }
 
   @Get(':id')

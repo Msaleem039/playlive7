@@ -268,11 +268,10 @@ export class SettlementService {
     });
 
     await tx.wallet.update({
-      where: { id: wallet.id },
+      where: { userId },
       data: {
-        balance: {
-          increment: profitLoss,
-        },
+        liability: { decrement: Math.abs(profitLoss) }, // clear exposure
+        balance: { increment: profitLoss },             // win/loss applied
       },
     });
 

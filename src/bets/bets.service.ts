@@ -2,7 +2,7 @@ import { HttpException, Injectable } from '@nestjs/common';
 import axios from 'axios';
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
-import { BetStatus, MatchStatus, TransactionType } from '@prisma/client';
+import { BetStatus, MatchStatus, Prisma, TransactionType } from '@prisma/client';
 
 @Injectable()
 export class BetsService {
@@ -234,11 +234,14 @@ export class BetsService {
     const avl_limit = allowed_exp - allowed_exposure;
 
     if (normalizedLossAmount > avl_limit) {
-      return {
-        success: false,
-        error: 'Exposure Limit crossed.',
-        code: 'ACCOUNT_LOCKED',
-      };
+      throw new HttpException(
+        {
+          success: false,
+          error: 'Exposure Limit crossed.',
+          code: 'ACCOUNT_LOCKED',
+        },
+        400,
+      );
     }
 
     debug.wallet_balance = wallet_balance;
@@ -279,24 +282,47 @@ export class BetsService {
 
     debug.required_amount = required_amount;
 
-    // 4. WALLET PENDING EXPOSURE
+    // 4. WALLET & LIABILITY CHECK
+    let wallet = await this.prisma.wallet.findUnique({ where: { userId } });
+    if (!wallet) {
+      wallet = await this.prisma.wallet.create({
+        data: {
+          userId,
+          balance: wallet_balance,
+          liability: 0,
+        },
+      });
+    }
+
     const pending_exposure = await this.get_total_pending_exposure(userId);
-    const available_wallet = wallet_balance - pending_exposure;
 
     debug.pending_exposure = pending_exposure;
+    debug.wallet_balance = wallet.balance;
+    debug.wallet_liability = wallet.liability ?? 0;
 
-    if (available_wallet < required_amount) {
+    if (wallet.balance < required_amount) {
       return {
         success: false,
-        error: 'Insufficient wallet balance.',
+        error: 'Insufficient wallet balance to cover liability.',
         code: 'INSUFFICIENT_FUNDS',
-        current_balance: wallet_balance,
-        required_amount,
+        balance: wallet.balance,
+        liability_needed: required_amount,
         debug,
       };
     }
 
-    // 5. INSERT BET
+    // 5. LOCK LIABILITY BEFORE CREATING BET
+    if (required_amount > 0) {
+      await this.adjustWalletBalance(
+        userId,
+        required_amount,
+        'debit',
+        `Liability locked for ${bet_name}`,
+      );
+      debug.wallet_debited = required_amount;
+    }
+
+    // 6. INSERT BET
     await this.ensureMatchExists(String(match_id), market_name, bet_name);
 
     const insertResult = await this.insertBet({
@@ -312,7 +338,7 @@ export class BetsService {
       betValue: normalizedBetValue,
       betRate: normalizedBetRate,
       winAmount: normalizedWinAmount,
-      lossAmount: normalizedLossAmount,
+      lossAmount: required_amount,
       gtype,
       settlementId: settlement_id,
       toReturn: to_return,
@@ -321,24 +347,13 @@ export class BetsService {
     });
     debug.bet_id = insertResult.insertId;
 
-    // 6. UPDATE EXPOSURE
+    // 7. UPDATE EXPOSURE
     await this.updateExposureBalance(
       userId,
       required_amount,
       settlement_id,
       gtype,
     );
-
-    // 7. DEBIT WALLET
-    if (required_amount > 0) {
-      await this.adjustWalletBalance(
-        userId,
-        required_amount,
-        'debit',
-        `Bet placed for ${bet_name}`,
-      );
-      debug.wallet_debited = required_amount;
-    }
 
     // 8. EXTERNAL API CALL IF NECESSARY
     const existingApi = await this.checkExistingAPICall(
@@ -402,40 +417,62 @@ export class BetsService {
       let wallet = await tx.wallet.findUnique({ where: { userId } });
       if (!wallet) {
         wallet = await tx.wallet.create({
-          data: { userId, balance: user.balance ?? 0 },
+          data: { userId, balance: user.balance ?? 0, liability: 0 },
         });
       }
 
-      if (type === 'debit' && wallet.balance < amount) {
-        throw new HttpException(
-          {
-            success: false,
-            error: 'Insufficient wallet balance.',
-            code: 'INSUFFICIENT_FUNDS',
+      if (type === 'debit') {
+        if (wallet.balance < amount) {
+          throw new HttpException(
+            {
+              success: false,
+              error: 'Insufficient wallet balance to lock liability.',
+              code: 'INSUFFICIENT_FUNDS',
+              balance: wallet.balance,
+              liability: wallet.liability,
+              required_amount: amount,
+            },
+            400,
+          );
+        }
+
+        await tx.wallet.update({
+          where: { userId },
+          data: {
+            balance: { decrement: amount },
+            liability: { increment: amount }, // <-- VERY IMPORTANT
           },
-          400,
-        );
+        });
+
+        await tx.user.update({
+          where: { id: userId },
+          data: {
+            balance: { decrement: amount },
+          },
+        });
+      } else {
+        const walletUpdateData: Prisma.WalletUpdateInput = {
+          balance: { increment: amount },
+        };
+
+        if (wallet.liability > 0) {
+          walletUpdateData.liability = {
+            decrement: Math.min(wallet.liability, amount),
+          };
+        }
+
+        await tx.wallet.update({
+          where: { userId },
+          data: walletUpdateData,
+        });
+
+        await tx.user.update({
+          where: { id: userId },
+          data: {
+            balance: { increment: amount },
+          },
+        });
       }
-
-      const delta = type === 'debit' ? -amount : amount;
-
-      await tx.wallet.update({
-        where: { id: wallet.id },
-        data: {
-          balance: {
-            increment: delta,
-          },
-        },
-      });
-
-      await tx.user.update({
-        where: { id: userId },
-        data: {
-          balance: {
-            increment: delta,
-          },
-        },
-      });
 
       await tx.transaction.create({
         data: {
