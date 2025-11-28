@@ -1,10 +1,10 @@
 import {
-    Injectable,
-    ForbiddenException,
-    BadRequestException,
-  } from '@nestjs/common';
-  import { PrismaService } from '../prisma/prisma.service';
-  import { UserRole, type User } from '@prisma/client';
+  Injectable,
+  ForbiddenException,
+  BadRequestException,
+} from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { Prisma, UserRole, type User } from '@prisma/client';
   import { BalanceChangeDto } from './dto/balance-change.dto';
   
   @Injectable()
@@ -42,6 +42,7 @@ import {
             where: { id: fromUser.id },
             data: { balance: { decrement: balance } },
           });
+          await this.syncWalletBalance(tx, updatedFromUser.id, updatedFromUser.balance);
         }
   
         // ✅ Add to target
@@ -49,6 +50,7 @@ import {
           where: { id: toUser.id },
           data: { balance: { increment: balance } },
         });
+        await this.syncWalletBalance(tx, updatedToUser.id, updatedToUser.balance);
   
         // Log the transfer
         await tx.transferLog.create({
@@ -102,12 +104,14 @@ import {
           where: { id: subordinate.id },
           data: { balance: { decrement: balance } },
         });
+        await this.syncWalletBalance(tx, updatedSubordinate.id, updatedSubordinate.balance);
   
         // ✅ Add to initiator (admin/agent)
         const updatedInitiator = await tx.user.update({
           where: { id: initiator.id },
           data: { balance: { increment: balance } },
         });
+        await this.syncWalletBalance(tx, updatedInitiator.id, updatedInitiator.balance);
   
         // Log transfer
         await tx.transferLog.create({
@@ -254,4 +258,19 @@ import {
         topLosingMarkets,
       };
     }
+
+  // =======================================================
+  // 🔄 Ensure wallet table mirrors user balance
+  // =======================================================
+  private async syncWalletBalance(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    balance: number,
+  ) {
+    await tx.wallet.upsert({
+      where: { userId },
+      update: { balance },
+      create: { userId, balance },
+    });
+  }
   }
