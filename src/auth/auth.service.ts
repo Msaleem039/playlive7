@@ -36,13 +36,18 @@ export class AuthService {
     const payload = { sub: user.id, role: user.role };
     const accessToken = this.jwtService.sign(payload);
 
+    // Fetch wallet balance instead of relying on User.balance
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId: user.id },
+    });
+
     return {
       user: {
         id: user.id,
         name: user.name,
         username: (user as any).username,
         role: user.role,
-        balance: user.balance,
+        balance: wallet?.balance ?? 0,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
       },
@@ -87,7 +92,10 @@ export class AuthService {
     
     try {
       const { name, username, password, role, balance, initialBalance, commissionPercentage } = createUserDto;
-      const resolvedBalance = (typeof balance === 'number' ? balance : undefined) ?? (typeof initialBalance === 'number' ? initialBalance : undefined) ?? 0;
+      const resolvedBalance =
+        (typeof balance === 'number' ? balance : undefined) ??
+        (typeof initialBalance === 'number' ? initialBalance : undefined) ??
+        0;
 
       // Check if creator can create this role
       if (role === UserRole.SUPER_ADMIN) {
@@ -124,7 +132,6 @@ export class AuthService {
           username,
           password: hashedPassword,
           role: UserRole.SUPER_ADMIN,
-          balance: resolvedBalance,
           parentId: undefined,
           commissionPercentage: commissionPercentage ?? 0,
         });
@@ -136,7 +143,6 @@ export class AuthService {
           username,
           password: hashedPassword,
           role,
-          balance: resolvedBalance,
           parentId: creator.id,
           commissionPercentage: commissionPercentage ?? 100,
         });
@@ -144,9 +150,22 @@ export class AuthService {
 
       console.log('User created successfully:', user);
 
+      // Create initial wallet with resolved balance
+      await this.prisma.wallet.create({
+        data: {
+          userId: user.id,
+          balance: resolvedBalance,
+          liability: 0,
+        },
+      });
+
       // Generate JWT token
       const payload = { sub: user.id, role: user.role };
       const accessToken = this.jwtService.sign(payload);
+
+      const wallet = await this.prisma.wallet.findUnique({
+        where: { userId: user.id },
+      });
 
       return {
         user: {
@@ -154,7 +173,7 @@ export class AuthService {
           name: user.name,
           username: (user as any).username,
           role: user.role,
-          balance: user.balance,
+          balance: wallet?.balance ?? resolvedBalance,
           createdAt: user.createdAt,
           updatedAt: user.updatedAt,
         },
@@ -168,53 +187,71 @@ export class AuthService {
 
 
   async findByRole(role: UserRole) {
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where: { role },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        createdAt: true,
-        updatedAt: true,
-      } as any,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
+      },
     });
+
+    return users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: (user as any).username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    }));
   }
 
   async findByParentAndRole(parentId: string, role: UserRole) {
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where: { parentId, role },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        parentId: true,
-        createdAt: true,
-        updatedAt: true,
-      } as any,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
+      },
     });
+
+    return users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: (user as any).username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      parentId: user.parentId,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    }));
   }
 
   async getSubordinates(userId: string) {
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where: { parentId: userId },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        parentId: true,
-        commissionPercentage: true,
-        createdAt: true,
-        updatedAt: true,
-      } as any,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
+      },
       orderBy: {
         createdAt: 'desc',
       },
     });
+
+    return users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: (user as any).username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      parentId: user.parentId,
+      commissionPercentage: user.commissionPercentage,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    }));
   }
 }

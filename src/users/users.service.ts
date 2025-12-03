@@ -46,16 +46,47 @@ export class UsersService {
     parentId?: string;
     commissionPercentage?: number;
   }): Promise<User> {
-    return this.prisma.user.create({
-      data,
+    const { balance, ...userData } = data;
+
+    const user = await this.prisma.user.create({
+      data: {
+        ...userData,
+        role: userData.role ?? UserRole.CLIENT,
+        commissionPercentage: userData.commissionPercentage ?? 100,
+      },
     });
+
+    await this.prisma.wallet.create({
+      data: {
+        userId: user.id,
+        balance: balance ?? 0,
+        liability: 0,
+      },
+    });
+
+    return user;
   }
 
-  async updateRole(id: string, role: UserRole): Promise<User> {
-    return this.prisma.user.update({
+  async updateRole(id: string, role: UserRole): Promise<UserResponseDto> {
+    const user = await this.prisma.user.update({
       where: { id },
       data: { role },
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
+      },
     });
+
+    return {
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
   }
 
   async updatePassword(id: string, password: string): Promise<User> {
@@ -75,14 +106,10 @@ export class UsersService {
   async getCurrentUser(id: string): Promise<UserResponseDto> {
     const user = await this.prisma.user.findUnique({
       where: { id },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        createdAt: true,
-        updatedAt: true,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
       },
     });
 
@@ -90,40 +117,60 @@ export class UsersService {
       throw new NotFoundException('User not found');
     }
 
-    return user;
+    return {
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    };
   }
 
   async getUserDetail(id: string): Promise<UserDetail | null> {
     const result = await this.prisma.user.findUnique({
       where: { id },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        parentId: true,
-        commissionPercentage: true,
-        createdAt: true,
-        updatedAt: true,
-      } as any,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
+      },
     });
 
-    return result as UserDetail | null;
+    if (!result) return null;
+
+    return {
+      id: result.id,
+      name: result.name,
+      username: result.username,
+      role: result.role,
+      balance: result.wallet?.balance ?? 0,
+      parentId: result.parentId,
+      commissionPercentage: result.commissionPercentage,
+      createdAt: result.createdAt,
+      updatedAt: result.updatedAt,
+    };
   }
 
   async getAllUsers(): Promise<UserResponseDto[]> {
-    return this.prisma.user.findMany({
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        createdAt: true,
-        updatedAt: true,
+    const users = await this.prisma.user.findMany({
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
       },
     });
+
+    return users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    }));
   }
 
   async getWalletBalanceWithLiability(userId: string) {

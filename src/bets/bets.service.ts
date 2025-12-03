@@ -14,7 +14,6 @@ export class BetsService {
   async selectOneRow(table: string, idField: string, userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { balance: true, id: true },
     });
 
     if (!user) {
@@ -27,33 +26,24 @@ export class BetsService {
         404,
       );
     }
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId },
+    });
 
-    return { fs_id: userId, status: 1, sports_exp: user.balance ?? 0 };
+    return {
+      fs_id: userId,
+      status: 1,
+      sports_exp: wallet?.balance ?? 0,
+    };
   }
 
   async selectWalletTotalAmountBetPlcae(userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, balance: true },
-    });
-
-    if (!user) {
-      throw new HttpException(
-        {
-          success: false,
-          error: `User not found. Please ensure the user with ID '${userId}' exists in the system before placing bets.`,
-          code: 'USER_NOT_FOUND',
-        },
-        404,
-      );
-    }
-
     const wallet = await this.prisma.wallet.upsert({
       where: { userId },
       update: {},
       create: {
         userId,
-        balance: user.balance ?? 0,
+        balance: 0,
       },
     });
 
@@ -237,7 +227,7 @@ export class BetsService {
       throw new HttpException(
         {
           success: false,
-          error: 'Exposure Limit crossed.',
+          error: 'Exposure Limit crossed. Betting is not allowed.',
           code: 'ACCOUNT_LOCKED',
         },
         400,
@@ -273,16 +263,34 @@ export class BetsService {
 
       required_amount = additional_exposure > 0 ? additional_exposure : 0;
 
-      debug.previous_loss = previous_loss;
-      debug.new_loss = new_loss;
+      debug.previous_possible_loss = previous_loss;
+      debug.new_possible_loss = new_loss;
       debug.additional_exposure = additional_exposure;
     } else {
       required_amount = normalizedLossAmount;
     }
 
-    debug.required_amount = required_amount;
+    debug.required_amount_to_place_bet = required_amount;
 
-    // 4. WALLET & LIABILITY CHECK
+    // 3. WALLET - Pending exposure check
+    const pending_exposure = await this.get_total_pending_exposure(userId);
+    const available_wallet = wallet_balance - pending_exposure;
+
+    debug.pending_exposure = pending_exposure;
+    debug.available_wallet_after_exposure = available_wallet;
+
+    if (available_wallet < required_amount) {
+      throw new HttpException(
+        {
+          success: false,
+          error: 'Insufficient available wallet after pending exposures.',
+          debug,
+        },
+        400,
+      );
+    }
+
+    // Ensure wallet exists before locking liability
     let wallet = await this.prisma.wallet.findUnique({ where: { userId } });
     if (!wallet) {
       wallet = await this.prisma.wallet.create({
@@ -294,24 +302,10 @@ export class BetsService {
       });
     }
 
-    const pending_exposure = await this.get_total_pending_exposure(userId);
-
-    debug.pending_exposure = pending_exposure;
     debug.wallet_balance = wallet.balance;
     debug.wallet_liability = wallet.liability ?? 0;
 
-    if (wallet.balance < required_amount) {
-      return {
-        success: false,
-        error: 'Insufficient wallet balance to cover liability.',
-        code: 'INSUFFICIENT_FUNDS',
-        balance: wallet.balance,
-        liability_needed: required_amount,
-        debug,
-      };
-    }
-
-    // 5. LOCK LIABILITY BEFORE CREATING BET
+    // 4. LOCK LIABILITY BEFORE CREATING BET
     if (required_amount > 0) {
       await this.adjustWalletBalance(
         userId,
@@ -330,6 +324,7 @@ export class BetsService {
       matchId: String(match_id),
       amount: normalizedBetValue,
       odds: normalizedBetRate,
+      selId: selid,
       selectionId: normalizedSelectionId,
       betType: bet_type,
       betName: bet_name,
@@ -417,7 +412,7 @@ export class BetsService {
       let wallet = await tx.wallet.findUnique({ where: { userId } });
       if (!wallet) {
         wallet = await tx.wallet.create({
-          data: { userId, balance: user.balance ?? 0, liability: 0 },
+          data: { userId, balance: 0, liability: 0 },
         });
       }
 
@@ -443,13 +438,6 @@ export class BetsService {
             liability: { increment: amount }, // <-- VERY IMPORTANT
           },
         });
-
-        await tx.user.update({
-          where: { id: userId },
-          data: {
-            balance: { decrement: amount },
-          },
-        });
       } else {
         const walletUpdateData: Prisma.WalletUpdateInput = {
           balance: { increment: amount },
@@ -464,13 +452,6 @@ export class BetsService {
         await tx.wallet.update({
           where: { userId },
           data: walletUpdateData,
-        });
-
-        await tx.user.update({
-          where: { id: userId },
-          data: {
-            balance: { increment: amount },
-          },
         });
       }
 

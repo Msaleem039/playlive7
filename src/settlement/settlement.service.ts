@@ -393,16 +393,21 @@ export class SettlementService {
     // Build payload matching PHP code structure
     // PHP uses: event_id, event_name, market_id, market_name, market_type
     const payload = {
+      // In PHP, event_id is the original match_id from the provider.
+      // Here we prioritise the bet's matchId, then the match's stored eventId, then fallback to our local matchId.
       event_id: Number(
-        matchDetails?.eventId ?? referenceBet?.matchId ?? matchId,
+        referenceBet?.matchId ?? matchDetails?.eventId ?? matchId,
       ),
       event_name:
         matchDetails?.eventName ??
         (matchDetails?.homeTeam && matchDetails?.awayTeam
           ? `${matchDetails.homeTeam} vs ${matchDetails.awayTeam}`
           : referenceBet?.marketName ?? referenceBet?.betName ?? 'Unknown Event'),
+      // Critical: for CricketID result API, market_id should match the selid we sent when placing the bet.
+      // We now store that as Bet.selId, so use that first, then fall back to any stored marketId/selectionId.
       market_id: Number(
-        matchDetails?.marketId ??
+        referenceBet?.selId ??
+          matchDetails?.marketId ??
           referenceBet?.selectionId ??
           referenceBet?.marketId ??
           matchId,
@@ -750,5 +755,339 @@ export class SettlementService {
       createdAt: bet.createdAt,
       updatedAt: bet.updatedAt,
     }));
+  }
+
+  /**
+   * Get all settlement results (all settled bets)
+   * Returns all bets that have been settled (WON or LOST status)
+   */
+  async getAllSettlementResults(filters?: {
+    matchId?: string;
+    settlementId?: string;
+    userId?: string;
+    status?: BetStatus;
+    limit?: number;
+    offset?: number;
+  }) {
+    const where: any = {
+      status: {
+        in: [BetStatus.WON, BetStatus.LOST],
+      },
+    };
+
+    if (filters?.matchId) {
+      where.matchId = filters.matchId;
+    }
+
+    if (filters?.settlementId) {
+      where.settlementId = filters.settlementId;
+    }
+
+    if (filters?.userId) {
+      where.userId = filters.userId;
+    }
+
+    if (filters?.status) {
+      where.status = filters.status;
+    }
+
+    const [bets, total] = await Promise.all([
+      this.prisma.bet.findMany({
+        where,
+        include: {
+          match: {
+            select: {
+              id: true,
+              homeTeam: true,
+              awayTeam: true,
+              eventName: true,
+              status: true,
+              startTime: true,
+            },
+          },
+          user: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+        },
+        orderBy: { updatedAt: 'desc' },
+        take: filters?.limit || 100,
+        skip: filters?.offset || 0,
+      }),
+      this.prisma.bet.count({ where }),
+    ]);
+
+    return {
+      total,
+      results: bets.map((bet) => ({
+        id: bet.id,
+        settlement_id: bet.settlementId,
+        match_id: bet.matchId,
+        user: bet.user,
+        match: bet.match,
+        amount: bet.amount,
+        odds: bet.odds,
+        betName: bet.betName,
+        marketName: bet.marketName,
+        gtype: bet.gtype,
+        winAmount: bet.winAmount,
+        lossAmount: bet.lossAmount,
+        status: bet.status,
+        profitLoss:
+          bet.status === BetStatus.WON
+            ? Number(bet.winAmount || bet.amount * bet.odds)
+            : -Number(bet.lossAmount || bet.amount),
+        createdAt: bet.createdAt,
+        updatedAt: bet.updatedAt,
+      })),
+    };
+  }
+
+  /**
+   * Reverse a settlement
+   * This will:
+   * 1. Revert bet status back to PENDING
+   * 2. Reverse wallet transactions (undo profit/loss)
+   * 3. Restore liability
+   */
+  async reverseSettlement(settlementId: string): Promise<{
+    success: boolean;
+    message: string;
+    reversed?: Array<{
+      betId: string;
+      userId: string;
+      previousStatus: BetStatus;
+      reversedAmount: number;
+    }>;
+  }> {
+    if (!settlementId) {
+      return { success: false, message: 'settlement_id is required' };
+    }
+
+    // Get all settled bets for this settlement_id
+    const settledBets = await this.prisma.bet.findMany({
+      where: {
+        settlementId,
+        status: {
+          in: [BetStatus.WON, BetStatus.LOST],
+        },
+      },
+      include: {
+        user: {
+          include: {
+            wallet: true,
+          },
+        },
+        match: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (settledBets.length === 0) {
+      return {
+        success: false,
+        message: `No settled bets found for settlement_id: ${settlementId}`,
+      };
+    }
+
+    const matchId = settledBets[0].matchId;
+
+    const reversed = await this.prisma.$transaction(async (tx) => {
+      const summary: Array<{
+        betId: string;
+        userId: string;
+        previousStatus: BetStatus;
+        reversedAmount: number;
+      }> = [];
+
+      for (const bet of settledBets) {
+        const previousStatus = bet.status;
+        const wasWon = previousStatus === BetStatus.WON;
+        const profitLoss = wasWon
+          ? Number(bet.winAmount || bet.amount * bet.odds)
+          : -Number(bet.lossAmount || bet.amount);
+
+        // Revert bet status to PENDING
+        await tx.bet.update({
+          where: { id: bet.id },
+          data: {
+            status: BetStatus.PENDING,
+            updatedAt: new Date(),
+          },
+        });
+
+        // Reverse wallet mutation
+        if (bet.user.wallet) {
+          const liabilityToRestore = Math.abs(profitLoss);
+
+          await tx.wallet.update({
+            where: { id: bet.user.wallet.id },
+            data: {
+              liability: { increment: liabilityToRestore }, // restore liability
+              balance: { decrement: profitLoss }, // reverse profit/loss
+            },
+          });
+
+          // Create a reversal transaction
+          await tx.transaction.create({
+            data: {
+              walletId: bet.user.wallet.id,
+              amount: Math.abs(profitLoss),
+              type: TransactionType.REFUND,
+              description: `Settlement reversal for bet ${bet.id} on match ${matchId} (previously ${previousStatus})`,
+            },
+          });
+        }
+
+        summary.push({
+          betId: bet.id,
+          userId: bet.userId,
+          previousStatus,
+          reversedAmount: profitLoss,
+        });
+      }
+
+      // Update match status if needed (if there are now pending bets)
+      const pendingBetsCount = await tx.bet.count({
+        where: {
+          matchId,
+          status: BetStatus.PENDING,
+        },
+      });
+
+      if (pendingBetsCount > 0) {
+        await tx.match.updateMany({
+          where: { id: matchId },
+          data: {
+            status: MatchStatus.LIVE, // or FINISHED, depending on your logic
+            updatedAt: new Date(),
+          },
+        });
+      }
+
+      return summary;
+    });
+
+    return {
+      success: true,
+      message: `Successfully reversed settlement for ${reversed.length} bet(s)`,
+      reversed,
+    };
+  }
+
+  /**
+   * Get pending settlements for a specific match
+   * Returns all settlement_ids with pending bets for the given match
+   */
+  async getPendingSettlementsByMatch(matchId: string) {
+    if (!matchId) {
+      return {
+        success: false,
+        message: 'match_id is required',
+      };
+    }
+
+    // Verify match exists
+    const match = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: {
+        id: true,
+        homeTeam: true,
+        awayTeam: true,
+        eventId: true,
+        eventName: true,
+        startTime: true,
+        status: true,
+      },
+    });
+
+    if (!match) {
+      return {
+        success: false,
+        message: `Match not found: ${matchId}`,
+      };
+    }
+
+    // Get all pending bets for this match
+    const bets = await this.prisma.bet.findMany({
+      where: {
+        matchId,
+        status: BetStatus.PENDING,
+        settlementId: { not: null },
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Group by settlement_id
+    const settlementMap = new Map<
+      string,
+      {
+        settlement_id: string;
+        pending_bets_count: number;
+        total_bet_amount: number;
+        bets: any[];
+      }
+    >();
+
+    for (const bet of bets) {
+      if (!bet.settlementId) continue;
+
+      const existing = settlementMap.get(bet.settlementId);
+      if (existing) {
+        existing.pending_bets_count += 1;
+        existing.total_bet_amount += Number(bet.amount || 0);
+        existing.bets.push({
+          id: bet.id,
+          userId: bet.userId,
+          user: bet.user,
+          amount: bet.amount,
+          odds: bet.odds,
+          betName: bet.betName,
+          marketName: bet.marketName,
+          winAmount: bet.winAmount,
+          lossAmount: bet.lossAmount,
+          createdAt: bet.createdAt,
+        });
+      } else {
+        settlementMap.set(bet.settlementId, {
+          settlement_id: bet.settlementId,
+          pending_bets_count: 1,
+          total_bet_amount: Number(bet.amount || 0),
+          bets: [
+            {
+              id: bet.id,
+              userId: bet.userId,
+              user: bet.user,
+              amount: bet.amount,
+              odds: bet.odds,
+              betName: bet.betName,
+              marketName: bet.marketName,
+              winAmount: bet.winAmount,
+              lossAmount: bet.lossAmount,
+              createdAt: bet.createdAt,
+            },
+          ],
+        });
+      }
+    }
+
+    return {
+      success: true,
+      match,
+      settlement_count: settlementMap.size,
+      settlements: Array.from(settlementMap.values()),
+    };
   }
 }

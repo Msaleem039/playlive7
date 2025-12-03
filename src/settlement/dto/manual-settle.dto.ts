@@ -21,3 +21,9 @@ export class ManualSettleWithResultDto {
   @IsNotEmpty()
   winner: string; // The winner/result to use for settlement
 }
+
+export class ReverseSettlementDto {
+  @IsString()
+  @IsNotEmpty()
+  settlement_id: string;
+}

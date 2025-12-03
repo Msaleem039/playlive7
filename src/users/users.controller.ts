@@ -87,14 +87,6 @@ export class UsersController {
     @Body('role', new ParseEnumPipe(UserRole)) role: UserRole,
   ): Promise<UserResponseDto> {
     const updatedUser = await this.usersService.updateRole(id, role);
-    return {
-      id: updatedUser.id,
-      name: updatedUser.name,
-      username: updatedUser.username,
-      role: updatedUser.role,
-      balance: updatedUser.balance,
-      createdAt: updatedUser.createdAt,
-      updatedAt: updatedUser.updatedAt,
-    };
+    return updatedUser;
   }
 }

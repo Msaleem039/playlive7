@@ -19,7 +19,7 @@ model User {
   username             String   @unique @map("email")
   password             String
   role                 UserRole @default(CLIENT)
-  balance              Float    @default(0)
+
   parentId             String?
   commissionPercentage Float    @default(100)
   createdAt            DateTime @default(now())
@@ -76,6 +76,7 @@ model Bet {
   matchId   String
   amount    Float
   odds      Float
+  selId     Int?
   selectionId Int?
   betType   String?
   betName   String?

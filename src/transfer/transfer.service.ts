@@ -7,20 +7,26 @@ export class TransferService {
   constructor(private prisma: PrismaService) {}
 
   async getUserChildren(userId: string) {
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where: { parentId: userId },
-      select: {
-        id: true,
-        name: true,
-        username: true,
-        role: true,
-        balance: true,
-        parentId: true,
-        commissionPercentage: true,
-        createdAt: true,
-        updatedAt: true,
+      include: {
+        wallet: {
+          select: { balance: true },
+        },
       },
     });
+
+    return users.map((user) => ({
+      id: user.id,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      balance: user.wallet?.balance ?? 0,
+      parentId: user.parentId,
+      commissionPercentage: user.commissionPercentage,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+    }));
   }
 
   async getHierarchyTree(userId: string) {
@@ -29,11 +35,10 @@ export class TransferService {
   }
 
   async getUserBalance(userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, balance: true },
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId },
     });
-    return user || { id: userId, balance: 0 };
+    return { id: userId, balance: wallet?.balance ?? 0 };
   }
 
   async getTransferHistory(userId: string, limit?: number) {
@@ -66,16 +71,25 @@ export class TransferService {
   ) {
     const hashedPassword = await bcrypt.hash(data.password, 10);
 
-    return this.prisma.user.create({
+    const user = await this.prisma.user.create({
       data: {
         ...data,
         password: hashedPassword,
         parentId,
         role: data.role as any,
         commissionPercentage: data.commissionPercentage ?? 100,
-        balance: data.balance ?? 0,
       },
     });
+
+    await this.prisma.wallet.create({
+      data: {
+        userId: user.id,
+        balance: data.balance ?? 0,
+        liability: 0,
+      },
+    });
+
+    return user;
   }
 }
 
