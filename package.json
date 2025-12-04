@@ -25,7 +25,8 @@
     "prisma:reset": "prisma migrate reset",
     "postinstall": "prisma generate",
     "migrate": "node scripts/run-migrations.js",
-    "setup:env": "node scripts/setup-env.js"
+    "setup:env": "node scripts/setup-env.js",
+    "verify:db": "node scripts/verify-db-setup.js"
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",
