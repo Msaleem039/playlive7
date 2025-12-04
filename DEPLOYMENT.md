@@ -8,8 +8,6 @@ Create a `.env` file in the project root with your production database credentia
 
 ```bash
 # Copy example file
-cp env.neon.example .env
-# OR
 cp env.production.example .env
 ```
 

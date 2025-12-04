@@ -72,7 +72,7 @@ DIRECT_URL="postgresql://username:password@host:5432/database?sslmode=require"
 ### Option 3: Copy from Example
 
 ```bash
-cp env.neon.example .env
+cp env.production.example .env
 # Then edit .env with your actual credentials
 nano .env
 ```

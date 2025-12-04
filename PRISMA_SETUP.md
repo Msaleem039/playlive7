@@ -6,7 +6,7 @@ This project has been configured to use Prisma ORM with Neon database instead of
 
 1. Copy the environment file:
    ```bash
-   cp env.neon.example .env
+   cp env.production.example .env
    ```
 
 2. Update the `.env` file with your Neon database credentials:
