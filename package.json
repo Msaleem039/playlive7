@@ -22,7 +22,10 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
-    "prisma:reset": "prisma migrate reset"
+    "prisma:reset": "prisma migrate reset",
+    "postinstall": "prisma generate",
+    "migrate": "node scripts/run-migrations.js",
+    "setup:env": "node scripts/setup-env.js"
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",
