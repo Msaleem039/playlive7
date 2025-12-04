@@ -1,4 +1,4 @@
-import { HttpException, Injectable } from '@nestjs/common';
+import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -6,6 +6,8 @@ import { BetStatus, MatchStatus, Prisma, TransactionType } from '@prisma/client'
 
 @Injectable()
 export class BetsService {
+  private readonly logger = new Logger(BetsService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   // ---------------------------- MOCK DATABASE FUNCTIONS ---------------------------- //
@@ -305,89 +307,172 @@ export class BetsService {
     debug.wallet_balance = wallet.balance;
     debug.wallet_liability = wallet.liability ?? 0;
 
-    // 4. LOCK LIABILITY BEFORE CREATING BET
-    if (required_amount > 0) {
-      await this.adjustWalletBalance(
+    // 4. LOCK LIABILITY AND CREATE BET IN A SINGLE TRANSACTION
+    // This ensures atomicity - if bet creation fails, balance deduction is rolled back
+    this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}`);
+    
+    try {
+      const result = await this.prisma.$transaction(async (tx) => {
+        // Step 1: Ensure match exists
+        await tx.match.upsert({
+          where: { id: String(match_id) },
+          update: {},
+          create: {
+            id: String(match_id),
+            homeTeam: bet_name ?? 'Unknown',
+            awayTeam: market_name ?? 'Unknown',
+            startTime: new Date(),
+            status: MatchStatus.LIVE,
+          },
+        });
+
+        // Step 2: Deduct balance and lock liability (if required)
+        if (required_amount > 0) {
+          // Ensure wallet exists (upsert to handle edge cases)
+          const currentWallet = await tx.wallet.upsert({
+            where: { userId },
+            update: {},
+            create: {
+              userId,
+              balance: wallet_balance,
+              liability: 0,
+            },
+          });
+
+          if (currentWallet.balance < required_amount) {
+            throw new HttpException(
+              {
+                success: false,
+                error: 'Insufficient wallet balance to lock liability.',
+                code: 'INSUFFICIENT_FUNDS',
+                balance: currentWallet.balance,
+                liability: currentWallet.liability,
+                required_amount: required_amount,
+              },
+              400,
+            );
+          }
+
+          await tx.wallet.update({
+            where: { userId },
+            data: {
+              balance: { decrement: required_amount },
+              liability: { increment: required_amount },
+            },
+          });
+
+          // Create transaction record
+          await tx.transaction.create({
+            data: {
+              walletId: currentWallet.id,
+              amount: required_amount,
+              type: TransactionType.BET_PLACED,
+              description: `Liability locked for ${bet_name}`,
+            },
+          });
+
+          debug.wallet_debited = required_amount;
+        }
+
+        // Step 3: Create the bet
+        const bet = await tx.bet.create({
+          data: {
+            userId: userId,
+            matchId: String(match_id),
+            amount: normalizedBetValue,
+            odds: normalizedBetRate,
+            selId: selid,
+            selectionId: normalizedSelectionId,
+            betType: bet_type,
+            betName: bet_name,
+            marketName: market_name,
+            marketType: market_type,
+            betValue: normalizedBetValue,
+            betRate: normalizedBetRate,
+            winAmount: normalizedWinAmount,
+            lossAmount: required_amount,
+            gtype,
+            settlementId: settlement_id,
+            toReturn: to_return,
+            status: BetStatus.PENDING,
+            metadata: runner_name_2 ? { runner_name_2 } : undefined,
+          },
+        });
+
+        return { betId: bet.id };
+      });
+
+      debug.bet_id = result.betId;
+
+      // 5. UPDATE EXPOSURE (this is just a calculation, doesn't need to be in transaction)
+      await this.updateExposureBalance(
         userId,
         required_amount,
-        'debit',
-        `Liability locked for ${bet_name}`,
+        settlement_id,
+        gtype,
       );
-      debug.wallet_debited = required_amount;
-    }
 
-    // 6. INSERT BET
-    await this.ensureMatchExists(String(match_id), market_name, bet_name);
+      // 6. EXTERNAL API CALL IF NECESSARY (non-critical, can fail without affecting bet)
+      const existingApi = await this.checkExistingAPICall(
+        match_id,
+        market_name,
+        bet_name,
+        gtype,
+      );
 
-    const insertResult = await this.insertBet({
-      userId: userId,
-      matchId: String(match_id),
-      amount: normalizedBetValue,
-      odds: normalizedBetRate,
-      selId: selid,
-      selectionId: normalizedSelectionId,
-      betType: bet_type,
-      betName: bet_name,
-      marketName: market_name,
-      marketType: market_type,
-      betValue: normalizedBetValue,
-      betRate: normalizedBetRate,
-      winAmount: normalizedWinAmount,
-      lossAmount: required_amount,
-      gtype,
-      settlementId: settlement_id,
-      toReturn: to_return,
-      status: BetStatus.PENDING,
-      metadata: runner_name_2 ? { runner_name_2 } : undefined,
-    });
-    debug.bet_id = insertResult.insertId;
+      if (existingApi == 0) {
+        const payload = {
+          event_id: match_id,
+          event_name: market_name,
+          market_id: selid,
+          market_name: bet_name,
+          market_type: gtype,
+        };
 
-    // 7. UPDATE EXPOSURE
-    await this.updateExposureBalance(
-      userId,
-      required_amount,
-      settlement_id,
-      gtype,
-    );
-
-    // 8. EXTERNAL API CALL IF NECESSARY
-    const existingApi = await this.checkExistingAPICall(
-      match_id,
-      market_name,
-      bet_name,
-      gtype,
-    );
-
-    if (existingApi == 0) {
-      const payload = {
-        event_id: match_id,
-        event_name: market_name,
-        market_id: selid,
-        market_name: bet_name,
-        market_type: gtype,
-      };
-
-      try {
-        const response = await axios.post(
-          'https://api.cricketid.xyz/placed_bets?key=dijbfuwd719e12rqhfbjdqdnkqnd11&sid=4',
-          payload,
-          { headers: { 'Content-Type': 'application/json' } },
-        );
-        debug.external_api_response = response.data;
-      } catch (error) {
-        debug.external_api_error =
-          axios.isAxiosError(error) && error.response
-            ? {
-                status: error.response.status,
-                data: error.response.data,
-              }
-            : { message: (error as Error).message };
+        try {
+          const response = await axios.post(
+            'https://api.cricketid.xyz/placed_bets?key=dijbfuwd719e12rqhfbjdqdnkqnd11&sid=4',
+            payload,
+            { headers: { 'Content-Type': 'application/json' } },
+          );
+          debug.external_api_response = response.data;
+        } catch (error) {
+          debug.external_api_error =
+            axios.isAxiosError(error) && error.response
+              ? {
+                  status: error.response.status,
+                  data: error.response.data,
+                }
+              : { message: (error as Error).message };
+        }
+      } else {
+        debug.external_api_response = 'Skipped – already exists';
       }
-    } else {
-      debug.external_api_response = 'Skipped – already exists';
-    }
 
-    return { success: true, debug, avl_limit };
+      this.logger.log(`Bet placed successfully: ${result.betId} for user ${userId}`);
+      return { success: true, debug, avl_limit };
+    } catch (error) {
+      this.logger.error(`Error placing bet for user ${userId}:`, error);
+      
+      // If it's already an HttpException, re-throw it
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      // For other errors, wrap in a proper error response
+      throw new HttpException(
+        {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to place bet',
+          code: 'BET_PLACEMENT_FAILED',
+          debug: {
+            ...debug,
+            error_details: error instanceof Error ? error.stack : String(error),
+          },
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
   }
 
   private async adjustWalletBalance(
