@@ -375,28 +375,35 @@ export class BetsService {
         }
 
         // Step 3: Create the bet
+        // Build bet data object with conditional selId to handle Prisma client type issues
+        const betData: any = {
+          userId: userId,
+          matchId: String(match_id),
+          amount: normalizedBetValue,
+          odds: normalizedBetRate,
+          selectionId: normalizedSelectionId,
+          betType: bet_type,
+          betName: bet_name,
+          marketName: market_name,
+          marketType: market_type,
+          betValue: normalizedBetValue,
+          betRate: normalizedBetRate,
+          winAmount: normalizedWinAmount,
+          lossAmount: required_amount,
+          gtype,
+          settlementId: settlement_id,
+          toReturn: to_return,
+          status: BetStatus.PENDING,
+          metadata: runner_name_2 ? { runner_name_2 } : undefined,
+        };
+
+        // Add selId if it exists in the schema (handles Prisma client version differences)
+        if (selid) {
+          betData.selId = selid;
+        }
+
         const bet = await tx.bet.create({
-          data: {
-            userId: userId,
-            matchId: String(match_id),
-            amount: normalizedBetValue,
-            odds: normalizedBetRate,
-            selId: selid,
-            selectionId: normalizedSelectionId,
-            betType: bet_type,
-            betName: bet_name,
-            marketName: market_name,
-            marketType: market_type,
-            betValue: normalizedBetValue,
-            betRate: normalizedBetRate,
-            winAmount: normalizedWinAmount,
-            lossAmount: required_amount,
-            gtype,
-            settlementId: settlement_id,
-            toReturn: to_return,
-            status: BetStatus.PENDING,
-            metadata: runner_name_2 ? { runner_name_2 } : undefined,
-          },
+          data: betData,
         });
 
         return { betId: bet.id };
