@@ -20,9 +20,20 @@ export class UsersService {
   constructor(private prisma: PrismaService) {}
 
   async findById(id: string): Promise<User | null> {
-    return this.prisma.user.findUnique({
-      where: { id },
-    });
+    try {
+      return await this.prisma.user.findUnique({
+        where: { id },
+      });
+    } catch (error) {
+      // Handle database connection errors gracefully in development
+      if (error instanceof Error && error.message.includes("Can't reach database")) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.warn('Database not available - returning null (development mode)');
+          return null;
+        }
+      }
+      throw error;
+    }
   }
 
   async findByUsername(username: string): Promise<User | null> {

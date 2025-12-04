@@ -26,7 +26,10 @@
     "postinstall": "prisma generate",
     "migrate": "node scripts/run-migrations.js",
     "setup:env": "node scripts/setup-env.js",
-    "verify:db": "node scripts/verify-db-setup.js"
+    "create:env": "node scripts/create-env-local.js",
+    "test:connection": "node scripts/test-neon-connection.js",
+    "verify:db": "node scripts/verify-db-setup.js",
+    "check:db": "node scripts/check-db-connection.js"
   },
   "dependencies": {
     "@nestjs/axios": "^4.0.1",
