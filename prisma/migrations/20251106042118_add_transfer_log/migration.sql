@@ -6,5 +6,5 @@ CREATE TABLE "transfer_logs" (
     "amount" REAL NOT NULL,
     "remarks" TEXT,
     "type" TEXT NOT NULL,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

@@ -11,8 +11,8 @@ import { SettlementService } from './settlement.service';
 import {
   ManualSettleDto,
   ManualSettleBySettlementIdDto,
-  ManualSettleWithResultDto,
   ReverseSettlementDto,
+  SettleSingleSessionBetDto,
 } from './dto/manual-settle.dto';
 import { BetStatus } from '@prisma/client';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -36,14 +36,6 @@ export class SettlementController {
     return this.settlement.settleBySettlementId(query.settlement_id);
   }
 
-  @Post('manual/with-result')
-  async manualSettleWithResult(@Body() body: ManualSettleWithResultDto) {
-    // This uses manually provided result
-    return this.settlement.settleBySettlementIdWithManualResult(
-      body.settlement_id,
-      body.winner,
-    );
-  }
 
   /**
    * Get list of settlement_ids that need settlement
@@ -147,5 +139,29 @@ export class SettlementController {
   @Get('pending/match/:matchId')
   async getPendingSettlementsByMatch(@Param('matchId') matchId: string) {
     return this.settlement.getPendingSettlementsByMatch(matchId);
+  }
+
+  /**
+   * Settle single session bet by match_id, selection_id, gtype, bet_name
+   * Similar to PHP's settleSingleSessionBet()
+   * 
+   * @example POST /settlement/manual/session-bet
+   * Body: {
+   *   "match_id": "match123",
+   *   "selection_id": 1,
+   *   "gtype": "fancy1",
+   *   "bet_name": "Over 10.5",
+   *   "winner_id": 15
+   * }
+   */
+  @Post('manual/session-bet')
+  async settleSingleSessionBet(@Body() body: SettleSingleSessionBetDto) {
+    return this.settlement.settleSingleSessionBet(
+      body.match_id,
+      body.selection_id,
+      body.gtype,
+      body.bet_name,
+      body.winner_id,
+    );
   }
 }

@@ -42,6 +42,12 @@ export class UsersService {
     });
   }
 
+  async findByEmail(email: string): Promise<User | null> {
+    return this.prisma.user.findFirst({
+      where: { email },
+    });
+  }
+
   async findByRole(role: UserRole): Promise<User | null> {
     return this.prisma.user.findFirst({
       where: { role },
@@ -51,6 +57,7 @@ export class UsersService {
   async create(data: {
     name: string;
     username: string;
+    email?: string | null;
     password: string;
     role?: UserRole;
     balance?: number;
@@ -62,6 +69,7 @@ export class UsersService {
     const user = await this.prisma.user.create({
       data: {
         ...userData,
+        email: userData.email ?? null,
         role: userData.role ?? UserRole.CLIENT,
         commissionPercentage: userData.commissionPercentage ?? 100,
       },

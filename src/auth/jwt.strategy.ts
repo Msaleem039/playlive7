@@ -20,7 +20,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: any) {
-    console.log('JWT Strategy validate called with payload:', payload);
+    // console.log('JWT Strategy validate called with payload:', payload);
     
     // Check if database is connected
     const isDbConnected = this.prismaService.isDatabaseConnected();
@@ -32,7 +32,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         id: payload.sub,
         role: payload.role,
         name: 'Development User',
-        username: 'dev@example.com',
+        username: payload.username || 'dev',
+        email: null,
         password: '',
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -66,7 +67,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
           id: payload.sub,
           role: payload.role,
           name: 'Development User',
-          username: 'dev@example.com',
+          username: payload.username || 'dev',
+          email: null,
           password: '',
           createdAt: new Date(),
           updatedAt: new Date(),

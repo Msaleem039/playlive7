@@ -30,7 +30,7 @@ export class TransferService {
     // ✅ Validate who can top-up whom
     this.validateRoleHierarchy(fromUser, toUser, 'TOPUP');
 
-    // ✅ Super Admin self top-up doesn’t deduct from anyone
+    // ✅ Super Admin self top-up doesn't deduct from anyone
     const shouldDeduct = !(
       fromUser.role === UserRole.SUPER_ADMIN && fromUser.id === toUser.id
     );
@@ -59,24 +59,63 @@ export class TransferService {
         create: { userId: toUser.id, balance: 0, liability: 0 },
       });
 
-      // ✅ Check initiator balance only when deduction is required
-      if (shouldDeduct && fromWallet && fromWallet.balance < balance) {
-        throw new BadRequestException('Insufficient balance');
+      // ✅ TOP-UP LOGIC WITH SHARE PERCENTAGES
+      const TOPUP_AMOUNT = balance; // Full amount target receives (100%)
+      
+      // Get share percentage from target user (stored in commissionPercentage field)
+      // share = parent's share percentage (SA% when SuperAdmin→Admin, AD% when Admin→Agent)
+      // For CLIENT, commissionPercentage is typically 100 (agent gets 100% share)
+      const share = toUser.commissionPercentage;
+      
+      // Validate share percentage exists and is valid
+      if (shouldDeduct) {
+        if (share === null || share === undefined || isNaN(share)) {
+          throw new BadRequestException(
+            `Target user (${toUser.role}) must have a valid share percentage (commissionPercentage) set. Current value: ${share}`
+          );
+        }
+        if (share < 1 || share > 100) {
+          throw new BadRequestException(
+            `Invalid share percentage (${share}). Share must be between 1 and 100 for ${toUser.role} users.`
+          );
+        }
+      }
+      
+      let parentShareAmount = 0;
+      
+      if (shouldDeduct && share) {
+        // Calculate parent's share and liability
+        // share = SA% (when SuperAdmin tops up Admin) or AD% (when Admin tops up Agent)
+        parentShareAmount = TOPUP_AMOUNT * (share / 100); // Parent's share/profit
+        const parentLiability = TOPUP_AMOUNT * (1 - share / 100); // Parent's exposure
+        
+        // Check initiator balance (must have enough to cover the full top-up amount)
+        if (fromWallet && fromWallet.balance < TOPUP_AMOUNT) {
+          throw new BadRequestException('Insufficient balance');
+        }
+
+        // Update parent balance:
+        // Net change = -TOPUP_AMOUNT + parentShareAmount = -(1 - share/100) * TOPUP_AMOUNT
+        // We need to calculate the net change first, then apply it
+        const netBalanceChange = -TOPUP_AMOUNT + parentShareAmount;
+        
+        if (fromWallet) {
+          updatedFromWallet = await tx.wallet.update({
+            where: { id: fromWallet.id },
+            data: { 
+              balance: netBalanceChange >= 0 
+                ? { increment: netBalanceChange }
+                : { decrement: Math.abs(netBalanceChange) }
+            },
+            select: { id: true, balance: true },
+          });
+        }
       }
 
-      // ✅ Deduct from initiator (admin/agent)
-      if (shouldDeduct && fromWallet) {
-        updatedFromWallet = await tx.wallet.update({
-          where: { id: fromWallet.id },
-          data: { balance: { decrement: balance } },
-          select: { id: true, balance: true },
-        });
-      }
-
-      // ✅ Add to target
+      // ✅ Add full amount to target (100% playable credit)
       const updatedToWallet = await tx.wallet.update({
         where: { id: toWalletInitial.id },
-        data: { balance: { increment: balance } },
+        data: { balance: { increment: TOPUP_AMOUNT } },
         select: { id: true, balance: true },
       });
 
@@ -85,7 +124,7 @@ export class TransferService {
         data: {
           fromUserId: fromUser.id,
           toUserId: toUser.id,
-          amount: balance,
+          amount: TOPUP_AMOUNT,
           remarks,
           type: 'TOPUP',
         },

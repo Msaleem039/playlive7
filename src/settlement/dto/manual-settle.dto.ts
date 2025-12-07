@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsString } from 'class-validator';
+import { IsNotEmpty, IsString, IsNumber } from 'class-validator';
 
 export class ManualSettleDto {
   @IsString()
@@ -26,4 +26,24 @@ export class ReverseSettlementDto {
   @IsString()
   @IsNotEmpty()
   settlement_id: string;
+}
+
+export class SettleSingleSessionBetDto {
+  @IsString()
+  @IsNotEmpty()
+  match_id: string;
+
+  @IsNumber()
+  selection_id: number;
+
+  @IsString()
+  @IsNotEmpty()
+  gtype: string;
+
+  @IsString()
+  @IsNotEmpty()
+  bet_name: string;
+
+  @IsNumber()
+  winner_id: number;
 }

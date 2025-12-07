@@ -1,4 +1,4 @@
-import { IsString, MinLength, MaxLength, IsEnum, IsOptional, IsNumber, Min, Max } from 'class-validator';
+import { IsString, MinLength, MaxLength, IsEnum, IsOptional, IsNumber, Min, Max, ValidateIf } from 'class-validator';
 import { UserRole } from '@prisma/client';
 
 export class CreateUserDto {
@@ -7,10 +7,17 @@ export class CreateUserDto {
   @MaxLength(50)
   name: string;
 
+  @IsOptional()
   @IsString()
   @MinLength(3)
   @MaxLength(30)
-  username: string;
+  username?: string;
+
+  @IsOptional()
+  @IsString()
+  @MinLength(3)
+  @MaxLength(30)
+  email?: string;
 
   @IsString()
   @MinLength(6)
@@ -25,9 +32,10 @@ export class CreateUserDto {
   @Min(0)
   balance?: number;
 
-  @IsOptional()
+  // share (commissionPercentage) is REQUIRED for ADMIN and AGENT, optional for others
+  @ValidateIf((o) => o.role === UserRole.ADMIN || o.role === UserRole.AGENT)
   @IsNumber()
-  @Min(0)
+  @Min(1)
   @Max(100)
   commissionPercentage?: number;
 

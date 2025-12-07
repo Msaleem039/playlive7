@@ -132,6 +132,62 @@ export class SettlementService {
   }
 
   /**
+   * Settle single session bet by match_id, selection_id, gtype, bet_name
+   * Similar to PHP's settleSingleSessionBet()
+   * 
+   * @param matchId - Match ID
+   * @param selectionId - Selection ID
+   * @param gtype - Game type (fancy1, Normal, oddeven)
+   * @param betName - Bet name
+   * @param winnerId - Winner ID (numeric value for comparison)
+   */
+  async settleSingleSessionBet(
+    matchId: string,
+    selectionId: number,
+    gtype: string,
+    betName: string,
+    winnerId: number,
+  ): Promise<SettlementResult> {
+    if (!matchId || !gtype || !betName || winnerId === undefined || winnerId === null) {
+      return {
+        success: false,
+        message: 'match_id, selection_id, gtype, bet_name, and winner_id are required',
+      };
+    }
+
+    // Get all matching pending bets (like PHP code)
+    const bets = await this.prisma.bet.findMany({
+      where: {
+        matchId,
+        selectionId,
+        gtype,
+        betName: betName.trim(),
+        status: BetStatus.PENDING,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (bets.length === 0) {
+      return {
+        success: false,
+        message: 'No pending bets found to settle.',
+      };
+    }
+
+    this.logger.log(
+      `Settling ${bets.length} session bets for match ${matchId}, selection ${selectionId}, gtype ${gtype}, bet_name ${betName} with winner_id: ${winnerId}`,
+    );
+
+    // Process settlement with winner_id as string (determineOutcome will handle numeric comparison)
+    return this.processSettlement(
+      `session_${matchId}_${selectionId}_${gtype}_${betName}`,
+      matchId,
+      bets,
+      winnerId.toString(),
+    );
+  }
+
+  /**
    * Common settlement processing logic
    * This handles the actual settlement of bets with a given winner
    */
@@ -141,7 +197,10 @@ export class SettlementService {
     pendingBets: any[],
     winner: string,
   ): Promise<SettlementResult> {
-    const settled = await this.prisma.$transaction(async (tx) => {
+    // Increase transaction timeout to 60 seconds for settlement operations
+    // Settlement involves multiple wallet updates and can take longer
+    const settled = await this.prisma.$transaction(
+      async (tx) => {
       const summary: SettlementResult['settled'] = [];
 
       for (const bet of pendingBets) {
@@ -197,7 +256,12 @@ export class SettlementService {
       }
 
       return summary ?? [];
-    });
+      },
+      {
+        maxWait: 60000, // Maximum time to wait for a transaction slot (60 seconds)
+        timeout: 60000, // Maximum time the transaction can run (60 seconds)
+      },
+    );
 
     return {
       success: true,
@@ -466,6 +530,51 @@ export class SettlementService {
   }
 
   private determineOutcome(bet: any, winner: string) {
+    const winAmount =
+      Number(bet.win_amount ?? bet.winAmount ?? bet.amount * bet.odds) || 0;
+    const lossAmount =
+      Number(bet.loss_amount ?? bet.lossAmount ?? bet.amount) || 0;
+
+    const winnerId = Number(winner);
+
+    // For session bets (fancy, fancy1, etc.), compare selectionId with winner_id
+    // This is the primary comparison method for session bets
+    if (!isNaN(winnerId) && bet.selectionId !== null && bet.selectionId !== undefined) {
+      const betSelectionId = Number(bet.selectionId);
+      if (!isNaN(betSelectionId)) {
+        // If selectionId matches winner_id, bet won
+        if (betSelectionId === winnerId) {
+          return { status: 'won' as const, profitLoss: winAmount };
+        } else {
+          return { status: 'lost' as const, profitLoss: -lossAmount };
+        }
+      }
+    }
+
+    // Handle back/lay bet types with numeric comparison (like PHP code)
+    const betType = bet.bet_type ?? bet.betType;
+    const betValue = Number(bet.bet_value ?? bet.betValue ?? 0);
+
+    // If bet has betType and betValue, use numeric comparison logic
+    if (betType && betValue > 0 && !isNaN(winnerId)) {
+      let isWinner = false;
+
+      if (betType.toLowerCase() === 'back') {
+        // Back bet: winner if winner_id >= bet_value
+        isWinner = winnerId >= betValue;
+      } else if (betType.toLowerCase() === 'lay') {
+        // Lay bet: winner if winner_id < bet_value
+        isWinner = winnerId < betValue;
+      }
+
+      if (isWinner) {
+        return { status: 'won' as const, profitLoss: winAmount };
+      } else {
+        return { status: 'lost' as const, profitLoss: -lossAmount };
+      }
+    }
+
+    // Fallback to string comparison for other bet types
     const betSelection =
       bet.bet_name ??
       bet.betName ??
@@ -478,11 +587,6 @@ export class SettlementService {
     if (!betSelection) {
       return null;
     }
-
-    const winAmount =
-      Number(bet.win_amount ?? bet.winAmount ?? bet.amount * bet.odds) || 0;
-    const lossAmount =
-      Number(bet.loss_amount ?? bet.lossAmount ?? bet.amount) || 0;
 
     // Compare bet selection with winner (case-insensitive)
     if (betSelection.toString().trim().toLowerCase() === winner.toString().trim().toLowerCase()) {
@@ -500,31 +604,189 @@ export class SettlementService {
     matchId: string,
     outcome: 'won' | 'lost',
   ) {
-    const wallet = await tx.wallet.upsert({
-      where: { userId },
-      update: {},
-      create: { userId },
+    // CPL = Client Profit/Loss (positive = client loses, negative = client wins)
+    const CPL = profitLoss;
+
+    // Get client user
+    const clientUser = await tx.user.findUnique({
+      where: { id: userId },
+      include: { parent: true },
     });
 
-    // Calculate the actual profit/loss accounting for liability
-    // If won: add win amount, clear liability
-    // If lost: deduct loss amount, clear liability
-    const liabilityToClear = Math.abs(profitLoss);
+    if (!clientUser) {
+      throw new Error(`User ${userId} not found`);
+    }
+
+    // STEP 1 — CLIENT → AGENT
+    // Agent owns 100% of client's P/L
+    let AGENT_PL = CPL;
+    let agentUser = clientUser.parent;
+
+    // STEP 2 — AGENT → ADMIN
+    let ADMIN_PL = 0;
+    let ADMIN_FINAL = 0;
+    let AGENT_FINAL = AGENT_PL;
+    let adminUser: { id: string; commissionPercentage: number; parentId: string | null } | null = null;
+
+    if (agentUser && agentUser.parentId) {
+      // Get Agent's share (stored in commissionPercentage field)
+      // This is AD% - Admin's share percentage
+      const AD_SHARE = agentUser.commissionPercentage;
+      ADMIN_PL = AGENT_PL * (AD_SHARE / 100);
+      AGENT_FINAL = AGENT_PL - ADMIN_PL; // AGENT_PL * (1 - AD_SHARE / 100)
+
+      // Get Admin (Agent's parent)
+      const foundAdmin = await tx.user.findUnique({
+        where: { id: agentUser.parentId },
+      });
+      if (foundAdmin) {
+        adminUser = foundAdmin;
+      }
+    }
+
+    // STEP 3 — ADMIN → SUPERADMIN
+    let SUPER_PL = 0;
+    let superAdminUser: { id: string } | null = null;
+
+    if (adminUser) {
+      // Get Admin's share (stored in commissionPercentage field)
+      // This is SA% - SuperAdmin's share percentage
+      const SA_SHARE = adminUser.commissionPercentage;
+      SUPER_PL = ADMIN_PL * (SA_SHARE / 100);
+      ADMIN_FINAL = ADMIN_PL - SUPER_PL; // ADMIN_PL * (1 - SA_SHARE / 100)
+
+      // Get SuperAdmin (Admin's parent)
+      if (adminUser.parentId) {
+        const foundSuperAdmin = await tx.user.findUnique({
+          where: { id: adminUser.parentId },
+        });
+        if (foundSuperAdmin) {
+          superAdminUser = foundSuperAdmin;
+        }
+      }
+    } else {
+      ADMIN_FINAL = ADMIN_PL;
+    }
+
+    // FINAL BALANCE UPDATES
+    // Update Agent balance
+    if (agentUser) {
+      const agentWallet = await tx.wallet.upsert({
+        where: { userId: agentUser.id },
+        update: {},
+        create: { userId: agentUser.id, balance: 0, liability: 0 },
+      });
+
+      const liabilityToClear = Math.abs(AGENT_PL);
+
+      await tx.wallet.update({
+        where: { userId: agentUser.id },
+        data: {
+          liability: { decrement: liabilityToClear },
+          balance: { increment: AGENT_FINAL },
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          walletId: agentWallet.id,
+          amount: Math.abs(AGENT_FINAL),
+          type:
+            AGENT_FINAL >= 0
+              ? TransactionType.BET_WON
+              : TransactionType.BET_LOST,
+          description: `Settlement share for bet ${betId} on match ${matchId} - Agent final: ${AGENT_FINAL}`,
+        },
+      });
+    }
+
+    // Update Admin balance
+    if (adminUser) {
+      const adminWallet = await tx.wallet.upsert({
+        where: { userId: adminUser.id },
+        update: {},
+        create: { userId: adminUser.id, balance: 0, liability: 0 },
+      });
+
+      await tx.wallet.update({
+        where: { userId: adminUser.id },
+        data: {
+          balance: { increment: ADMIN_FINAL },
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          walletId: adminWallet.id,
+          amount: Math.abs(ADMIN_FINAL),
+          type:
+            ADMIN_FINAL >= 0
+              ? TransactionType.BET_WON
+              : TransactionType.BET_LOST,
+          description: `Settlement share for bet ${betId} on match ${matchId} - Admin final: ${ADMIN_FINAL}`,
+        },
+      });
+    }
+
+    // Update SuperAdmin balance
+    if (superAdminUser) {
+      const superAdminWallet = await tx.wallet.upsert({
+        where: { userId: superAdminUser.id },
+        update: {},
+        create: { userId: superAdminUser.id, balance: 0, liability: 0 },
+      });
+
+      await tx.wallet.update({
+        where: { userId: superAdminUser.id },
+        data: {
+          balance: { increment: SUPER_PL },
+        },
+      });
+
+      await tx.transaction.create({
+        data: {
+          walletId: superAdminWallet.id,
+          amount: Math.abs(SUPER_PL),
+          type:
+            SUPER_PL >= 0
+              ? TransactionType.BET_WON
+              : TransactionType.BET_LOST,
+          description: `Settlement share for bet ${betId} on match ${matchId} - SuperAdmin share: ${SUPER_PL}`,
+        },
+      });
+    }
+
+    // Update Client wallet
+    // CPL (Client Profit/Loss):
+    // - Positive CPL = client loses money (already deducted, just clear liability)
+    // - Negative CPL = client wins money (add to balance, clear liability)
+    const clientWallet = await tx.wallet.upsert({
+      where: { userId },
+      update: {},
+      create: { userId, balance: 0, liability: 0 },
+    });
+
+    const liabilityToClear = Math.abs(CPL);
+    const walletUpdateData: Prisma.WalletUpdateInput = {
+      liability: { decrement: liabilityToClear },
+    };
+
+    // If client won (negative CPL means profit), add to balance
+    if (CPL < 0) {
+      walletUpdateData.balance = { increment: Math.abs(CPL) };
+    }
 
     await tx.wallet.update({
       where: { userId },
-      data: {
-        liability: { decrement: liabilityToClear }, // clear exposure/liability
-        balance: { increment: profitLoss }, // win/loss applied
-      },
+      data: walletUpdateData,
     });
 
     await tx.transaction.create({
       data: {
-        walletId: wallet.id,
-        amount: Math.abs(profitLoss),
+        walletId: clientWallet.id,
+        amount: Math.abs(CPL),
         type:
-          profitLoss >= 0
+          CPL < 0 // Negative CPL means client won
             ? TransactionType.BET_WON
             : TransactionType.BET_LOST,
         description: `Settlement for bet ${betId} on match ${matchId} (${outcome})`,
@@ -537,15 +799,29 @@ export class SettlementService {
    * Includes match info and bet counts
    */
   async getSettlementIdsNeedingSettlement() {
+    // Filter by gtype: fancy, fancy1, Normal, oddeven (like PHP code)
+    // Note: PHP code doesn't require settlementId, so we make it optional
+    // Also include "fancy" (not just "fancy1") based on actual data
+    // Also include bets where marketName is "Normal" (session bets)
     const bets = await this.prisma.bet.findMany({
       where: {
         status: BetStatus.PENDING,
-        settlementId: { not: null },
-        match: {
-          status: {
-            in: [MatchStatus.FINISHED, MatchStatus.LIVE],
+        OR: [
+          {
+            gtype: {
+              in: ['fancy', 'fancy1', 'Normal', 'oddeven'],
+            },
           },
-        },
+          {
+            marketName: 'Normal', // Session bets often have marketName "Normal"
+          },
+        ],
+        // Remove match status filter to show all pending bets (like PHP)
+        // match: {
+        //   status: {
+        //     in: [MatchStatus.FINISHED, MatchStatus.LIVE],
+        //   },
+        // },
       },
       include: {
         match: {
@@ -563,44 +839,65 @@ export class SettlementService {
       orderBy: { createdAt: 'desc' },
     });
 
-    // Group by settlement_id
-    const settlementMap = new Map<
+    // Group by match_id, selection_id, gtype, bet_name (like PHP code)
+    const groupedMap = new Map<
       string,
       {
-        settlement_id: string;
         match_id: string;
+        selection_id: number | null;
+        gtype: string | null;
+        bet_name: string | null;
         match: any;
         pending_bets_count: number;
         total_bet_amount: number;
-        first_bet: any;
+        created_at: Date;
+        settlement_ids: Set<string>;
       }
     >();
 
     for (const bet of bets) {
-      if (!bet.settlementId) continue;
+      // Create unique key: match_id + selection_id + gtype + bet_name
+      // Note: settlementId is optional, so we don't skip bets without it
+      const groupKey = `${bet.matchId}_${bet.selectionId ?? 'null'}_${bet.gtype ?? 'null'}_${bet.betName ?? 'null'}`;
 
-      const existing = settlementMap.get(bet.settlementId);
+      const existing = groupedMap.get(groupKey);
       if (existing) {
         existing.pending_bets_count += 1;
         existing.total_bet_amount += Number(bet.amount || 0);
+        if (bet.settlementId) {
+          existing.settlement_ids.add(bet.settlementId);
+        }
+        // Keep earliest created_at
+        if (bet.createdAt < existing.created_at) {
+          existing.created_at = bet.createdAt;
+        }
       } else {
-        settlementMap.set(bet.settlementId, {
-          settlement_id: bet.settlementId,
+        groupedMap.set(groupKey, {
           match_id: bet.matchId,
+          selection_id: bet.selectionId,
+          gtype: bet.gtype,
+          bet_name: bet.betName,
           match: bet.match,
           pending_bets_count: 1,
           total_bet_amount: Number(bet.amount || 0),
-          first_bet: {
-            betName: bet.betName,
-            marketName: bet.marketName,
-            gtype: bet.gtype,
-            selectionId: bet.selectionId,
-          },
+          created_at: bet.createdAt,
+          settlement_ids: bet.settlementId ? new Set([bet.settlementId]) : new Set(),
         });
       }
     }
 
-    return Array.from(settlementMap.values());
+    // Convert to array format similar to PHP
+    return Array.from(groupedMap.values()).map((group) => ({
+      match_id: group.match_id,
+      selection_id: group.selection_id,
+      gtype: group.gtype,
+      bet_name: group.bet_name,
+      match: group.match,
+      pending_bets_count: group.pending_bets_count,
+      total_bet_amount: group.total_bet_amount,
+      created_at: group.created_at,
+      settlement_ids: Array.from(group.settlement_ids),
+    }));
   }
 
   /**
@@ -675,6 +972,7 @@ export class SettlementService {
         amount: bet.amount,
         odds: bet.odds,
         betName: bet.betName,
+        selectionId: bet.selectionId,
         winAmount: bet.winAmount,
         lossAmount: bet.lossAmount,
         status: bet.status,
@@ -742,6 +1040,7 @@ export class SettlementService {
       id: bet.id,
       settlement_id: bet.settlementId,
       match_id: bet.matchId,
+      selection_id: bet.selectionId,
       user: bet.user,
       match: bet.match,
       amount: bet.amount,
@@ -826,6 +1125,7 @@ export class SettlementService {
         id: bet.id,
         settlement_id: bet.settlementId,
         match_id: bet.matchId,
+        selection_id: bet.selectionId,
         user: bet.user,
         match: bet.match,
         amount: bet.amount,
@@ -1055,6 +1355,7 @@ export class SettlementService {
           amount: bet.amount,
           odds: bet.odds,
           betName: bet.betName,
+          selectionId: bet.selectionId,
           marketName: bet.marketName,
           winAmount: bet.winAmount,
           lossAmount: bet.lossAmount,
@@ -1073,6 +1374,7 @@ export class SettlementService {
               amount: bet.amount,
               odds: bet.odds,
               betName: bet.betName,
+              selectionId: bet.selectionId,
               marketName: bet.marketName,
               winAmount: bet.winAmount,
               lossAmount: bet.lossAmount,
