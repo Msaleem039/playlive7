@@ -96,9 +96,58 @@ This means migrations haven't been run. Follow these steps:
    pm2 restart nest-app
    ```
 
-### Error: "DATABASE_URL is not set"
+### Error: "DATABASE_URL is not set" or "Can't reach database server at `placeholder:5432`"
 
-Make sure your `.env` file exists and contains the `DATABASE_URL` variable.
+This means the `DATABASE_URL` environment variable is not set or PM2 is not loading the `.env` file.
+
+**Solution:**
+
+1. **Verify `.env` file exists and has correct values:**
+   ```bash
+   # Check if .env exists
+   ls -la .env
+   
+   # View DATABASE_URL (be careful, this shows password)
+   cat .env | grep DATABASE_URL
+   ```
+
+2. **Run verification script:**
+   ```bash
+   node scripts/verify-production-env.js
+   ```
+
+3. **If `.env` is missing or has placeholder values:**
+   ```bash
+   # Copy example file
+   cp env.production.example .env
+   
+   # Edit with your actual database credentials
+   nano .env
+   # or
+   vi .env
+   ```
+
+4. **Restart PM2 with environment file:**
+   ```bash
+   # Stop current process
+   pm2 stop backend
+   pm2 delete backend
+   
+   # Start with ecosystem config (loads .env automatically)
+   pm2 start ecosystem.config.js
+   
+   # Or start manually with env file
+   pm2 start dist/main.js --name backend --env-file .env
+   
+   # Check logs
+   pm2 logs backend
+   ```
+
+5. **Verify environment is loaded:**
+   ```bash
+   # Check if DATABASE_URL is loaded (should NOT show placeholder)
+   pm2 logs backend | grep DATABASE_URL
+   ```
 
 ### Automatic Migration on Startup
 
@@ -112,22 +161,66 @@ The application will attempt to run migrations automatically on startup in produ
 - [ ] Application built (`npm run build`)
 - [ ] Application started (`npm run start:prod` or PM2)
 
-## PM2 Commands
+## PM2 Configuration
+
+The project includes an `ecosystem.config.js` file for PM2. This ensures environment variables are loaded correctly.
+
+### Using PM2 with Ecosystem Config
 
 ```bash
-# Start application
-pm2 start dist/main.js --name nest-app
+# Start application with ecosystem config
+pm2 start ecosystem.config.js
+
+# Or start with specific environment
+pm2 start ecosystem.config.js --env production
+
+# Save PM2 configuration
+pm2 save
+
+# Setup PM2 to start on system boot
+pm2 startup
+```
+
+### PM2 Commands
+
+```bash
+# Start application (using ecosystem config - recommended)
+pm2 start ecosystem.config.js
+
+# Or start manually
+pm2 start dist/main.js --name backend --env-file .env
 
 # View logs
-pm2 logs nest-app
+pm2 logs backend
+
+# View error logs only
+pm2 logs backend --err
 
 # Restart application
-pm2 restart nest-app
+pm2 restart backend
 
 # Stop application
-pm2 stop nest-app
+pm2 stop backend
 
 # View status
 pm2 status
+
+# Delete from PM2
+pm2 delete backend
 ```
+
+## Verify Environment Setup
+
+Before starting the application, verify your environment is configured correctly:
+
+```bash
+# Verify environment variables are set
+node scripts/verify-production-env.js
+```
+
+This script will check:
+- ✅ `.env` file exists
+- ✅ All required environment variables are set
+- ✅ `DATABASE_URL` format is valid
+- ✅ No placeholder values are used
 
