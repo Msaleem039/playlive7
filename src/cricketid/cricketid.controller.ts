@@ -17,27 +17,41 @@ export class CricketIdController {
     return this.cricketIdService.getSports();
   }
 
+  @Get('matches/all')
+  getAllMatches() {
+    return this.cricketIdService.getAllMatches();
+  }
+
+  @Get('match/detail')
+  getSingleMatchDetail(
+    @Query('sid') sid: number,
+    @Query('gmid') gmid: number,
+  ) {
+    return this.cricketIdService.getSingleMatchDetail(sid, gmid);
+  }
+
+  @Get('match/private')
+  getPrivateData(
+    @Query('sid') sid: number,
+    @Query('gmid') gmid: number,
+  ) {
+    return this.cricketIdService.getPrivateData(sid, gmid);
+  }
+
+  @Get('match')
+  getMatch(@Query('match') matchId?: string) {
+    return this.cricketIdService.fetchMatch(matchId);
+  }
+
+  @Get('match/:matchId')
+  getMatchById(@Param('matchId') matchId: string) {
+    return this.cricketIdService.fetchMatch(matchId);
+  }
+
   @Get('matches/details/:sid')
   getMatchDetails(@Param('sid') sid: number) {
     return this.cricketIdService.getMatchDetailsBySid(sid);
   }
-
-  @Get('match/detail')
-getMatchDetail(
-  @Query('sid') sid: number,
-  @Query('gmid') gmid: number,
-) {
-  return this.cricketIdService.getSingleMatchDetail(sid, gmid);
-}
-
-
-@Get('match/private')
-getPrivateData(
-  @Query('sid') sid: number,
-  @Query('gmid') gmid: number,
-) {
-  return this.cricketIdService.getPrivateData(sid, gmid);
-}
 
 
   @Get('matches/:matchId/fancy')

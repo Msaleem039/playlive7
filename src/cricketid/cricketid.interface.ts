@@ -60,3 +60,22 @@ export interface CricketIdScore {
   [key: string]: any;
 }
 
+export interface AllMatchesResponse {
+  status: string;
+  data: {
+    status: {
+      statusCode: string;
+      statusDesc: string;
+    };
+    success: boolean;
+    result: Array<{
+      event: {
+        id: string;
+        name: string;
+        [key: string]: any;
+      };
+      [key: string]: any;
+    }>;
+  };
+}
+
