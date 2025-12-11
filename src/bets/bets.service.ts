@@ -1,14 +1,17 @@
 import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
-import axios from 'axios';
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { BetStatus, MatchStatus, Prisma, TransactionType } from '@prisma/client';
+import { CricketIdService } from '../cricketid/cricketid.service';
 
 @Injectable()
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cricketIdService: CricketIdService,
+  ) {}
 
   // ---------------------------- MOCK DATABASE FUNCTIONS ---------------------------- //
   // Replace these with actual TypeORM / Prisma / Sequelize calls
@@ -153,21 +156,6 @@ export class BetsService {
     return this.selectExposureBalance(userId, gtype, settlement);
   }
 
-  async checkExistingAPICall(
-    matchId: number,
-    marketName: string,
-    betName: string,
-    gtype: string,
-  ) {
-    return this.prisma.bet.count({
-      where: {
-        matchId: String(matchId),
-        marketName,
-        betName,
-        gtype,
-      },
-    });
-  }
 
   // ---------------------------------- MAIN LOGIC ---------------------------------- //
 
@@ -187,6 +175,8 @@ export class BetsService {
       win_amount,
       loss_amount,
       gtype,
+      marketId,
+      eventId,
       runner_name_2,
     } = input;
 
@@ -313,16 +303,21 @@ export class BetsService {
     
     try {
       const result = await this.prisma.$transaction(async (tx) => {
-        // Step 1: Ensure match exists
+        // Step 1: Ensure match exists (update with eventId if provided)
         await tx.match.upsert({
           where: { id: String(match_id) },
-          update: {},
+          update: {
+            ...(eventId && { eventId }),
+            ...(marketId && { marketId }),
+          },
           create: {
             id: String(match_id),
             homeTeam: bet_name ?? 'Unknown',
             awayTeam: market_name ?? 'Unknown',
             startTime: new Date(),
             status: MatchStatus.LIVE,
+            ...(eventId && { eventId }),
+            ...(marketId && { marketId }),
           },
         });
 
@@ -394,6 +389,8 @@ export class BetsService {
           settlementId: settlement_id,
           toReturn: to_return,
           status: BetStatus.PENDING,
+          ...(marketId && { marketId }),
+          ...(eventId && { eventId }),
           metadata: runner_name_2 ? { runner_name_2 } : undefined,
         };
 
@@ -419,41 +416,40 @@ export class BetsService {
         gtype,
       );
 
-      // 6. EXTERNAL API CALL IF NECESSARY (non-critical, can fail without affecting bet)
-      const existingApi = await this.checkExistingAPICall(
-        match_id,
-        market_name,
-        bet_name,
-        gtype,
-      );
-
-      if (existingApi == 0) {
-        const payload = {
-          event_id: match_id,
-          event_name: market_name,
-          market_id: selid,
-          market_name: bet_name,
-          market_type: gtype,
-        };
-
+      // 6. PLACE BET WITH VENDOR API (non-critical, can fail without affecting bet)
+      // Only place bet with vendor if marketId and eventId are provided
+      if (marketId && eventId) {
         try {
-          const response = await axios.post(
-            'https://api.cricketid.xyz/placed_bets?key=dijbfuwd719e12rqhfbjdqdnkqnd11&sid=4',
-            payload,
-            { headers: { 'Content-Type': 'application/json' } },
-          );
-          debug.external_api_response = response.data;
+          const vendorBetData = {
+            marketId,
+            selectionId: normalizedSelectionId,
+            side: (bet_type.toUpperCase() === 'BACK' ? 'BACK' : 'LAY') as 'BACK' | 'LAY',
+            size: normalizedBetValue,
+            price: normalizedBetRate,
+            eventId,
+          };
+
+          const vendorResponse = await this.cricketIdService.placeBet(vendorBetData);
+          debug.vendor_api_response = vendorResponse;
+          this.logger.log(`Bet placed with vendor API for bet ${result.betId}`);
         } catch (error) {
-          debug.external_api_error =
-            axios.isAxiosError(error) && error.response
+          // Log but don't fail the bet placement
+          debug.vendor_api_error =
+            error instanceof Error
               ? {
-                  status: error.response.status,
-                  data: error.response.data,
+                  message: error.message,
+                  stack: error.stack,
                 }
-              : { message: (error as Error).message };
+              : { message: String(error) };
+          this.logger.warn(
+            `Failed to place bet with vendor API (bet ${result.betId} still created): ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
       } else {
-        debug.external_api_response = 'Skipped – already exists';
+        debug.vendor_api_response = 'Skipped – marketId or eventId not provided';
+        this.logger.warn(
+          `Bet placed without vendor API call (missing marketId or eventId) for bet ${result.betId}`,
+        );
       }
 
       this.logger.log(`Bet placed successfully: ${result.betId} for user ${userId}`);

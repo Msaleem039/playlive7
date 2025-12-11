@@ -170,7 +170,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       this.logger.error('  • Check if your firewall is blocking the connection');
       this.logger.error('  • Verify your Neon database is not paused');
       this.logger.error('  • Try using the direct connection URL instead of pooler');
-      this.logger.error('  • Run: node scripts/test-neon-connection.js to test connection');
+      this.logger.error('  • Verify DATABASE_URL in your .env file is correct');
     } else if (error.code === 'P1000') {
       this.logger.error('  • Authentication failed');
       this.logger.error('  • Check your database username and password');
@@ -185,10 +185,10 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     }
     
     this.logger.error('\n💡 Quick fixes:');
-    this.logger.error('  1. Test connection: node scripts/test-neon-connection.js');
-    this.logger.error('  2. Check .env file has correct DATABASE_URL');
-    this.logger.error('  3. Verify Neon database is active in Neon Console');
-    this.logger.error('  4. Try using direct connection URL (not pooler)');
+    this.logger.error('  1. Check .env file has correct DATABASE_URL');
+    this.logger.error('  2. Verify Neon database is active in Neon Console');
+    this.logger.error('  3. Try using direct connection URL (not pooler)');
+    this.logger.error('  4. Run: npm run verify:env to verify environment setup');
     this.logger.error('');
   }
 

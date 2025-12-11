@@ -12,61 +12,98 @@ export class CricketIdController {
     private readonly webhookService: CricketIdWebhookService,
   ) {}
 
+  /**
+   * Get all sports/events
+   * GET /cricketid/sports
+   */
   @Get('sports')
-  getSports() {
-    return this.cricketIdService.getSports();
+  getAllSports() {
+    return this.cricketIdService.getAllSports();
   }
 
-  @Get('matches/all')
-  getAllMatches() {
-    return this.cricketIdService.getAllMatches();
+  /**
+   * Get all competitions/series for a specific sport
+   * GET /cricketid/series?sportId=4
+   * Returns list of competitions with competition.id, competition.name, etc.
+   * @param sportId - Sport ID (4 for cricket)
+   */
+  @Get('series')
+  getSeriesList(@Query('sportId') sportId: number) {
+    return this.cricketIdService.getSeriesList(sportId);
   }
 
-  @Get('match/detail')
-  getSingleMatchDetail(
-    @Query('sid') sid: number,
-    @Query('gmid') gmid: number,
-  ) {
-    return this.cricketIdService.getSingleMatchDetail(sid, gmid);
+  /**
+   * Get match details by competition ID
+   * GET /cricketid/matches?competitionId={competitionId}
+   * Example: GET /cricketid/matches?competitionId=9992899
+   * @param competitionId - Competition ID from the series list (e.g., "9992899")
+   */
+  @Get('matches')
+  getMatchDetails(@Query('competitionId') competitionId: string | number) {
+    return this.cricketIdService.getMatchDetails(competitionId);
   }
 
-  @Get('match/private')
-  getPrivateData(
-    @Query('sid') sid: number,
-    @Query('gmid') gmid: number,
-  ) {
-    return this.cricketIdService.getPrivateData(sid, gmid);
+  /**
+   * Get market list (odds/markets) for a specific event/match
+   * GET /cricketid/markets?eventId={eventId}
+   * Example: GET /cricketid/markets?eventId=34917574
+   * Returns markets with runners, selectionId, marketName, etc.
+   * @param eventId - Event ID from the match list (e.g., "34917574")
+   */
+  @Get('markets')
+  getMarketList(@Query('eventId') eventId: string | number) {
+    return this.cricketIdService.getMarketList(eventId);
   }
 
-  @Get('match')
-  getMatch(@Query('match') matchId?: string) {
-    return this.cricketIdService.fetchMatch(matchId);
+  /**
+   * Get Betfair odds for specific markets
+   * GET /cricketid/odds?marketIds=1.250049502,1.250049500
+   * Returns detailed odds data including availableToBack, availableToLay, tradedVolume, etc.
+   * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
+   */
+  @Get('odds')
+  getBetfairOdds(@Query('marketIds') marketIds: string) {
+    return this.cricketIdService.getBetfairOdds(marketIds);
   }
 
-  @Get('match/:matchId')
-  getMatchById(@Param('matchId') matchId: string) {
-    return this.cricketIdService.fetchMatch(matchId);
+  /**
+   * Get Betfair results for specific markets
+   * GET /cricketid/results?marketIds=1.249961303
+   * Returns result data including winner, result, status, type, etc.
+   * @param marketIds - Comma-separated market IDs (e.g., "1.249961303")
+   */
+  @Get('results')
+  getBetfairResults(@Query('marketIds') marketIds: string) {
+    return this.cricketIdService.getBetfairResults(marketIds);
   }
 
-  @Get('matches/details/:sid')
-  getMatchDetails(@Param('sid') sid: number) {
-    return this.cricketIdService.getMatchDetailsBySid(sid);
+  /**
+   * Get fancy bet results for a specific event
+   * GET /cricketid/fancy-result?eventId=34917574
+   * Returns fancy bet results with odds, runners, etc.
+   * @param eventId - Event ID (e.g., "34917574")
+   */
+  @Get('fancy-result')
+  getFancyResult(@Query('eventId') eventId: string | number) {
+    return this.cricketIdService.getFancyResult(eventId);
   }
 
-
-  @Get('matches/:matchId/fancy')
-  getMatchFancy(@Param('matchId') matchId: string) {
-    return this.cricketIdService.getMatchFancy(matchId);
-  }
-
-  @Get('matches/:matchId/session')
-  getMatchSession(@Param('matchId') matchId: string) {
-    return this.cricketIdService.getMatchSession(matchId);
-  }
-
-  @Get('matches/:matchId/score')
-  getMatchScore(@Param('matchId') matchId: string) {
-    return this.cricketIdService.getMatchScore(matchId);
+  /**
+   * Place bet via vendor API
+   * POST /cricketid/place-bet
+   * Body: { marketId, selectionId, side, size, price, eventId, ... }
+   */
+  @Post('place-bet')
+  async placeBet(@Body() betData: {
+    marketId: string;
+    selectionId: number;
+    side: 'BACK' | 'LAY';
+    size: number;
+    price: number;
+    eventId?: string;
+    [key: string]: any;
+  }) {
+    return this.cricketIdService.placeBet(betData);
   }
 
   @Post('webhook')

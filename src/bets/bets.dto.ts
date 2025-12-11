@@ -56,6 +56,15 @@ export class PlaceBetDto {
   @IsString()
   gtype: string;
 
+  // New fields for vendor API
+  @IsOptional()
+  @IsString()
+  marketId?: string; // Market ID from vendor API (e.g., "1.250049502")
+
+  @IsOptional()
+  @IsString()
+  eventId?: string; // Event ID from vendor API (e.g., "34917574")
+
   @IsOptional()
   @IsString()
   runner_name_2?: string;

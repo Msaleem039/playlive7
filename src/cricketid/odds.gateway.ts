@@ -43,10 +43,22 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('subscribe_match')
   async subscribeMatch(
-    @MessageBody() data: { sid: number; gmid: number },
+    @MessageBody() data: { eventId?: string | number; marketIds?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const roomName = `${data.sid}_${data.gmid}`;
+    // Support both old format (sid, gmid) and new format (eventId, marketIds)
+    const eventId = data.eventId;
+    const marketIds = data.marketIds;
+    
+    if (!eventId && !marketIds) {
+      client.emit('odds_error', {
+        error: 'Either eventId or marketIds is required',
+      });
+      return;
+    }
+
+    // Use marketIds if provided, otherwise use eventId to get markets first
+    const roomName = marketIds ? `markets_${marketIds}` : `event_${eventId}`;
     client.join(roomName);
 
     // Track which rooms this client is in
@@ -64,11 +76,36 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Create interval to poll API every 2-3 seconds
     const interval = setInterval(async () => {
       try {
-        const result = await this.cricketService.getPrivateData(data.sid, data.gmid);
+        let result;
+        
+        if (marketIds) {
+          // Direct odds fetch if marketIds provided
+          result = await this.cricketService.getBetfairOdds(marketIds);
+        } else if (eventId) {
+          // Get markets first, then get odds for all markets
+          const markets = await this.cricketService.getMarketList(eventId);
+          
+          // Extract marketIds from markets response
+          if (markets && Array.isArray(markets)) {
+            const marketIdList = markets
+              .map((m: any) => m.marketId)
+              .filter((id: any) => id)
+              .join(',');
+            
+            if (marketIdList) {
+              result = await this.cricketService.getBetfairOdds(marketIdList);
+            } else {
+              result = markets; // Return markets if no marketIds found
+            }
+          } else {
+            result = markets;
+          }
+        }
+        
         this.server.to(roomName).emit('odds_update', result);
       } catch (error) {
         this.logger.error(
-          `Error fetching private data for room ${roomName}:`,
+          `Error fetching odds data for room ${roomName}:`,
           error instanceof Error ? error.message : String(error),
         );
         // Optionally emit error to clients
@@ -85,10 +122,12 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('unsubscribe_match')
   leaveMatch(
-    @MessageBody() data: { sid: number; gmid: number },
+    @MessageBody() data: { eventId?: string | number; marketIds?: string },
     @ConnectedSocket() client: Socket,
   ) {
-    const roomName = `${data.sid}_${data.gmid}`;
+    const eventId = data.eventId;
+    const marketIds = data.marketIds;
+    const roomName = marketIds ? `markets_${marketIds}` : `event_${eventId}`;
     client.leave(roomName);
 
     // Remove room from client's tracked rooms

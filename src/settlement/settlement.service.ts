@@ -1,7 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import axios from 'axios';
-import { URLSearchParams } from 'url';
 import {
   BetStatus,
   MatchStatus,
@@ -9,6 +7,7 @@ import {
   TransactionType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { CricketIdService } from '../cricketid/cricketid.service';
 
 type SettlementResult = {
   success: boolean;
@@ -26,12 +25,11 @@ type SettlementResult = {
 @Injectable()
 export class SettlementService {
   private readonly logger = new Logger(SettlementService.name);
-  private readonly baseUrl = 'https://api.cricketid.xyz';
-  private readonly apiKey =
-    process.env.CRICKET_ID_API_KEY ?? 'dijbfuwd719e12rqhfbjdqdnkqnd11';
-  private readonly apiSid = process.env.CRICKET_ID_API_SID ?? '4';
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cricketIdService: CricketIdService,
+  ) {}
 
   /**
    * Settle bets by settlement_id (match_id + selection_id)
@@ -353,6 +351,32 @@ export class SettlementService {
         settlementId,
         status: BetStatus.PENDING,
       },
+      select: {
+        id: true,
+        userId: true,
+        matchId: true,
+        amount: true,
+        odds: true,
+        selId: true,
+        selectionId: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        marketId: true,
+        eventId: true,
+        gtype: true,
+        betValue: true,
+        betRate: true,
+        winAmount: true,
+        lossAmount: true,
+        settlementId: true,
+        toReturn: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        metadata: true,
+      } as any,
       orderBy: { createdAt: 'asc' },
     });
   }
@@ -438,93 +462,106 @@ export class SettlementService {
   }
 
   /**
-   * Fetch match result from CricketID API
-   * Updated to match PHP code structure and use bet-specific data
+   * Fetch match result from new vendor API
+   * Uses /v3/betfairResults endpoint with marketIds
    */
   private async fetchMatchResult(matchId: string, referenceBet?: any) {
-    const matchDetails = await this.prisma.match.findUnique({
-      where: { id: matchId },
-      select: {
-        homeTeam: true,
-        awayTeam: true,
-        eventId: true,
-        eventName: true,
-        marketId: true,
-        marketName: true,
-      } as any,
-    });
-
-    // Build payload matching PHP code structure
-    // PHP uses: event_id, event_name, market_id, market_name, market_type
-    const payload = {
-      // In PHP, event_id is the original match_id from the provider.
-      // Here we prioritise the bet's matchId, then the match's stored eventId, then fallback to our local matchId.
-      event_id: Number(
-        referenceBet?.matchId ?? matchDetails?.eventId ?? matchId,
-      ),
-      event_name:
-        matchDetails?.eventName ??
-        (matchDetails?.homeTeam && matchDetails?.awayTeam
-          ? `${matchDetails.homeTeam} vs ${matchDetails.awayTeam}`
-          : referenceBet?.marketName ?? referenceBet?.betName ?? 'Unknown Event'),
-      // Critical: for CricketID result API, market_id should match the selid we sent when placing the bet.
-      // We now store that as Bet.selId, so use that first, then fall back to any stored marketId/selectionId.
-      market_id: Number(
-        referenceBet?.selId ??
-          matchDetails?.marketId ??
-          referenceBet?.selectionId ??
-          referenceBet?.marketId ??
-          matchId,
-      ),
-      market_name:
-        matchDetails?.marketName ??
-        referenceBet?.marketName ??
-        referenceBet?.betName ??
-        'MATCH_ODDS',
-      // Add market_type if available from bet data
-      ...(referenceBet?.gtype && { market_type: referenceBet.gtype }),
-    };
-
-    const params = new URLSearchParams({
-      key: this.apiKey,
-      sid: this.apiSid,
-    });
-
-    const url = `${this.baseUrl}/get-result?${params.toString()}`;
-
     try {
-      const response = await axios.post(url, payload, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 10000, // 10 second timeout
+      // Get match details to find eventId and marketId
+      const matchDetails = await this.prisma.match.findUnique({
+        where: { id: matchId },
+        select: {
+          eventId: true,
+          marketId: true,
+        } as any,
       });
 
-      return response.data;
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        const errorData = error.response?.data;
-        const errorMessage =
-          errorData?.message || JSON.stringify(errorData) || 'Unknown error';
+      // Get marketId from bet, match details, or fetch from market list
+      // Priority: bet.marketId > match.marketId > fetch from market list
+      let marketId = referenceBet?.marketId || matchDetails?.marketId;
 
-        // If result is not declared yet, it's an expected scenario - log at debug level
-        if (
-          error.response?.status === 400 &&
-          (errorMessage.includes('result is not declared yet') ||
-            errorMessage.includes('result is not declared'))
-        ) {
-          this.logger.debug(
-            `Result not available yet for settlement_id ${referenceBet?.settlementId || matchId} - this is expected if the match just finished`,
-          );
-        } else {
-          // Other errors should be logged as errors
-          this.logger.error(
-            `Failed to fetch result for match ${matchId} (settlement_id: ${referenceBet?.settlementId || 'N/A'}) - Status: ${error.response?.status} - Data: ${JSON.stringify(errorData)}`,
+      // If we don't have marketId, try to get it from the market list using eventId
+      if (!marketId && matchDetails?.eventId) {
+        try {
+          const eventId: string | number = String(matchDetails.eventId);
+          const markets = await this.cricketIdService.getMarketList(eventId);
+          // Find market that matches the bet's selectionId or marketName
+          if (Array.isArray(markets) && markets.length > 0) {
+            // Try to find matching market based on selectionId or marketName
+            const matchingMarket = markets.find(
+              (m: any) =>
+                m.runners?.some(
+                  (r: any) => r.selectionId === referenceBet?.selectionId,
+                ) || m.marketName === referenceBet?.marketName,
+            );
+            marketId = matchingMarket?.marketId || markets[0]?.marketId;
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Could not fetch markets for eventId ${matchDetails.eventId}: ${(error as Error).message}`,
           );
         }
-      } else {
-        this.logger.error(
-          `Failed to fetch result for match ${matchId} - Unknown error: ${(error as Error).stack}`,
-        );
       }
+
+      if (!marketId) {
+        this.logger.warn(
+          `No marketId found for match ${matchId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
+        );
+        return null;
+      }
+
+      // Fetch result using new API
+      const results = await this.cricketIdService.getBetfairResults(marketId);
+
+      // Parse the new result format
+      // Response format: [{ result: { status, marketId, eventId, sport, isRefund, type, gtype, result: 235, winnerName } }]
+      if (!results || !Array.isArray(results) || results.length === 0) {
+        this.logger.debug(
+          `No results found for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
+        );
+        return null;
+      }
+
+      const resultData = results[0]?.result;
+      if (!resultData) {
+        this.logger.debug(
+          `Result data not available for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
+        );
+        return null;
+      }
+
+      // Check if result is ready
+      if (!resultData.status || resultData.isRefund) {
+        this.logger.debug(
+          `Result not ready or refunded for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
+        );
+        return null;
+      }
+
+      // Extract winner from result
+      // The result field contains the selectionId of the winner (e.g., 235)
+      const winnerSelectionId = resultData.result;
+      if (!winnerSelectionId) {
+        this.logger.debug(
+          `Winner not determined yet for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
+        );
+        return null;
+      }
+
+      // Return in format expected by settlement logic
+      return {
+        winner: winnerSelectionId.toString(), // Convert to string for comparison
+        winnerName: resultData.winnerName,
+        marketId: resultData.marketId,
+        eventId: resultData.eventId,
+        type: resultData.type,
+        gtype: resultData.gtype,
+        isRefund: resultData.isRefund,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to fetch result for match ${matchId} (settlement_id: ${referenceBet?.settlementId || 'N/A'}): ${(error as Error).message}`,
+      );
       return null;
     }
   }

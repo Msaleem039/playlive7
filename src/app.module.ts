@@ -11,7 +11,6 @@ import { RolesModule } from './roles/roles.module';
 import { BettingGateway } from './betting/betting.gateway';
 import { CricketIdModule } from './cricketid/cricketid.module';
 import { BetfairController } from './betting/beffair.controller';
-import { RedisModule } from './redis/redis.module';
 import { BalanceTransferModule } from './balancetransfer/balancetransfer.module';
 import { BetsModule } from './bets/bets.module';
 import { ResultsModule } from './results/results.module';
@@ -32,7 +31,6 @@ import { ScheduleModule } from '@nestjs/schedule';
 
     RolesModule,
     CricketIdModule,
-    RedisModule,
     BalanceTransferModule,
     BetsModule,
     ResultsModule,
