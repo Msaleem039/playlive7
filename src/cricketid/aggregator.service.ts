@@ -6,20 +6,20 @@ import * as https from 'https';
 @Injectable()
 export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
-  private readonly baseUrl = 'https://72.61.140.55';
+  private readonly baseUrl = 'https://api.trusting.com';
 
   constructor(private readonly http: HttpService) {}
 
   private async fetch<T>(path: string, params: Record<string, any> = {}): Promise<T> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-    const url = `https://72.61.140.55${normalizedPath}`;
+    const url = `${this.baseUrl}${normalizedPath}`;
 
     try {
       const { data } = await firstValueFrom(
         this.http.get<T>(url, {
           params,
-          httpsAgent: new https.Agent({ rejectUnauthorized: false }), // SSL bypass for IP
-          headers: { host: 'vendorapi.tresting.com' },               // must match the API host
+          httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+          headers: { host: 'vendorapi.tresting.com' }, // or the host given by the provider
         }),
       );
       return data;
@@ -36,8 +36,9 @@ export class AggregatorService {
    */
   async getCompetitions(sportId: string = '4') {
     try {
-      const response = await this.fetch<{ data?: any[] }>('/cricketid/series', { sportId });
-      return response.data || [];
+      const response = await this.fetch<any[]>(`/cricketid/series`, { sportId });
+      // the API already returns an array
+      return Array.isArray(response) ? response : [];
     } catch (error) {
       this.logger.error(`Error fetching competitions for sportId ${sportId}:`, error);
       throw error;
@@ -51,11 +52,11 @@ export class AggregatorService {
    */
   async getMatchesByCompetition(competitionId: string) {
     try {
-      const response = await this.fetch('/cricketid/matches', { competitionId });
-      return response || [];
+      const response = await this.fetch<any[]>(`/cricketid/matches`, { competitionId });
+      return Array.isArray(response) ? response : [];
     } catch (error) {
       this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
-      throw error;
+      return []; // return empty array on error to continue
     }
   }
 
