@@ -1,7 +1,6 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
-import { AxiosError } from 'axios';
 import * as https from 'https';
 
 @Injectable()
@@ -13,43 +12,20 @@ export class AggregatorService {
 
   private async fetch<T>(path: string, params: Record<string, any> = {}): Promise<T> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-    const url = `${this.baseUrl}${normalizedPath}`;
+    const url = `https://72.61.140.55${normalizedPath}`;
 
     try {
       const { data } = await firstValueFrom(
         this.http.get<T>(url, {
           params,
-          httpsAgent: new https.Agent({ rejectUnauthorized: false }), // Ignore SSL
-          headers: { host: 'vendorapi.tresting.com' }, // Important if provider requires Host header
+          httpsAgent: new https.Agent({ rejectUnauthorized: false }), // SSL bypass for IP
+          headers: { host: 'vendorapi.tresting.com' },               // must match the API host
         }),
       );
       return data;
     } catch (error) {
-      this.logger.error(`Error fetching ${url}:`, error instanceof Error ? error.message : String(error));
-      
-      if (error instanceof AxiosError) {
-        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
-        const message = error.response?.data?.message || error.message || 'Failed to fetch data from aggregator API';
-        
-        throw new HttpException(
-          {
-            statusCode: status,
-            message,
-            error: 'Aggregator API Error',
-            details: error.response?.data || undefined,
-          },
-          status,
-        );
-      }
-      
-      throw new HttpException(
-        {
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: error instanceof Error ? error.message : 'Internal server error',
-          error: 'Internal Server Error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+      this.logger.error(`Error fetching ${url}:`, error);
+      throw error;
     }
   }
 
