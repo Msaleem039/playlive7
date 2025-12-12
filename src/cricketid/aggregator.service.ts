@@ -6,7 +6,7 @@ import * as https from 'https';
 @Injectable()
 export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
-  private readonly baseUrl = 'https://api.trusting.com';
+  private readonly baseUrl = 'https://vendorapi.tresting.com';
 
   constructor(private readonly http: HttpService) {}
 
