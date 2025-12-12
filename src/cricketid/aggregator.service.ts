@@ -2,11 +2,12 @@ import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import { AxiosError } from 'axios';
+import * as https from 'https';
 
 @Injectable()
 export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
-  private readonly baseUrl = 'https://vendorapi.tresting.com';
+  private readonly baseUrl = 'https://72.61.140.55';
 
   constructor(private readonly http: HttpService) {}
 
@@ -18,6 +19,8 @@ export class AggregatorService {
       const { data } = await firstValueFrom(
         this.http.get<T>(url, {
           params,
+          httpsAgent: new https.Agent({ rejectUnauthorized: false }), // Ignore SSL
+          headers: { host: 'vendorapi.tresting.com' }, // Important if provider requires Host header
         }),
       );
       return data;
