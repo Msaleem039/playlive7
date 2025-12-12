@@ -4,12 +4,14 @@ import { CricketIdController } from './cricketid.controller';
 import { CricketIdService } from './cricketid.service';
 import { CricketIdWebhookService } from './cricketid.webhook';
 import { OddsGateway } from './odds.gateway';
+import { AggregatorService } from './aggregator.service';
+import { AggregatorController } from './aggregator.controller';
 
 @Module({
   imports: [HttpModule],
-  controllers: [CricketIdController],
-  providers: [CricketIdService, CricketIdWebhookService, OddsGateway],
-  exports: [CricketIdService],
+  controllers: [CricketIdController, AggregatorController],
+  providers: [CricketIdService, CricketIdWebhookService, OddsGateway, AggregatorService],
+  exports: [CricketIdService, AggregatorService],
 })
 export class CricketIdModule {}
 

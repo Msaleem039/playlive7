@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Logger, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Param, Post, Query, HttpException, HttpStatus } from '@nestjs/common';
 import { CricketIdService } from './cricketid.service';
 import { CricketIdWebhookDto } from './dto/webhook.dto';
 import { CricketIdWebhookService } from './cricketid.webhook';
@@ -34,13 +34,20 @@ export class CricketIdController {
 
   /**
    * Get match details by competition ID
-   * GET /cricketid/matches?competitionId={competitionId}
-   * Example: GET /cricketid/matches?competitionId=9992899
+   * GET /cricketid/matches?sportId=4&competitionId={competitionId}
+   * Example: GET /cricketid/matches?sportId=4&competitionId=9992899
    * @param competitionId - Competition ID from the series list (e.g., "9992899")
+   * @param sportId - Sport ID (default: 4 for cricket)
    */
   @Get('matches')
-  getMatchDetails(@Query('competitionId') competitionId: string | number) {
-    return this.cricketIdService.getMatchDetails(competitionId);
+  getMatchDetails(
+    @Query('competitionId') competitionId: string | number,
+    @Query('sportId') sportId?: number,
+  ) {
+    return this.cricketIdService.getMatchDetails(
+      competitionId,
+      sportId ? Number(sportId) : 4,
+    );
   }
 
   /**
@@ -51,8 +58,24 @@ export class CricketIdController {
    * @param eventId - Event ID from the match list (e.g., "34917574")
    */
   @Get('markets')
-  getMarketList(@Query('eventId') eventId: string | number) {
-    return this.cricketIdService.getMarketList(eventId);
+  async getMarketList(@Query('eventId') eventId: string | number) {
+    if (!eventId) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'eventId query parameter is required',
+          error: 'Bad Request',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    try {
+      return await this.cricketIdService.getMarketList(eventId);
+    } catch (error) {
+      this.logger.error(`Error getting market list for eventId ${eventId}:`, error);
+      throw error;
+    }
   }
 
   /**

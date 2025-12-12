@@ -1,9 +1,11 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
+import { AxiosError } from 'axios';
 
 @Injectable()
 export class CricketIdService {
+  private readonly logger = new Logger(CricketIdService.name);
   private readonly baseUrl = 'https://vendorapi.tresting.com';
 
   constructor(private readonly http: HttpService) {}
@@ -12,12 +14,40 @@ export class CricketIdService {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = `${this.baseUrl}${normalizedPath}`;
 
-    const { data } = await firstValueFrom(
-      this.http.get<T>(url, {
-        params,
-      }),
-    );
-    return data;
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get<T>(url, {
+          params,
+        }),
+      );
+      return data;
+    } catch (error) {
+      this.logger.error(`Error fetching ${url}:`, error instanceof Error ? error.message : String(error));
+      
+      if (error instanceof AxiosError) {
+        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
+        const message = error.response?.data?.message || error.message || 'Failed to fetch data from vendor API';
+        
+        throw new HttpException(
+          {
+            statusCode: status,
+            message,
+            error: 'Vendor API Error',
+            details: error.response?.data || undefined,
+          },
+          status,
+        );
+      }
+      
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+          message: error instanceof Error ? error.message : 'Internal server error',
+          error: 'Internal Server Error',
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
   }
 
   /**
@@ -40,12 +70,13 @@ export class CricketIdService {
 
   /**
    * Get match details by competition ID
-   * Endpoint: /v3/matchList?sportId=4&competitionId={competitionId}
+   * Endpoint: /v3/matchList?sportId={sportId}&competitionId={competitionId}
    * @param competitionId - Competition ID from the series list (e.g., "9992899")
+   * @param sportId - Sport ID (default: 4 for cricket)
    */
-  async getMatchDetails(competitionId: string | number) {
+  async getMatchDetails(competitionId: string | number, sportId: number = 4) {
     return this.fetch('/v3/matchList', { 
-      sportId: 4, // Cricket sport ID
+      sportId,
       competitionId 
     });
   }
@@ -99,14 +130,42 @@ export class CricketIdService {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = `${this.baseUrl}${normalizedPath}`;
 
-    const { data } = await firstValueFrom(
-      this.http.post<T>(url, body, {
-        headers: {
-          'Content-Type': 'application/json',
+    try {
+      const { data } = await firstValueFrom(
+        this.http.post<T>(url, body, {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        }),
+      );
+      return data;
+    } catch (error) {
+      this.logger.error(`Error posting to ${url}:`, error instanceof Error ? error.message : String(error));
+      
+      if (error instanceof AxiosError) {
+        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
+        const message = error.response?.data?.message || error.message || 'Failed to post data to vendor API';
+        
+        throw new HttpException(
+          {
+            statusCode: status,
+            message,
+            error: 'Vendor API Error',
+            details: error.response?.data || undefined,
+          },
+          status,
+        );
+      }
+      
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+          message: error instanceof Error ? error.message : 'Internal server error',
+          error: 'Internal Server Error',
         },
-      }),
-    );
-    return data;
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
   }
 
   /**
