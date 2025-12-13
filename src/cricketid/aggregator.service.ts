@@ -7,8 +7,39 @@ import * as https from 'https';
 export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
   private readonly baseUrl = 'https://72.61.140.55';
+  private cache = new Map<string, { data: any; expiresAt: number }>();
 
-  constructor(private readonly http: HttpService) {}
+  constructor(private readonly http: HttpService) {
+    // Clean up expired cache entries every 5 minutes
+    setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
+  }
+
+  private cleanExpiredCache() {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, value] of this.cache.entries()) {
+      if (value.expiresAt <= now) {
+        this.cache.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      this.logger.debug(`Cleaned ${cleaned} expired cache entries`);
+    }
+  }
+
+  private async fetchWithCache<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+    const cached = this.cache.get(key);
+    const now = Date.now();
+
+    if (cached && cached.expiresAt > now) {
+      return cached.data;
+    }
+
+    const data = await fetcher();
+    this.cache.set(key, { data, expiresAt: now + ttlMs });
+    return data;
+  }
 
   private async fetch<T>(path: string, params: Record<string, any> = {}): Promise<T> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -63,75 +94,34 @@ export class AggregatorService {
   /**
    * Fetch all cricket matches and classify Live / Upcoming
    * @param sportId - Sport ID (default: '4' for cricket)
+   * @param page - Page number (for cache key differentiation)
+   * @param per_page - Items per page (for cache key differentiation)
    */
-  async getAllCricketMatches(sportId: string = '4') {
-    try {
-      const competitions = await this.getCompetitions(sportId);
+  async getAllCricketMatches(sportId = '4', page = 1, per_page = 20) {
+    return this.fetchWithCache(
+      `cricket:${sportId}:${page}:${per_page}`,
+      30_000, // cache for 30 seconds
+      async () => {
+        const competitions = await this.getCompetitions(sportId);
 
-      const allMatches: any[] = [];
+        const allMatches: any[] = [];
 
-      for (const competition of competitions) {
-        const compId = competition?.competition?.id;
-        if (!compId) {
-          this.logger.warn(`Skipping competition without ID: ${JSON.stringify(competition)}`);
-          continue;
+        for (const competition of competitions) {
+          const compId = competition?.competition?.id;
+          if (!compId) continue;
+
+          const matches = await this.getMatchesByCompetition(compId);
+          allMatches.push(...matches);
         }
 
-        try {
-          const matchList = await this.getMatchesByCompetition(compId);
-          if (Array.isArray(matchList)) {
-            allMatches.push(...matchList);
-          } else if (matchList && typeof matchList === 'object') {
-            // Handle case where response might be wrapped
-            const matches = (matchList as any).data || (matchList as any).result || matchList;
-            if (Array.isArray(matches)) {
-              allMatches.push(...matches);
-            } else {
-              allMatches.push(matchList);
-            }
-          }
-        } catch (error) {
-          this.logger.error(`Error fetching matches for competition ${compId}:`, error);
-          // Continue with other competitions even if one fails
-        }
-      }
-
-      // Classify matches
-      const now = new Date();
-      const live: any[] = [];
-      const upcoming: any[] = [];
-
-      for (const match of allMatches) {
-        const dateStr = match?.event?.openDate;
-        if (!dateStr) {
-          upcoming.push(match);
-          continue;
-        }
-
-        try {
-          const matchTime = new Date(dateStr);
-
-          if (matchTime <= now) {
-            live.push(match);
-          } else {
-            upcoming.push(match);
-          }
-        } catch (error) {
-          this.logger.warn(`Invalid date format for match: ${dateStr}`, error);
-          upcoming.push(match);
-        }
-      }
-
-      return {
-        total: allMatches.length,
-        live,
-        upcoming,
-        all: allMatches,
-      };
-    } catch (error) {
-      this.logger.error('Error fetching all cricket matches:', error);
-      throw error;
-    }
+        return {
+          total: allMatches.length,
+          // all: allMatches,
+          live: allMatches.filter(m => new Date(m?.event?.openDate) <= new Date()),
+          upcoming: allMatches.filter(m => new Date(m?.event?.openDate) > new Date()),
+        };
+      },
+    );
   }
 
   /**
