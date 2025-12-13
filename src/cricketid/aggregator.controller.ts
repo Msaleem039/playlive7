@@ -1,4 +1,4 @@
-import { Controller, Get, Param } from '@nestjs/common';
+import { Controller, Get, Param, Query } from '@nestjs/common';
 import { AggregatorService } from './aggregator.service';
 
 @Controller('cricketid/aggregator')
@@ -15,6 +15,19 @@ export class AggregatorController {
   @Get('match/:eventId')
   async getMatch(@Param('eventId') eventId: string) {
     return this.service.getMatchDetail(eventId);
+  }
+
+  /**
+   * GET /cricketid/aggregator/odds
+   * ?eventId=34917574&marketIds=1.250049502,1.250049500
+   * Returns combined bookmaker fancy and match odds
+   */
+  @Get('odds')
+  async getOdds(
+    @Query('eventId') eventId: string,
+    @Query('marketIds') marketIds: string,
+  ) {
+    return this.service.getCombinedOdds(eventId, marketIds);
   }
 }
 

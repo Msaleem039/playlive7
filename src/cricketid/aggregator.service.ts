@@ -51,6 +51,7 @@ export class AggregatorService {
           params,
           httpsAgent: new https.Agent({ rejectUnauthorized: false }),
           headers: { host: 'vendorapi.tresting.com' }, // or the host given by the provider
+          timeout: 8000,
         }),
       );
       return data;
@@ -135,6 +136,50 @@ export class AggregatorService {
       return response;
     } catch (error) {
       this.logger.error(`Error fetching match detail for eventId ${eventId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get bookmaker fancy for a specific event
+   * Endpoint: /v3/bookmakerFancy?eventId={eventId}
+   * @param eventId - Event ID
+   */
+  private async getBookmakerFancy(eventId: string) {
+    return this.fetch('/v3/bookmakerFancy', { eventId });
+  }
+
+  /**
+   * Get Betfair odds for specific markets
+   * Endpoint: /v3/betfairOdds?marketIds={marketIds}
+   * @param marketIds - Comma-separated market IDs
+   */
+  private async getMatchOdds(marketIds: string) {
+    return this.fetch('/v3/betfairOdds', { marketIds });
+  }
+
+  /**
+   * Get combined odds (bookmaker fancy + match odds)
+   * Fetches both bookmaker fancy and Betfair odds in parallel and returns merged result
+   * @param eventId - Event ID (e.g., "34917574")
+   * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
+   */
+  async getCombinedOdds(eventId: string, marketIds: string) {
+    try {
+      const [bookmakerFancy, matchOdds] = await Promise.all([
+        this.getBookmakerFancy(eventId),
+        this.getMatchOdds(marketIds),
+      ]);
+
+      return {
+        eventId,
+        marketIds: marketIds.split(','),
+        bookmakerFancy,
+        matchOdds,
+        updatedAt: new Date().toISOString(),
+      };
+    } catch (error) {
+      this.logger.error('Failed to fetch combined odds', error);
       throw error;
     }
   }

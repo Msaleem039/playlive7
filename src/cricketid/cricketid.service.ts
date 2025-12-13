@@ -122,6 +122,16 @@ export class CricketIdService {
   }
 
   /**
+   * Get bookmaker fancy for a specific event
+   * Endpoint: /v3/bookmakerFancy?eventId={eventId}
+   * Returns bookmaker fancy data
+   * @param eventId - Event ID (e.g., "34917574")
+   */
+  async getBookmakerFancy(eventId: string | number) {
+    return this.fetch('/v3/bookmakerFancy', { eventId });
+  }
+
+  /**
    * Place bet via vendor API
    * Endpoint: /v3/placeBet (POST)
    * @param betData - Bet placement data

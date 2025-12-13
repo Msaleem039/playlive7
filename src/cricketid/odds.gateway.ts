@@ -116,6 +116,7 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /**
    * Fetch and emit odds for all active rooms
    * Called by cron job every 3-5 seconds
+   * Merges match odds (Betfair) and bookmaker fancy data
    */
   async fetchAndEmitOddsForAllRooms() {
     const activeRooms = Array.from(this.roomMetadata.entries());
@@ -135,34 +136,74 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
             return;
           }
 
-          let result;
+          let matchOdds = null;
+          let bookmakerFancy = null;
 
           if (metadata.marketIds) {
             // Direct odds fetch if marketIds provided
-            result = await this.cricketService.getBetfairOdds(metadata.marketIds);
+            matchOdds = await this.cricketService.getBetfairOdds(metadata.marketIds);
           } else if (metadata.eventId) {
-            // Get markets first, then get odds for all markets
-            const markets = await this.cricketService.getMarketList(metadata.eventId);
+            // Fetch both match odds and bookmaker fancy in parallel
+            const [marketsResult, fancyResult] = await Promise.allSettled([
+              // Get markets first, then get odds for all markets
+              this.cricketService.getMarketList(metadata.eventId).then(async (markets) => {
+                if (markets && Array.isArray(markets)) {
+                  const marketIdList = markets
+                    .map((m: any) => m.marketId)
+                    .filter((id: any) => id)
+                    .join(',');
 
-            // Extract marketIds from markets response
-            if (markets && Array.isArray(markets)) {
-              const marketIdList = markets
-                .map((m: any) => m.marketId)
-                .filter((id: any) => id)
-                .join(',');
+                  if (marketIdList) {
+                    return await this.cricketService.getBetfairOdds(marketIdList);
+                  } else {
+                    return markets; // Return markets if no marketIds found
+                  }
+                }
+                return markets;
+              }),
+              // Get bookmaker fancy
+              this.cricketService.getBookmakerFancy(metadata.eventId),
+            ]);
 
-              if (marketIdList) {
-                result = await this.cricketService.getBetfairOdds(marketIdList);
-              } else {
-                result = markets; // Return markets if no marketIds found
-              }
+            // Extract results
+            if (marketsResult.status === 'fulfilled') {
+              matchOdds = marketsResult.value;
             } else {
-              result = markets;
+              this.logger.warn(
+                `Failed to fetch match odds for eventId ${metadata.eventId}:`,
+                marketsResult.reason,
+              );
+            }
+
+            if (fancyResult.status === 'fulfilled') {
+              bookmakerFancy = fancyResult.value;
+            } else {
+              this.logger.warn(
+                `Failed to fetch bookmaker fancy for eventId ${metadata.eventId}:`,
+                fancyResult.reason,
+              );
             }
           }
 
-          if (result) {
-            this.server.to(roomName).emit('odds_update', result);
+          // Merge match odds and bookmaker fancy into a single result
+          const mergedResult: any = {
+            matchOdds: matchOdds || null,
+            bookmakerFancy: bookmakerFancy || null,
+          };
+
+          // If matchOdds is an object (not array), spread its properties
+          if (matchOdds && typeof matchOdds === 'object' && !Array.isArray(matchOdds)) {
+            Object.assign(mergedResult, matchOdds);
+          }
+
+          // If bookmakerFancy is an object (not array), spread its properties
+          if (bookmakerFancy && typeof bookmakerFancy === 'object' && !Array.isArray(bookmakerFancy)) {
+            Object.assign(mergedResult, bookmakerFancy);
+          }
+
+          // If we have data, emit it
+          if (matchOdds || bookmakerFancy) {
+            this.server.to(roomName).emit('odds_update', mergedResult);
           }
         } catch (error) {
           this.logger.error(
