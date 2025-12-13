@@ -136,8 +136,8 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
             return;
           }
 
-          let matchOdds = null;
-          let bookmakerFancy = null;
+          let matchOdds: any = null;
+          let bookmakerFancy: any = null;
 
           if (metadata.marketIds) {
             // Direct odds fetch if marketIds provided
