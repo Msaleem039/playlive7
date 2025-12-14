@@ -251,10 +251,37 @@ export class AggregatorService {
     // Register this match as active for cache pre-fetching
     this.registerActiveMatch(eventId, marketIds);
 
-    const [fancy, odds] = await Promise.all([
+    // Use Promise.allSettled to handle partial failures gracefully
+    const [fancyResult, oddsResult] = await Promise.allSettled([
       this.getFancy(eventId),
       this.getOdds(marketIds),
     ]);
+
+    const fancy = fancyResult.status === 'fulfilled' ? fancyResult.value : null;
+    const odds = oddsResult.status === 'fulfilled' ? oddsResult.value : null;
+
+    // Log warnings for failed requests
+    if (fancyResult.status === 'rejected') {
+      this.logger.warn(
+        `Failed to fetch fancy for eventId ${eventId}:`,
+        fancyResult.reason instanceof Error
+          ? fancyResult.reason.message
+          : String(fancyResult.reason),
+      );
+    }
+    if (oddsResult.status === 'rejected') {
+      this.logger.warn(
+        `Failed to fetch odds for marketIds ${marketIds}:`,
+        oddsResult.reason instanceof Error
+          ? oddsResult.reason.message
+          : String(oddsResult.reason),
+      );
+    }
+
+    // If both failed, throw an error
+    if (!fancy && !odds) {
+      throw new Error('Failed to fetch both fancy and odds data');
+    }
 
     return {
       eventId,

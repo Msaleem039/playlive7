@@ -19,11 +19,25 @@ export class AggregatorController {
 
   // GET /cricketid/aggregator/odds?eventId=34917574&marketIds=1.250049502,1.250049500
   @Get('odds')
-  getOddsFancy(
+  async getOddsFancy(
     @Query('eventId') eventId: string,
     @Query('marketIds') marketIds: string,
   ) {
-    return this.service.getOddsAndFancy(eventId, marketIds);
+    if (!eventId || !marketIds) {
+      return {
+        success: false,
+        message: 'eventId and marketIds are required',
+      };
+    }
+    try {
+      return await this.service.getOddsAndFancy(eventId, marketIds);
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Failed to fetch odds and fancy',
+        error: 'Internal Server Error',
+      };
+    }
   }
 }
 
