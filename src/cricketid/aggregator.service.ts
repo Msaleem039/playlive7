@@ -268,57 +268,64 @@ export class AggregatorService {
     // Register this match as active for cache pre-fetching
     this.registerActiveMatch(eventId, marketIds);
 
-    // Use Promise.allSettled to handle partial failures gracefully
+    // Fetch fancy and odds concurrently
     const [fancyResult, oddsResult] = await Promise.allSettled([
       this.getFancy(eventId),
       this.getOdds(marketIds),
     ]);
 
+    // Extract results or null
     const fancy = fancyResult.status === 'fulfilled' ? fancyResult.value : null;
     const odds = oddsResult.status === 'fulfilled' ? oddsResult.value : null;
 
-    // Extract error details for logging and response
-    const fancyError = fancyResult.status === 'rejected' ? {
-      message: fancyResult.reason instanceof Error ? fancyResult.reason.message : String(fancyResult.reason),
-      details: (fancyResult.reason as any)?.details || null,
-    } : null;
+    // Determine if the data is actually present
+    const hasFancy = fancy && Object.keys(fancy).length > 0;
+    const hasOdds = odds && typeof odds === 'object' && 'data' in odds && Array.isArray((odds as any).data) && (odds as any).data.length > 0;
 
-    const oddsError = oddsResult.status === 'rejected' ? {
-      message: oddsResult.reason instanceof Error ? oddsResult.reason.message : String(oddsResult.reason),
-      details: (oddsResult.reason as any)?.details || null,
-    } : null;
+    // Capture errors for logging
+    const fancyError =
+      fancyResult.status === 'rejected'
+        ? {
+            message:
+              fancyResult.reason instanceof Error
+                ? fancyResult.reason.message
+                : String(fancyResult.reason),
+            details: (fancyResult.reason as any)?.details || null,
+          }
+        : null;
 
-    // Log warnings for failed requests
-    if (fancyError) {
+    const oddsError =
+      oddsResult.status === 'rejected'
+        ? {
+            message:
+              oddsResult.reason instanceof Error
+                ? oddsResult.reason.message
+                : String(oddsResult.reason),
+            details: (oddsResult.reason as any)?.details || null,
+          }
+        : null;
+
+    // Log warnings if upstream had issues or empty data
+    if (!hasFancy) {
       this.logger.warn(
-        `Failed to fetch fancy for eventId ${eventId}:`,
-        JSON.stringify(fancyError, null, 2),
+        `No fancy data available for eventId ${eventId}` +
+          (fancyError ? `: ${JSON.stringify(fancyError)}` : '')
       );
     }
-    if (oddsError) {
+    if (!hasOdds) {
       this.logger.warn(
-        `Failed to fetch odds for marketIds ${marketIds}:`,
-        JSON.stringify(oddsError, null, 2),
+        `No odds data available for marketIds ${marketIds}` +
+          (oddsError ? `: ${JSON.stringify(oddsError)}` : '')
       );
     }
 
-    // If both failed, throw an error with detailed information
-    if (!fancy && !odds) {
-      const error = new Error('Failed to fetch both fancy and odds data');
-      (error as any).fancyError = fancyError;
-      (error as any).oddsError = oddsError;
-      throw error;
-    }
-
+    // Return a clean JSON object, never throw
     return {
       eventId,
       marketIds: marketIds.split(','),
-      fancy,
-      odds,
-      errors: fancyError || oddsError ? {
-        fancy: fancyError,
-        odds: oddsError,
-      } : undefined,
+      fancy: hasFancy ? fancy : null,
+      odds: hasOdds ? odds : null,
+      errors: fancyError || oddsError ? { fancy: fancyError, odds: oddsError } : undefined,
       updatedAt: Date.now(),
     };
   }
