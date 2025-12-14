@@ -104,11 +104,21 @@ export class CricketIdService {
   /**
    * Get Betfair results for specific markets
    * Endpoint: /v3/betfairResults?marketIds={marketIds}
-   * Returns result data including winner, result, status, etc.
+   * Returns result data including winner, result, status, type, etc.
    * @param marketIds - Comma-separated market IDs (e.g., "1.249961303")
    */
   async getBetfairResults(marketIds: string) {
     return this.fetch('/v3/betfairResults', { marketIds });
+  }
+
+  /**
+   * Get bookmaker fancy for a specific event
+   * Endpoint: /v3/bookmakerFancy?eventId={eventId}
+   * Returns bookmaker fancy data with markets, sections, odds, etc.
+   * @param eventId - Event ID (e.g., "34917574")
+   */
+  async getBookmakerFancy(eventId: string | number) {
+    return this.fetch('/v3/bookmakerFancy', { eventId });
   }
 
   /**

@@ -29,8 +29,15 @@ export class AggregatorController {
         message: 'eventId and marketIds are required',
       };
     }
-    // Method never throws, always returns a response
-    return await this.service.getOddsAndFancy(eventId, marketIds);
+    try {
+      return await this.service.getOddsAndFancy(eventId, marketIds);
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : 'Failed to fetch odds and fancy',
+        error: 'Internal Server Error',
+      };
+    }
   }
 }
 
