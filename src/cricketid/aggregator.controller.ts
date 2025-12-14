@@ -17,8 +17,8 @@ export class AggregatorController {
     return this.service.getMatchDetail(eventId);
   }
 
-  // GET /cricketid/odds-fancy?eventId=34917574&marketIds=1.250049502,1.250049500
-  @Get('/cricketid/odds-fancy')
+  // GET /cricketid/aggregator/odds?eventId=34917574&marketIds=1.250049502,1.250049500
+  @Get('odds')
   getOddsFancy(
     @Query('eventId') eventId: string,
     @Query('marketIds') marketIds: string,
