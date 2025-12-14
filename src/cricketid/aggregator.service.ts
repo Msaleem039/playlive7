@@ -133,9 +133,26 @@ export class AggregatorService {
         }),
       );
       return data;
-    } catch (error) {
-      this.logger.error(`Error fetching ${url}:`, error);
-      throw error;
+    } catch (error: any) {
+      // Extract detailed error information
+      const errorDetails = {
+        url,
+        params,
+        status: error?.response?.status,
+        statusText: error?.response?.statusText,
+        message: error?.message || String(error),
+        responseData: error?.response?.data,
+        code: error?.code,
+      };
+      
+      this.logger.error(`Error fetching ${url}:`, JSON.stringify(errorDetails, null, 2));
+      
+      // Create a more informative error
+      const enhancedError = new Error(
+        `API request failed: ${errorDetails.message}${errorDetails.status ? ` (Status: ${errorDetails.status})` : ''}`,
+      );
+      (enhancedError as any).details = errorDetails;
+      throw enhancedError;
     }
   }
 
@@ -260,27 +277,37 @@ export class AggregatorService {
     const fancy = fancyResult.status === 'fulfilled' ? fancyResult.value : null;
     const odds = oddsResult.status === 'fulfilled' ? oddsResult.value : null;
 
+    // Extract error details for logging and response
+    const fancyError = fancyResult.status === 'rejected' ? {
+      message: fancyResult.reason instanceof Error ? fancyResult.reason.message : String(fancyResult.reason),
+      details: (fancyResult.reason as any)?.details || null,
+    } : null;
+
+    const oddsError = oddsResult.status === 'rejected' ? {
+      message: oddsResult.reason instanceof Error ? oddsResult.reason.message : String(oddsResult.reason),
+      details: (oddsResult.reason as any)?.details || null,
+    } : null;
+
     // Log warnings for failed requests
-    if (fancyResult.status === 'rejected') {
+    if (fancyError) {
       this.logger.warn(
         `Failed to fetch fancy for eventId ${eventId}:`,
-        fancyResult.reason instanceof Error
-          ? fancyResult.reason.message
-          : String(fancyResult.reason),
+        JSON.stringify(fancyError, null, 2),
       );
     }
-    if (oddsResult.status === 'rejected') {
+    if (oddsError) {
       this.logger.warn(
         `Failed to fetch odds for marketIds ${marketIds}:`,
-        oddsResult.reason instanceof Error
-          ? oddsResult.reason.message
-          : String(oddsResult.reason),
+        JSON.stringify(oddsError, null, 2),
       );
     }
 
-    // If both failed, throw an error
+    // If both failed, throw an error with detailed information
     if (!fancy && !odds) {
-      throw new Error('Failed to fetch both fancy and odds data');
+      const error = new Error('Failed to fetch both fancy and odds data');
+      (error as any).fancyError = fancyError;
+      (error as any).oddsError = oddsError;
+      throw error;
     }
 
     return {
@@ -288,6 +315,10 @@ export class AggregatorService {
       marketIds: marketIds.split(','),
       fancy,
       odds,
+      errors: fancyError || oddsError ? {
+        fancy: fancyError,
+        odds: oddsError,
+      } : undefined,
       updatedAt: Date.now(),
     };
   }
