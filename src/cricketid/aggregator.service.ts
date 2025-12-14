@@ -8,10 +8,13 @@ export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
   private readonly baseUrl = 'https://72.61.140.55';
   private cache = new Map<string, { data: any; expiresAt: number }>();
+  private activeMatches = new Map<string, { eventId: string; marketIds: string; lastAccessed: number }>();
 
   constructor(private readonly http: HttpService) {
     // Clean up expired cache entries every 5 minutes
     setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
+    // Clean up inactive matches (not accessed in last 5 minutes)
+    setInterval(() => this.cleanInactiveMatches(), 5 * 60 * 1000);
   }
 
   private cleanExpiredCache() {
@@ -25,6 +28,82 @@ export class AggregatorService {
     }
     if (cleaned > 0) {
       this.logger.debug(`Cleaned ${cleaned} expired cache entries`);
+    }
+  }
+
+  private cleanInactiveMatches() {
+    const now = Date.now();
+    const inactiveThreshold = 5 * 60 * 1000; // 5 minutes
+    let cleaned = 0;
+    for (const [key, match] of this.activeMatches.entries()) {
+      if (now - match.lastAccessed > inactiveThreshold) {
+        this.activeMatches.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      this.logger.debug(`Cleaned ${cleaned} inactive matches`);
+    }
+  }
+
+  /**
+   * Register an active match for cache pre-fetching
+   */
+  registerActiveMatch(eventId: string, marketIds: string) {
+    const key = `${eventId}:${marketIds}`;
+    const existing = this.activeMatches.get(key);
+    this.activeMatches.set(key, {
+      eventId,
+      marketIds,
+      lastAccessed: Date.now(),
+    });
+    if (!existing) {
+      this.logger.debug(`Registered new active match: ${key}`);
+    }
+  }
+
+  /**
+   * Get all active matches
+   */
+  getActiveMatches(): Array<{ eventId: string; marketIds: string }> {
+    return Array.from(this.activeMatches.values()).map(({ eventId, marketIds }) => ({
+      eventId,
+      marketIds,
+    }));
+  }
+
+  /**
+   * Pre-fetch and refresh cache for a specific match
+   * Forces a refresh by directly fetching (bypasses cache check)
+   */
+  async refreshMatchCache(eventId: string, marketIds: string) {
+    try {
+      const now = Date.now();
+      
+      // Force refresh by directly fetching and updating cache
+      const [fancyResult, oddsResult] = await Promise.allSettled([
+        this.fetch('/v3/bookmakerFancy', { eventId })
+          .then((data) => {
+            // Update cache directly
+            this.cache.set(`fancy:${eventId}`, { data, expiresAt: now + 2_000 });
+            return data;
+          }),
+        this.fetch('/v3/betfairOdds', { marketIds })
+          .then((data) => {
+            // Update cache directly
+            this.cache.set(`odds:${marketIds}`, { data, expiresAt: now + 1_500 });
+            return data;
+          }),
+      ]);
+
+      if (fancyResult.status === 'rejected') {
+        this.logger.warn(`Failed to refresh fancy cache for eventId ${eventId}:`, fancyResult.reason);
+      }
+      if (oddsResult.status === 'rejected') {
+        this.logger.warn(`Failed to refresh odds cache for marketIds ${marketIds}:`, oddsResult.reason);
+      }
+    } catch (error) {
+      this.logger.error(`Error refreshing cache for match ${eventId}:`, error);
     }
   }
 
@@ -51,7 +130,6 @@ export class AggregatorService {
           params,
           httpsAgent: new https.Agent({ rejectUnauthorized: false }),
           headers: { host: 'vendorapi.tresting.com' }, // or the host given by the provider
-          timeout: 8000,
         }),
       );
       return data;
@@ -141,47 +219,50 @@ export class AggregatorService {
   }
 
   /**
-   * Get bookmaker fancy for a specific event
-   * Endpoint: /v3/bookmakerFancy?eventId={eventId}
-   * @param eventId - Event ID
+   * Get bookmaker fancy for a match
    */
-  private async getBookmakerFancy(eventId: string) {
-    return this.fetch('/v3/bookmakerFancy', { eventId });
+  async getFancy(eventId: string) {
+    return this.fetchWithCache(
+      `fancy:${eventId}`,
+      2_000, // cache 2 seconds
+      async () => {
+        return this.fetch('/v3/bookmakerFancy', { eventId });
+      },
+    );
   }
 
   /**
-   * Get Betfair odds for specific markets
-   * Endpoint: /v3/betfairOdds?marketIds={marketIds}
-   * @param marketIds - Comma-separated market IDs
+   * Get match odds
    */
-  private async getMatchOdds(marketIds: string) {
-    return this.fetch('/v3/betfairOdds', { marketIds });
+  async getOdds(marketIds: string) {
+    return this.fetchWithCache(
+      `odds:${marketIds}`,
+      1_500, // cache 1.5 seconds
+      async () => {
+        return this.fetch('/v3/betfairOdds', { marketIds });
+      },
+    );
   }
 
   /**
-   * Get combined odds (bookmaker fancy + match odds)
-   * Fetches both bookmaker fancy and Betfair odds in parallel and returns merged result
-   * @param eventId - Event ID (e.g., "34917574")
-   * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
+   * Get both odds and fancy merged together
    */
-  async getCombinedOdds(eventId: string, marketIds: string) {
-    try {
-      const [bookmakerFancy, matchOdds] = await Promise.all([
-        this.getBookmakerFancy(eventId),
-        this.getMatchOdds(marketIds),
-      ]);
+  async getOddsAndFancy(eventId: string, marketIds: string) {
+    // Register this match as active for cache pre-fetching
+    this.registerActiveMatch(eventId, marketIds);
 
-      return {
-        eventId,
-        marketIds: marketIds.split(','),
-        bookmakerFancy,
-        matchOdds,
-        updatedAt: new Date().toISOString(),
-      };
-    } catch (error) {
-      this.logger.error('Failed to fetch combined odds', error);
-      throw error;
-    }
+    const [fancy, odds] = await Promise.all([
+      this.getFancy(eventId),
+      this.getOdds(marketIds),
+    ]);
+
+    return {
+      eventId,
+      marketIds: marketIds.split(','),
+      fancy,
+      odds,
+      updatedAt: Date.now(),
+    };
   }
 }
 

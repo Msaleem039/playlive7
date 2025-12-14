@@ -1,26 +1,11 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
-import {
-  BetStatus,
-  MatchStatus,
-  Prisma,
-  TransactionType,
-} from '@prisma/client';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import { BetStatus, PrismaClient } from '@prisma/client';
+// @ts-ignore - MarketType exists after Prisma client regeneration
+import { MarketType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CricketIdService } from '../cricketid/cricketid.service';
-
-type SettlementResult = {
-  success: boolean;
-  settlement_id?: string;
-  match_id?: string;
-  message?: string;
-  settled?: Array<{
-    betId: string;
-    userId: string;
-    result: 'won' | 'lost';
-    profitLoss: number;
-  }>;
-};
+import { PnlService } from './pnl.service';
 
 @Injectable()
 export class SettlementService {
@@ -29,1404 +14,425 @@ export class SettlementService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cricketIdService: CricketIdService,
+    private readonly pnlService: PnlService,
   ) {}
 
-  /**
-   * Settle bets by settlement_id (match_id + selection_id)
-   * This matches the PHP logic where settlement_id = match_id + "_" + selection_id
-   */
-  async settleBySettlementId(settlementId: string): Promise<SettlementResult> {
-    if (!settlementId) {
-      return { success: false, message: 'settlement_id is required' };
-    }
+  async settleFancyAuto(eventId: string) {
+    const fancyResults = await this.cricketIdService.getFancyResult(eventId);
 
-    const pendingBets = await this.getPendingBetsBySettlementId(settlementId);
-    if (pendingBets.length === 0) {
-      return {
-        success: true,
-        settlement_id: settlementId,
-        message: 'No pending bets to settle for this settlement_id.',
-      };
-    }
+    // Handle response format - check if it's wrapped in a data property
+    const results = Array.isArray(fancyResults)
+      ? fancyResults
+      : (fancyResults as any)?.data || (fancyResults as any)?.status?.data || [];
 
-    // Get match_id from the first bet (all bets with same settlement_id share same match_id)
-    const matchId = pendingBets[0].matchId;
-    if (!matchId) {
-      return {
-        success: false,
-        settlement_id: settlementId,
-        message: 'Match ID not found in bets.',
-      };
-    }
+    for (const fancy of results) {
+      // Skip if neither declared nor cancelled
+      if (!fancy.isDeclare && !fancy.isCancel) continue;
 
-    // Use the first bet as reference for fetching result
-    const referenceBet = pendingBets[0];
-    const matchResult = await this.fetchMatchResult(matchId, referenceBet);
+      const settlementId = `CRICKET:FANCY:${eventId}:${fancy.selectionId}`;
 
-    if (!matchResult) {
-      return {
-        success: false,
-        settlement_id: settlementId,
-        match_id: matchId,
-        message: 'Unable to fetch result from provider.',
-      };
-    }
+      // Check if settlement already exists (prevent double settlement)
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
 
-    if (!matchResult.winner) {
-      return {
-        success: false,
-        settlement_id: settlementId,
-        match_id: matchId,
-        message: 'Result not ready yet.',
-      };
-    }
+      if (existingSettlement && !existingSettlement.isRollback) {
+        this.logger.warn(
+          `Settlement ${settlementId} already exists, skipping...`,
+        );
+        continue;
+      }
 
-    this.logger.log(
-      `Settling ${pendingBets.length} bets for settlement_id ${settlementId} (match: ${matchId}) with winner: ${matchResult.winner}`,
-    );
-
-    return this.processSettlement(settlementId, matchId, pendingBets, matchResult.winner);
-  }
-
-  /**
-   * Manually settle bets by settlement_id with a manually provided winner/result
-   * This allows admins to input the result directly instead of fetching from API
-   */
-  async settleBySettlementIdWithManualResult(
-    settlementId: string,
-    winner: string,
-  ): Promise<SettlementResult> {
-    if (!settlementId) {
-      return { success: false, message: 'settlement_id is required' };
-    }
-
-    if (!winner) {
-      return { success: false, message: 'winner/result is required' };
-    }
-
-    const pendingBets = await this.getPendingBetsBySettlementId(settlementId);
-    if (pendingBets.length === 0) {
-      return {
-        success: true,
-        settlement_id: settlementId,
-        message: 'No pending bets to settle for this settlement_id.',
-      };
-    }
-
-    const matchId = pendingBets[0].matchId;
-    if (!matchId) {
-      return {
-        success: false,
-        settlement_id: settlementId,
-        message: 'Match ID not found in bets.',
-      };
-    }
-
-    this.logger.log(
-      `Manually settling ${pendingBets.length} bets for settlement_id ${settlementId} (match: ${matchId}) with manually provided winner: ${winner}`,
-    );
-
-    return this.processSettlement(settlementId, matchId, pendingBets, winner);
-  }
-
-  /**
-   * Settle single session bet by match_id, selection_id, gtype, bet_name
-   * Similar to PHP's settleSingleSessionBet()
-   * 
-   * @param matchId - Match ID
-   * @param selectionId - Selection ID
-   * @param gtype - Game type (fancy1, Normal, oddeven)
-   * @param betName - Bet name
-   * @param winnerId - Winner ID (numeric value for comparison)
-   */
-  async settleSingleSessionBet(
-    matchId: string,
-    selectionId: number,
-    gtype: string,
-    betName: string,
-    winnerId: number,
-  ): Promise<SettlementResult> {
-    if (!matchId || !gtype || !betName || winnerId === undefined || winnerId === null) {
-      return {
-        success: false,
-        message: 'match_id, selection_id, gtype, bet_name, and winner_id are required',
-      };
-    }
-
-    // Get all matching pending bets (like PHP code)
     const bets = await this.prisma.bet.findMany({
       where: {
-        matchId,
-        selectionId,
-        gtype,
-        betName: betName.trim(),
+          settlementId,
         status: BetStatus.PENDING,
       },
-      orderBy: { createdAt: 'asc' },
     });
 
     if (bets.length === 0) {
-      return {
-        success: false,
-        message: 'No pending bets found to settle.',
-      };
-    }
-
-    this.logger.log(
-      `Settling ${bets.length} session bets for match ${matchId}, selection ${selectionId}, gtype ${gtype}, bet_name ${betName} with winner_id: ${winnerId}`,
-    );
-
-    // Process settlement with winner_id as string (determineOutcome will handle numeric comparison)
-    return this.processSettlement(
-      `session_${matchId}_${selectionId}_${gtype}_${betName}`,
-      matchId,
-      bets,
-      winnerId.toString(),
-    );
-  }
-
-  /**
-   * Common settlement processing logic
-   * This handles the actual settlement of bets with a given winner
-   */
-  private async processSettlement(
-    settlementId: string,
-    matchId: string,
-    pendingBets: any[],
-    winner: string,
-  ): Promise<SettlementResult> {
-    // Increase transaction timeout to 60 seconds for settlement operations
-    // Settlement involves multiple wallet updates and can take longer
-    const settled = await this.prisma.$transaction(
-      async (tx) => {
-      const summary: SettlementResult['settled'] = [];
-
-      for (const bet of pendingBets) {
-        const outcome = this.determineOutcome(bet, winner);
-        if (!outcome) {
-          this.logger.warn(
-            `Skipping bet ${bet.id} because the outcome could not be determined`,
-          );
           continue;
         }
 
-        await tx.bet.update({
-          where: { id: bet.id },
-          data: {
-            status: outcome.status === 'won' ? BetStatus.WON : BetStatus.LOST,
-            updatedAt: new Date(),
-          },
-        });
-
-        await this.applyWalletMutation(
-          tx,
-          bet.userId,
-          outcome.profitLoss,
-          bet.id,
-          matchId,
-          outcome.status,
-        );
-
-        summary?.push({
-          betId: bet.id,
-          userId: bet.userId,
-          result: outcome.status,
-          profitLoss: outcome.profitLoss,
-        });
-      }
-
-      // Check if all bets for this match are settled, then mark match as finished
-      const remainingPendingBets = await tx.bet.count({
-        where: {
-          matchId,
-          status: BetStatus.PENDING,
+      // Create settlement record FIRST
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      await this.prisma.settlement.upsert({
+        where: { settlementId },
+        update: {
+          isRollback: false,
+          settledBy: 'AUTO',
+        },
+        create: {
+          settlementId,
+          eventId,
+          marketType: MarketType.FANCY,
+          marketId: fancy.marketId?.toString(),
+          winnerId: fancy.isCancel ? null : fancy.decisionRun?.toString(),
+          settledBy: 'AUTO',
         },
       });
 
-      if (remainingPendingBets === 0) {
-        await tx.match.updateMany({
-          where: { id: matchId },
-          data: {
-            status: MatchStatus.FINISHED,
-            updatedAt: new Date(),
-          },
-        });
-      }
+      const userIds = new Set<string>();
 
-      return summary ?? [];
-      },
-      {
-        maxWait: 60000, // Maximum time to wait for a transaction slot (60 seconds)
-        timeout: 60000, // Maximum time the transaction can run (60 seconds)
-      },
-    );
+      for (const bet of bets) {
+        let result: { status: BetStatus; pnl: number };
 
-    return {
-      success: true,
-      settlement_id: settlementId,
-      match_id: matchId,
-      settled,
-    };
-  }
-
-  /**
-   * Legacy method - settle all bets for a match
-   * This is kept for backward compatibility but internally groups by settlement_id
-   */
-  async settleMatch(matchId: string): Promise<SettlementResult> {
-    if (!matchId) {
-      return { success: false, message: 'match_id is required' };
-    }
-
-    // Get all unique settlement_ids for this match
-    const settlementIds = await this.getSettlementIdsForMatch(matchId);
-
-    if (settlementIds.length === 0) {
-      return {
-        success: true,
-        match_id: matchId,
-        message: 'No pending bets to settle.',
-      };
-    }
-
-    const allSettled: SettlementResult['settled'] = [];
-    let hasErrors = false;
-
-    // Settle each settlement_id separately
-    for (const settlementId of settlementIds) {
-      try {
-        const result = await this.settleBySettlementId(settlementId);
-        if (result.success && result.settled) {
-          allSettled.push(...result.settled);
-        } else {
-          hasErrors = true;
-        }
-      } catch (error) {
-        this.logger.error(
-          `Failed to settle settlement_id ${settlementId} for match ${matchId}: ${(error as Error).message}`,
-        );
-        hasErrors = true;
-      }
-    }
-
-    return {
-      success: !hasErrors,
-      match_id: matchId,
-      settled: allSettled,
-      message: hasErrors
-        ? 'Some settlements completed with errors'
-        : 'All settlements completed successfully',
-    };
-  }
-
-  @Cron(CronExpression.EVERY_30_SECONDS)
-  async autoSettlementCron() {
-    const settlementIds = await this.getSettlementIdsAwaitingSettlement();
-    if (settlementIds.length === 0) {
-      return;
-    }
-
-    this.logger.log(
-      `Auto settlement triggered for ${settlementIds.length} settlement_id(s): ${settlementIds.slice(0, 5).join(', ')}${settlementIds.length > 5 ? '...' : ''}`,
-    );
-
-    for (const settlementId of settlementIds) {
-      try {
-        await this.settleBySettlementId(settlementId);
-      } catch (error) {
-        this.logger.error(
-          `Failed to auto-settle settlement_id ${settlementId}`,
-          (error as Error).stack,
-        );
-      }
-    }
-  }
-
-  /**
-   * Get pending bets grouped by settlement_id
-   */
-  private async getPendingBetsBySettlementId(settlementId: string) {
-    return this.prisma.bet.findMany({
-      where: {
-        settlementId,
-        status: BetStatus.PENDING,
-      },
-      select: {
-        id: true,
-        userId: true,
-        matchId: true,
-        amount: true,
-        odds: true,
-        selId: true,
-        selectionId: true,
-        betType: true,
-        betName: true,
-        marketName: true,
-        marketType: true,
-        marketId: true,
-        eventId: true,
-        gtype: true,
-        betValue: true,
-        betRate: true,
-        winAmount: true,
-        lossAmount: true,
-        settlementId: true,
-        toReturn: true,
-        status: true,
-        createdAt: true,
-        updatedAt: true,
-        metadata: true,
-      } as any,
-      orderBy: { createdAt: 'asc' },
-    });
-  }
-
-  /**
-   * Get all settlement_ids that have pending bets
-   * Only includes matches that are FINISHED or LIVE
-   */
-  private async getSettlementIdsAwaitingSettlement(): Promise<string[]> {
-    const bets = await this.prisma.bet.findMany({
-      where: {
-        status: BetStatus.PENDING,
-        settlementId: { not: null },
-        match: {
-          status: {
-            in: [MatchStatus.FINISHED, MatchStatus.LIVE],
-          },
-        },
-      },
-      select: { settlementId: true },
-      distinct: ['settlementId'],
-      take: 25,
-    });
-
-    return bets
-      .map((bet) => bet.settlementId)
-      .filter((id): id is string => id !== null && id !== undefined);
-  }
-
-  /**
-   * Get all settlement_ids for a specific match
-   */
-  private async getSettlementIdsForMatch(matchId: string): Promise<string[]> {
-    const bets = await this.prisma.bet.findMany({
-      where: {
-        matchId,
-        status: BetStatus.PENDING,
-        settlementId: { not: null },
-      },
-      select: { settlementId: true },
-      distinct: ['settlementId'],
-    });
-
-    return bets
-      .map((bet) => bet.settlementId)
-      .filter((id): id is string => id !== null && id !== undefined);
-  }
-
-  /**
-   * Legacy method - kept for backward compatibility
-   */
-  private async getPendingBets(matchId: string) {
-    return this.prisma.bet.findMany({
-      where: {
-        matchId,
-        status: BetStatus.PENDING,
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-  }
-
-  /**
-   * Legacy method - kept for backward compatibility
-   */
-  private async getMatchesAwaitingSettlement(): Promise<string[]> {
-    // Only get matches that are FINISHED or LIVE (not UPCOMING)
-    // and have pending bets
-    const matches = await this.prisma.bet.findMany({
-      where: {
-        status: BetStatus.PENDING,
-        match: {
-          status: {
-            in: [MatchStatus.FINISHED, MatchStatus.LIVE],
-          },
-        },
-      },
-      select: { matchId: true },
-      distinct: ['matchId'],
-      take: 25,
-    });
-
-    return matches.map((item) => item.matchId);
-  }
-
-  /**
-   * Fetch match result from new vendor API
-   * Uses /v3/betfairResults endpoint with marketIds
-   */
-  private async fetchMatchResult(matchId: string, referenceBet?: any) {
-    try {
-      // Get match details to find eventId and marketId
-      const matchDetails = await this.prisma.match.findUnique({
-        where: { id: matchId },
-        select: {
-          eventId: true,
-          marketId: true,
-        } as any,
-      });
-
-      // Get marketId from bet, match details, or fetch from market list
-      // Priority: bet.marketId > match.marketId > fetch from market list
-      let marketId = referenceBet?.marketId || matchDetails?.marketId;
-
-      // If we don't have marketId, try to get it from the market list using eventId
-      if (!marketId && matchDetails?.eventId) {
-        try {
-          const eventId: string | number = String(matchDetails.eventId);
-          const markets = await this.cricketIdService.getMarketList(eventId);
-          // Find market that matches the bet's selectionId or marketName
-          if (Array.isArray(markets) && markets.length > 0) {
-            // Try to find matching market based on selectionId or marketName
-            const matchingMarket = markets.find(
-              (m: any) =>
-                m.runners?.some(
-                  (r: any) => r.selectionId === referenceBet?.selectionId,
-                ) || m.marketName === referenceBet?.marketName,
-            );
-            marketId = matchingMarket?.marketId || markets[0]?.marketId;
+        // Handle cancellation (refund stake)
+        if (fancy.isCancel || fancy.isRollback) {
+          // Refund the stake amount (amount field)
+          result = { status: BetStatus.CANCELLED, pnl: bet.amount ?? 0 };
+        } else if (fancy.isDeclare) {
+          // Handle declared fancy with BACK/LAY logic
+          if (bet.betType === 'BACK') {
+            const betValue = bet.betValue ?? 0;
+            const lossAmount = bet.lossAmount ?? 0;
+            result =
+              fancy.decisionRun > betValue
+                ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+                : { status: BetStatus.LOST, pnl: -lossAmount };
+          } else {
+            const betValue = bet.betValue ?? 0;
+            const lossAmount = bet.lossAmount ?? 0;
+            result =
+              fancy.decisionRun <= betValue
+                ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+                : { status: BetStatus.LOST, pnl: -lossAmount };
           }
-        } catch (error) {
+        } else {
+          // Skip if neither declared nor cancelled
+          continue;
+        }
+
+        await this.applyOutcome(bet, result);
+        userIds.add(bet.userId);
+      }
+
+      // Recalculate P/L for all affected users
+      for (const userId of userIds) {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
+            userId,
+            eventId,
+          );
+      } catch (error) {
           this.logger.warn(
-            `Could not fetch markets for eventId ${matchDetails.eventId}: ${(error as Error).message}`,
+            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
           );
         }
       }
-
-      if (!marketId) {
-        this.logger.warn(
-          `No marketId found for match ${matchId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
-        );
-        return null;
-      }
-
-      // Fetch result using new API
-      const results = await this.cricketIdService.getBetfairResults(marketId);
-
-      // Parse the new result format
-      // Response format: [{ result: { status, marketId, eventId, sport, isRefund, type, gtype, result: 235, winnerName } }]
-      if (!results || !Array.isArray(results) || results.length === 0) {
-        this.logger.debug(
-          `No results found for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
-        );
-        return null;
-      }
-
-      const resultData = results[0]?.result;
-      if (!resultData) {
-        this.logger.debug(
-          `Result data not available for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
-        );
-        return null;
-      }
-
-      // Check if result is ready
-      if (!resultData.status || resultData.isRefund) {
-        this.logger.debug(
-          `Result not ready or refunded for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
-        );
-        return null;
-      }
-
-      // Extract winner from result
-      // The result field contains the selectionId of the winner (e.g., 235)
-      const winnerSelectionId = resultData.result;
-      if (!winnerSelectionId) {
-        this.logger.debug(
-          `Winner not determined yet for marketId ${marketId} (settlement_id: ${referenceBet?.settlementId || 'N/A'})`,
-        );
-        return null;
-      }
-
-      // Return in format expected by settlement logic
-      return {
-        winner: winnerSelectionId.toString(), // Convert to string for comparison
-        winnerName: resultData.winnerName,
-        marketId: resultData.marketId,
-        eventId: resultData.eventId,
-        type: resultData.type,
-        gtype: resultData.gtype,
-        isRefund: resultData.isRefund,
-      };
-    } catch (error) {
-      this.logger.error(
-        `Failed to fetch result for match ${matchId} (settlement_id: ${referenceBet?.settlementId || 'N/A'}): ${(error as Error).message}`,
-      );
-      return null;
     }
   }
 
-  private determineOutcome(bet: any, winner: string) {
-    const winAmount =
-      Number(bet.win_amount ?? bet.winAmount ?? bet.amount * bet.odds) || 0;
-    const lossAmount =
-      Number(bet.loss_amount ?? bet.lossAmount ?? bet.amount) || 0;
-
-    const winnerId = Number(winner);
-
-    // For session bets (fancy, fancy1, etc.), compare selectionId with winner_id
-    // This is the primary comparison method for session bets
-    if (!isNaN(winnerId) && bet.selectionId !== null && bet.selectionId !== undefined) {
-      const betSelectionId = Number(bet.selectionId);
-      if (!isNaN(betSelectionId)) {
-        // If selectionId matches winner_id, bet won
-        if (betSelectionId === winnerId) {
-          return { status: 'won' as const, profitLoss: winAmount };
-        } else {
-          return { status: 'lost' as const, profitLoss: -lossAmount };
-        }
-      }
-    }
-
-    // Handle back/lay bet types with numeric comparison (like PHP code)
-    const betType = bet.bet_type ?? bet.betType;
-    const betValue = Number(bet.bet_value ?? bet.betValue ?? 0);
-
-    // If bet has betType and betValue, use numeric comparison logic
-    if (betType && betValue > 0 && !isNaN(winnerId)) {
-      let isWinner = false;
-
-      if (betType.toLowerCase() === 'back') {
-        // Back bet: winner if winner_id >= bet_value
-        isWinner = winnerId >= betValue;
-      } else if (betType.toLowerCase() === 'lay') {
-        // Lay bet: winner if winner_id < bet_value
-        isWinner = winnerId < betValue;
-      }
-
-      if (isWinner) {
-        return { status: 'won' as const, profitLoss: winAmount };
-      } else {
-        return { status: 'lost' as const, profitLoss: -lossAmount };
-      }
-    }
-
-    // Fallback to string comparison for other bet types
-    const betSelection =
-      bet.bet_name ??
-      bet.betName ??
-      bet.selection ??
-      bet.selectionName ??
-      bet.market_name ??
-      bet.marketName ??
-      null;
-
-    if (!betSelection) {
-      return null;
-    }
-
-    // Compare bet selection with winner (case-insensitive)
-    if (betSelection.toString().trim().toLowerCase() === winner.toString().trim().toLowerCase()) {
-      return { status: 'won' as const, profitLoss: winAmount };
-    }
-
-    return { status: 'lost' as const, profitLoss: -lossAmount };
-  }
-
-  private async applyWalletMutation(
-    tx: Prisma.TransactionClient,
-    userId: string,
-    profitLoss: number,
-    betId: string,
-    matchId: string,
-    outcome: 'won' | 'lost',
+  async settleBookmakerManual(
+    eventId: string,
+    marketId: string,
+    winnerSelectionId: string,
+    adminId: string,
   ) {
-    // CPL = Client Profit/Loss (positive = client loses, negative = client wins)
-    const CPL = profitLoss;
+    const settlementId = `CRICKET:BOOKMAKER:${eventId}:${marketId}`;
 
-    // Get client user
-    const clientUser = await tx.user.findUnique({
-      where: { id: userId },
-      include: { parent: true },
+    // Check if settlement already exists (prevent double settlement)
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const existingSettlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
     });
 
-    if (!clientUser) {
-      throw new Error(`User ${userId} not found`);
+    if (existingSettlement && !existingSettlement.isRollback) {
+      throw new BadRequestException(
+        `Settlement ${settlementId} already exists`,
+      );
     }
 
-    // STEP 1 — CLIENT → AGENT
-    // Agent owns 100% of client's P/L
-    let AGENT_PL = CPL;
-    let agentUser = clientUser.parent;
-
-    // STEP 2 — AGENT → ADMIN
-    let ADMIN_PL = 0;
-    let ADMIN_FINAL = 0;
-    let AGENT_FINAL = AGENT_PL;
-    let adminUser: { id: string; commissionPercentage: number; parentId: string | null } | null = null;
-
-    if (agentUser && agentUser.parentId) {
-      // Get Agent's share (stored in commissionPercentage field)
-      // This is AD% - Admin's share percentage
-      const AD_SHARE = agentUser.commissionPercentage;
-      ADMIN_PL = AGENT_PL * (AD_SHARE / 100);
-      AGENT_FINAL = AGENT_PL - ADMIN_PL; // AGENT_PL * (1 - AD_SHARE / 100)
-
-      // Get Admin (Agent's parent)
-      const foundAdmin = await tx.user.findUnique({
-        where: { id: agentUser.parentId },
-      });
-      if (foundAdmin) {
-        adminUser = foundAdmin;
-      }
-    }
-
-    // STEP 3 — ADMIN → SUPERADMIN
-    let SUPER_PL = 0;
-    let superAdminUser: { id: string } | null = null;
-
-    if (adminUser) {
-      // Get Admin's share (stored in commissionPercentage field)
-      // This is SA% - SuperAdmin's share percentage
-      const SA_SHARE = adminUser.commissionPercentage;
-      SUPER_PL = ADMIN_PL * (SA_SHARE / 100);
-      ADMIN_FINAL = ADMIN_PL - SUPER_PL; // ADMIN_PL * (1 - SA_SHARE / 100)
-
-      // Get SuperAdmin (Admin's parent)
-      if (adminUser.parentId) {
-        const foundSuperAdmin = await tx.user.findUnique({
-          where: { id: adminUser.parentId },
-        });
-        if (foundSuperAdmin) {
-          superAdminUser = foundSuperAdmin;
-        }
-      }
-    } else {
-      ADMIN_FINAL = ADMIN_PL;
-    }
-
-    // FINAL BALANCE UPDATES
-    // Update Agent balance
-    if (agentUser) {
-      const agentWallet = await tx.wallet.upsert({
-        where: { userId: agentUser.id },
-        update: {},
-        create: { userId: agentUser.id, balance: 0, liability: 0 },
-      });
-
-      const liabilityToClear = Math.abs(AGENT_PL);
-
-      await tx.wallet.update({
-        where: { userId: agentUser.id },
-        data: {
-          liability: { decrement: liabilityToClear },
-          balance: { increment: AGENT_FINAL },
-        },
-      });
-
-      await tx.transaction.create({
-        data: {
-          walletId: agentWallet.id,
-          amount: Math.abs(AGENT_FINAL),
-          type:
-            AGENT_FINAL >= 0
-              ? TransactionType.BET_WON
-              : TransactionType.BET_LOST,
-          description: `Settlement share for bet ${betId} on match ${matchId} - Agent final: ${AGENT_FINAL}`,
-        },
-      });
-    }
-
-    // Update Admin balance
-    if (adminUser) {
-      const adminWallet = await tx.wallet.upsert({
-        where: { userId: adminUser.id },
-        update: {},
-        create: { userId: adminUser.id, balance: 0, liability: 0 },
-      });
-
-      await tx.wallet.update({
-        where: { userId: adminUser.id },
-        data: {
-          balance: { increment: ADMIN_FINAL },
-        },
-      });
-
-      await tx.transaction.create({
-        data: {
-          walletId: adminWallet.id,
-          amount: Math.abs(ADMIN_FINAL),
-          type:
-            ADMIN_FINAL >= 0
-              ? TransactionType.BET_WON
-              : TransactionType.BET_LOST,
-          description: `Settlement share for bet ${betId} on match ${matchId} - Admin final: ${ADMIN_FINAL}`,
-        },
-      });
-    }
-
-    // Update SuperAdmin balance
-    if (superAdminUser) {
-      const superAdminWallet = await tx.wallet.upsert({
-        where: { userId: superAdminUser.id },
-        update: {},
-        create: { userId: superAdminUser.id, balance: 0, liability: 0 },
-      });
-
-      await tx.wallet.update({
-        where: { userId: superAdminUser.id },
-        data: {
-          balance: { increment: SUPER_PL },
-        },
-      });
-
-      await tx.transaction.create({
-        data: {
-          walletId: superAdminWallet.id,
-          amount: Math.abs(SUPER_PL),
-          type:
-            SUPER_PL >= 0
-              ? TransactionType.BET_WON
-              : TransactionType.BET_LOST,
-          description: `Settlement share for bet ${betId} on match ${matchId} - SuperAdmin share: ${SUPER_PL}`,
-        },
-      });
-    }
-
-    // Update Client wallet
-    // CPL (Client Profit/Loss):
-    // - Positive CPL = client loses money (already deducted, just clear liability)
-    // - Negative CPL = client wins money (add to balance, clear liability)
-    const clientWallet = await tx.wallet.upsert({
-      where: { userId },
-      update: {},
-      create: { userId, balance: 0, liability: 0 },
-    });
-
-    const liabilityToClear = Math.abs(CPL);
-    const walletUpdateData: Prisma.WalletUpdateInput = {
-      liability: { decrement: liabilityToClear },
-    };
-
-    // If client won (negative CPL means profit), add to balance
-    if (CPL < 0) {
-      walletUpdateData.balance = { increment: Math.abs(CPL) };
-    }
-
-    await tx.wallet.update({
-      where: { userId },
-      data: walletUpdateData,
-    });
-
-    await tx.transaction.create({
-      data: {
-        walletId: clientWallet.id,
-        amount: Math.abs(CPL),
-        type:
-          CPL < 0 // Negative CPL means client won
-            ? TransactionType.BET_WON
-            : TransactionType.BET_LOST,
-        description: `Settlement for bet ${betId} on match ${matchId} (${outcome})`,
-      },
-    });
-  }
-
-  /**
-   * Get list of settlement_ids that need settlement (with pending bets)
-   * Includes match info and bet counts
-   */
-  async getSettlementIdsNeedingSettlement() {
-    // Filter by gtype: fancy, fancy1, Normal, oddeven (like PHP code)
-    // Note: PHP code doesn't require settlementId, so we make it optional
-    // Also include "fancy" (not just "fancy1") based on actual data
-    // Also include bets where marketName is "Normal" (session bets)
-    const bets = await this.prisma.bet.findMany({
-      where: {
-        status: BetStatus.PENDING,
-        OR: [
-          {
-            gtype: {
-              in: ['fancy', 'fancy1', 'Normal', 'oddeven'],
-            },
-          },
-          {
-            marketName: 'Normal', // Session bets often have marketName "Normal"
-          },
-        ],
-        // Remove match status filter to show all pending bets (like PHP)
-        // match: {
-        //   status: {
-        //     in: [MatchStatus.FINISHED, MatchStatus.LIVE],
-        //   },
-        // },
-      },
-      include: {
-        match: {
-          select: {
-            id: true,
-            homeTeam: true,
-            awayTeam: true,
-            eventId: true,
-            eventName: true,
-            startTime: true,
-            status: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    // Group by match_id, selection_id, gtype, bet_name (like PHP code)
-    const groupedMap = new Map<
-      string,
-      {
-        match_id: string;
-        selection_id: number | null;
-        gtype: string | null;
-        bet_name: string | null;
-        match: any;
-        pending_bets_count: number;
-        total_bet_amount: number;
-        created_at: Date;
-        settlement_ids: Set<string>;
-      }
-    >();
-
-    for (const bet of bets) {
-      // Create unique key: match_id + selection_id + gtype + bet_name
-      // Note: settlementId is optional, so we don't skip bets without it
-      const groupKey = `${bet.matchId}_${bet.selectionId ?? 'null'}_${bet.gtype ?? 'null'}_${bet.betName ?? 'null'}`;
-
-      const existing = groupedMap.get(groupKey);
-      if (existing) {
-        existing.pending_bets_count += 1;
-        existing.total_bet_amount += Number(bet.amount || 0);
-        if (bet.settlementId) {
-          existing.settlement_ids.add(bet.settlementId);
-        }
-        // Keep earliest created_at
-        if (bet.createdAt < existing.created_at) {
-          existing.created_at = bet.createdAt;
-        }
-      } else {
-        groupedMap.set(groupKey, {
-          match_id: bet.matchId,
-          selection_id: bet.selectionId,
-          gtype: bet.gtype,
-          bet_name: bet.betName,
-          match: bet.match,
-          pending_bets_count: 1,
-          total_bet_amount: Number(bet.amount || 0),
-          created_at: bet.createdAt,
-          settlement_ids: bet.settlementId ? new Set([bet.settlementId]) : new Set(),
-        });
-      }
-    }
-
-    // Convert to array format similar to PHP
-    return Array.from(groupedMap.values()).map((group) => ({
-      match_id: group.match_id,
-      selection_id: group.selection_id,
-      gtype: group.gtype,
-      bet_name: group.bet_name,
-      match: group.match,
-      pending_bets_count: group.pending_bets_count,
-      total_bet_amount: group.total_bet_amount,
-      created_at: group.created_at,
-      settlement_ids: Array.from(group.settlement_ids),
-    }));
-  }
-
-  /**
-   * Get details for a specific settlement_id
-   * Returns match info, all bets, and their status
-   */
-  async getSettlementDetails(settlementId: string) {
     const bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
+        status: BetStatus.PENDING,
       },
-      include: {
-        match: true,
-        user: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'asc' },
     });
 
     if (bets.length === 0) {
-      return null;
+      return { success: true, message: 'No pending bets to settle' };
     }
 
-    const matchId = bets[0].matchId;
-    const match = bets[0].match;
-
-    // Count bets by status
-    const statusCounts = {
-      PENDING: bets.filter((b) => b.status === BetStatus.PENDING).length,
-      WON: bets.filter((b) => b.status === BetStatus.WON).length,
-      LOST: bets.filter((b) => b.status === BetStatus.LOST).length,
-      CANCELLED: bets.filter((b) => b.status === BetStatus.CANCELLED).length,
-    };
-
-    // Calculate totals
-    const totalPendingAmount = bets
-      .filter((b) => b.status === BetStatus.PENDING)
-      .reduce((sum, b) => sum + Number(b.amount || 0), 0);
-
-    const firstBet = bets[0];
-
-    return {
-      settlement_id: settlementId,
-      match_id: matchId,
-      match: {
-        id: match.id,
-        homeTeam: match.homeTeam,
-        awayTeam: match.awayTeam,
-        eventId: match.eventId,
-        eventName: match.eventName,
-        startTime: match.startTime,
-        status: match.status,
+    // Create settlement record FIRST
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    await this.prisma.settlement.upsert({
+      where: { settlementId },
+      update: {
+        isRollback: false,
+        settledBy: adminId,
       },
-      bet_info: {
-        betName: firstBet.betName,
-        marketName: firstBet.marketName,
-        gtype: firstBet.gtype,
-        selectionId: firstBet.selectionId,
+      create: {
+        settlementId,
+        eventId,
+        marketType: MarketType.BOOKMAKER,
+        marketId,
+        winnerId: winnerSelectionId,
+        settledBy: adminId,
       },
-      status_counts: statusCounts,
-      total_pending_amount: totalPendingAmount,
-      total_bets: bets.length,
-      bets: bets.map((bet) => ({
-        id: bet.id,
-        userId: bet.userId,
-        user: bet.user,
-        amount: bet.amount,
-        odds: bet.odds,
-        betName: bet.betName,
-        selectionId: bet.selectionId,
-        winAmount: bet.winAmount,
-        lossAmount: bet.lossAmount,
-        status: bet.status,
-        createdAt: bet.createdAt,
-        updatedAt: bet.updatedAt,
-      })),
-    };
+    });
+
+    const winnerSelectionIdNum = Number(winnerSelectionId);
+    const userIds = new Set<string>();
+
+    for (const bet of bets) {
+      let result: { status: BetStatus; pnl: number };
+      const lossAmount = bet.lossAmount ?? 0;
+
+      if (bet.selectionId === winnerSelectionIdNum) {
+        result =
+          bet.betType === 'BACK'
+            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+            : { status: BetStatus.LOST, pnl: -lossAmount };
+      } else {
+        result =
+          bet.betType === 'LAY'
+            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+            : { status: BetStatus.LOST, pnl: -lossAmount };
+      }
+
+      await this.applyOutcome(bet, result);
+      userIds.add(bet.userId);
+    }
+
+    // Recalculate P/L for all affected users
+    for (const userId of userIds) {
+      try {
+        await this.pnlService.recalculateUserPnlAfterSettlement(
+          userId,
+          eventId,
+        );
+        } catch (error) {
+          this.logger.warn(
+          `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
+        );
+      }
+    }
+
+    return { success: true, message: 'Bookmaker bets settled successfully' };
   }
 
-  /**
-   * Get bets with settlement status
-   * Can filter by status, match_id, or settlement_id
-   */
-  async getBetsWithStatus(filters?: {
-    status?: BetStatus;
-    matchId?: string;
-    settlementId?: string;
-    userId?: string;
-    limit?: number;
-  }) {
-    const where: any = {};
+  async settleMatchOddsManual(
+    eventId: string,
+    marketId: string,
+    winnerSelectionId: string,
+    adminId: string,
+  ) {
+    const settlementId = `CRICKET:MATCHODDS:${eventId}:${marketId}`;
 
-    if (filters?.status) {
-      where.status = filters.status;
-    }
+    // Check if settlement already exists (prevent double settlement)
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const existingSettlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
+    });
 
-    if (filters?.matchId) {
-      where.matchId = filters.matchId;
-    }
-
-    if (filters?.settlementId) {
-      where.settlementId = filters.settlementId;
-    }
-
-    if (filters?.userId) {
-      where.userId = filters.userId;
+    if (existingSettlement && !existingSettlement.isRollback) {
+      throw new BadRequestException(
+        `Settlement ${settlementId} already exists`,
+      );
     }
 
     const bets = await this.prisma.bet.findMany({
-      where,
-      include: {
-        match: {
-          select: {
-            id: true,
-            homeTeam: true,
-            awayTeam: true,
-            eventName: true,
-            status: true,
-            startTime: true,
-          },
-        },
-        user: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-          },
-        },
+      where: {
+        settlementId,
+        status: BetStatus.PENDING,
       },
-      orderBy: { createdAt: 'desc' },
-      take: filters?.limit || 100,
     });
 
-    return bets.map((bet) => ({
-      id: bet.id,
-      settlement_id: bet.settlementId,
-      match_id: bet.matchId,
-      selection_id: bet.selectionId,
-      user: bet.user,
-      match: bet.match,
-      amount: bet.amount,
-      odds: bet.odds,
-      betName: bet.betName,
-      marketName: bet.marketName,
-      gtype: bet.gtype,
-      winAmount: bet.winAmount,
-      lossAmount: bet.lossAmount,
-      status: bet.status,
-      createdAt: bet.createdAt,
-      updatedAt: bet.updatedAt,
-    }));
+    if (bets.length === 0) {
+      return { success: true, message: 'No pending bets to settle' };
+    }
+
+    // Create settlement record FIRST
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    await this.prisma.settlement.upsert({
+      where: { settlementId },
+      update: {
+        isRollback: false,
+        settledBy: adminId,
+      },
+      create: {
+        settlementId,
+        eventId,
+        marketType: MarketType.MATCH_ODDS,
+        marketId,
+        winnerId: winnerSelectionId,
+        settledBy: adminId,
+      },
+    });
+
+    const winnerSelectionIdNum = Number(winnerSelectionId);
+    const userIds = new Set<string>();
+
+    for (const bet of bets) {
+      let result: { status: BetStatus; pnl: number };
+      const lossAmount = bet.lossAmount ?? 0;
+
+      if (bet.selectionId === winnerSelectionIdNum) {
+        result =
+          bet.betType === 'BACK'
+            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+            : { status: BetStatus.LOST, pnl: -lossAmount };
+        } else {
+        result =
+          bet.betType === 'LAY'
+            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
+            : { status: BetStatus.LOST, pnl: -lossAmount };
+      }
+
+      await this.applyOutcome(bet, result);
+      userIds.add(bet.userId);
+    }
+
+    // Recalculate P/L for all affected users
+    for (const userId of userIds) {
+      try {
+        await this.pnlService.recalculateUserPnlAfterSettlement(
+          userId,
+          eventId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
+        );
+      }
+    }
+
+    return { success: true, message: 'Match odds bets settled successfully' };
   }
 
-  /**
-   * Get all settlement results (all settled bets)
-   * Returns all bets that have been settled (WON or LOST status)
-   */
-  async getAllSettlementResults(filters?: {
-    matchId?: string;
-    settlementId?: string;
-    userId?: string;
-    status?: BetStatus;
-    limit?: number;
-    offset?: number;
-  }) {
-    const where: any = {
+  private async applyOutcome(
+    bet: any,
+    outcome: { status: BetStatus; pnl: number },
+  ) {
+    await this.prisma.$transaction(async (tx) => {
+      if (outcome.pnl !== 0) {
+      await tx.wallet.update({
+          where: { userId: bet.userId },
+        data: {
+            balance: { increment: outcome.pnl },
+        },
+      });
+    }
+
+      await tx.bet.update({
+        where: { id: bet.id },
+        data: {
+          status: outcome.status,
+          // @ts-ignore - pnl field exists after database migration
+          pnl: outcome.pnl,
+          settledAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+    });
+  }
+
+  async rollbackSettlement(settlementId: string, adminId: string) {
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const settlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
+    });
+
+    if (!settlement || settlement.isRollback) {
+      throw new BadRequestException(
+        'Invalid or already rollbacked settlement',
+      );
+    }
+
+    const bets = await this.prisma.bet.findMany({
+      where: {
+        settlementId,
       status: {
         in: [BetStatus.WON, BetStatus.LOST],
       },
-    };
-
-    if (filters?.matchId) {
-      where.matchId = filters.matchId;
-    }
-
-    if (filters?.settlementId) {
-      where.settlementId = filters.settlementId;
-    }
-
-    if (filters?.userId) {
-      where.userId = filters.userId;
-    }
-
-    if (filters?.status) {
-      where.status = filters.status;
-    }
-
-    const [bets, total] = await Promise.all([
-      this.prisma.bet.findMany({
-        where,
-        include: {
-          match: {
-            select: {
-              id: true,
-              homeTeam: true,
-              awayTeam: true,
-              eventName: true,
-              status: true,
-              startTime: true,
-            },
-          },
-          user: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-            },
-          },
-        },
-        orderBy: { updatedAt: 'desc' },
-        take: filters?.limit || 100,
-        skip: filters?.offset || 0,
-      }),
-      this.prisma.bet.count({ where }),
-    ]);
-
-    return {
-      total,
-      results: bets.map((bet) => ({
-        id: bet.id,
-        settlement_id: bet.settlementId,
-        match_id: bet.matchId,
-        selection_id: bet.selectionId,
-        user: bet.user,
-        match: bet.match,
-        amount: bet.amount,
-        odds: bet.odds,
-        betName: bet.betName,
-        marketName: bet.marketName,
-        gtype: bet.gtype,
-        winAmount: bet.winAmount,
-        lossAmount: bet.lossAmount,
-        status: bet.status,
-        profitLoss:
-          bet.status === BetStatus.WON
-            ? Number(bet.winAmount || bet.amount * bet.odds)
-            : -Number(bet.lossAmount || bet.amount),
-        createdAt: bet.createdAt,
-        updatedAt: bet.updatedAt,
-      })),
-    };
-  }
-
-  /**
-   * Reverse a settlement
-   * This will:
-   * 1. Revert bet status back to PENDING
-   * 2. Reverse wallet transactions (undo profit/loss)
-   * 3. Restore liability
-   */
-  async reverseSettlement(settlementId: string): Promise<{
-    success: boolean;
-    message: string;
-    reversed?: Array<{
-      betId: string;
-      userId: string;
-      previousStatus: BetStatus;
-      reversedAmount: number;
-    }>;
-  }> {
-    if (!settlementId) {
-      return { success: false, message: 'settlement_id is required' };
-    }
-
-    // Get all settled bets for this settlement_id
-    const settledBets = await this.prisma.bet.findMany({
-      where: {
-        settlementId,
-        status: {
-          in: [BetStatus.WON, BetStatus.LOST],
-        },
       },
-      include: {
-        user: {
-          include: {
-            wallet: true,
-          },
-        },
-        match: true,
-      },
-      orderBy: { createdAt: 'asc' },
     });
 
-    if (settledBets.length === 0) {
-      return {
-        success: false,
-        message: `No settled bets found for settlement_id: ${settlementId}`,
-      };
-    }
+    await this.prisma.$transaction(async (tx) => {
+      for (const bet of bets) {
+        // Reverse wallet
+        // @ts-ignore - pnl field exists after database migration
+        if (bet.pnl !== 0) {
+          await tx.wallet.update({
+            where: { userId: bet.userId },
+            data: {
+              // @ts-ignore - pnl field exists after database migration
+              balance: { increment: -bet.pnl },
+            },
+          });
+        }
 
-    const matchId = settledBets[0].matchId;
-
-    const reversed = await this.prisma.$transaction(async (tx) => {
-      const summary: Array<{
-        betId: string;
-        userId: string;
-        previousStatus: BetStatus;
-        reversedAmount: number;
-      }> = [];
-
-      for (const bet of settledBets) {
-        const previousStatus = bet.status;
-        const wasWon = previousStatus === BetStatus.WON;
-        const profitLoss = wasWon
-          ? Number(bet.winAmount || bet.amount * bet.odds)
-          : -Number(bet.lossAmount || bet.amount);
-
-        // Revert bet status to PENDING
+        // Reset bet
         await tx.bet.update({
           where: { id: bet.id },
           data: {
             status: BetStatus.PENDING,
-            updatedAt: new Date(),
-          },
-        });
-
-        // Reverse wallet mutation
-        if (bet.user.wallet) {
-          const liabilityToRestore = Math.abs(profitLoss);
-
-          await tx.wallet.update({
-            where: { id: bet.user.wallet.id },
-            data: {
-              liability: { increment: liabilityToRestore }, // restore liability
-              balance: { decrement: profitLoss }, // reverse profit/loss
-            },
-          });
-
-          // Create a reversal transaction
-          await tx.transaction.create({
-            data: {
-              walletId: bet.user.wallet.id,
-              amount: Math.abs(profitLoss),
-              type: TransactionType.REFUND,
-              description: `Settlement reversal for bet ${bet.id} on match ${matchId} (previously ${previousStatus})`,
-            },
-          });
-        }
-
-        summary.push({
-          betId: bet.id,
-          userId: bet.userId,
-          previousStatus,
-          reversedAmount: profitLoss,
-        });
-      }
-
-      // Update match status if needed (if there are now pending bets)
-      const pendingBetsCount = await tx.bet.count({
-        where: {
-          matchId,
-          status: BetStatus.PENDING,
-        },
-      });
-
-      if (pendingBetsCount > 0) {
-        await tx.match.updateMany({
-          where: { id: matchId },
-          data: {
-            status: MatchStatus.LIVE, // or FINISHED, depending on your logic
+            // @ts-ignore - pnl field exists after database migration
+            pnl: 0,
+            rollbackAt: new Date(),
+            settledAt: null,
             updatedAt: new Date(),
           },
         });
       }
 
-      return summary;
+      // Mark settlement as rollbacked
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      await tx.settlement.update({
+        where: { settlementId },
+            data: {
+          isRollback: true,
+          settledBy: adminId,
+            },
+          });
     });
 
-    return {
-      success: true,
-      message: `Successfully reversed settlement for ${reversed.length} bet(s)`,
-      reversed,
-    };
+    return { success: true, message: 'Settlement rolled back successfully' };
   }
 
-  /**
-   * Get pending settlements for a specific match
-   * Returns all settlement_ids with pending bets for the given match
-   */
-  async getPendingSettlementsByMatch(matchId: string) {
-    if (!matchId) {
-      return {
-        success: false,
-        message: 'match_id is required',
-      };
-    }
-
-    // Verify match exists
-    const match = await this.prisma.match.findUnique({
-      where: { id: matchId },
-      select: {
-        id: true,
-        homeTeam: true,
-        awayTeam: true,
-        eventId: true,
-        eventName: true,
-        startTime: true,
-        status: true,
-      },
-    });
-
-    if (!match) {
-      return {
-        success: false,
-        message: `Match not found: ${matchId}`,
-      };
-    }
-
-    // Get all pending bets for this match
-    const bets = await this.prisma.bet.findMany({
-      where: {
-        matchId,
-        status: BetStatus.PENDING,
-        settlementId: { not: null },
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
+  @Cron('*/15 * * * * *') // every 15 seconds
+  async handleFancySettlement() {
+    try {
+      // Get all unique eventIds that have pending fancy bets
+      const pendingFancyBets = await this.prisma.bet.findMany({
+        where: {
+          status: BetStatus.PENDING,
+          settlementId: {
+            startsWith: 'CRICKET:FANCY:',
+          },
+          eventId: {
+            not: null,
           },
         },
+      select: {
+        eventId: true,
       },
-      orderBy: { createdAt: 'desc' },
     });
 
-    // Group by settlement_id
-    const settlementMap = new Map<
-      string,
-      {
-        settlement_id: string;
-        pending_bets_count: number;
-        total_bet_amount: number;
-        bets: any[];
-      }
-    >();
+      // Get unique eventIds using Set
+      const eventIds = Array.from(
+        new Set(
+          pendingFancyBets
+            .map((bet) => bet.eventId)
+            .filter((id): id is string => id !== null && id !== undefined),
+        ),
+      );
 
-    for (const bet of bets) {
-      if (!bet.settlementId) continue;
-
-      const existing = settlementMap.get(bet.settlementId);
-      if (existing) {
-        existing.pending_bets_count += 1;
-        existing.total_bet_amount += Number(bet.amount || 0);
-        existing.bets.push({
-          id: bet.id,
-          userId: bet.userId,
-          user: bet.user,
-          amount: bet.amount,
-          odds: bet.odds,
-          betName: bet.betName,
-          selectionId: bet.selectionId,
-          marketName: bet.marketName,
-          winAmount: bet.winAmount,
-          lossAmount: bet.lossAmount,
-          createdAt: bet.createdAt,
-        });
-      } else {
-        settlementMap.set(bet.settlementId, {
-          settlement_id: bet.settlementId,
-          pending_bets_count: 1,
-          total_bet_amount: Number(bet.amount || 0),
-          bets: [
-            {
-              id: bet.id,
-              userId: bet.userId,
-              user: bet.user,
-              amount: bet.amount,
-              odds: bet.odds,
-              betName: bet.betName,
-              selectionId: bet.selectionId,
-              marketName: bet.marketName,
-              winAmount: bet.winAmount,
-              lossAmount: bet.lossAmount,
-              createdAt: bet.createdAt,
-            },
-          ],
-        });
+      for (const eventId of eventIds) {
+        try {
+          await this.settleFancyAuto(eventId);
+        } catch (error) {
+          this.logger.error(
+            `Failed to settle fancy bets for eventId ${eventId}: ${(error as Error).message}`,
+          );
+        }
       }
+    } catch (error) {
+      this.logger.error(
+        `Error in handleFancySettlement: ${(error as Error).message}`,
+      );
     }
-
-    return {
-      success: true,
-      match,
-      settlement_count: settlementMap.size,
-      settlements: Array.from(settlementMap.values()),
-    };
   }
 }

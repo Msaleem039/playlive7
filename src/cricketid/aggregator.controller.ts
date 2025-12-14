@@ -17,17 +17,13 @@ export class AggregatorController {
     return this.service.getMatchDetail(eventId);
   }
 
-  /**
-   * GET /cricketid/aggregator/odds
-   * ?eventId=34917574&marketIds=1.250049502,1.250049500
-   * Returns combined bookmaker fancy and match odds
-   */
-  @Get('odds')
-  async getOdds(
+  // GET /cricketid/odds-fancy?eventId=34917574&marketIds=1.250049502,1.250049500
+  @Get('/cricketid/odds-fancy')
+  getOddsFancy(
     @Query('eventId') eventId: string,
     @Query('marketIds') marketIds: string,
   ) {
-    return this.service.getCombinedOdds(eventId, marketIds);
+    return this.service.getOddsAndFancy(eventId, marketIds);
   }
 }
 

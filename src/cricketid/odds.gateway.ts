@@ -25,8 +25,8 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   public server: Server; // Make public so webhook service can access it
   private readonly logger = new Logger(OddsGateway.name);
 
+  private intervals = new Map<string, NodeJS.Timeout>();
   private clientRooms = new Map<string, Set<string>>();
-  private roomMetadata = new Map<string, { eventId?: string | number; marketIds?: string }>();
 
   constructor(private cricketService: CricketIdService) {}
 
@@ -37,7 +37,7 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
-    this.clearClientRooms(client);
+    this.clearClientIntervals(client);
     this.clientRooms.delete(client.id);
   }
 
@@ -67,11 +67,57 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       clientRoomSet.add(roomName);
     }
 
-    // Store room metadata for cron job to use
-    if (!this.roomMetadata.has(roomName)) {
-      this.roomMetadata.set(roomName, { eventId, marketIds });
-      this.logger.log(`Room ${roomName} registered for cron job updates`);
+    // If interval already exists for this room, don't create another one
+    if (this.intervals.has(roomName)) {
+      this.logger.debug(`Interval already exists for room: ${roomName}`);
+      return;
     }
+
+    // Create interval to poll API every 2-3 seconds
+    const interval = setInterval(async () => {
+      try {
+        let result;
+        
+        if (marketIds) {
+          // Direct odds fetch if marketIds provided
+          result = await this.cricketService.getBetfairOdds(marketIds);
+        } else if (eventId) {
+          // Get markets first, then get odds for all markets
+          const markets = await this.cricketService.getMarketList(eventId);
+          
+          // Extract marketIds from markets response
+          if (markets && Array.isArray(markets)) {
+            const marketIdList = markets
+              .map((m: any) => m.marketId)
+              .filter((id: any) => id)
+              .join(',');
+            
+            if (marketIdList) {
+              result = await this.cricketService.getBetfairOdds(marketIdList);
+            } else {
+              result = markets; // Return markets if no marketIds found
+            }
+          } else {
+            result = markets;
+          }
+        }
+        
+        this.server.to(roomName).emit('odds_update', result);
+      } catch (error) {
+        this.logger.error(
+          `Error fetching odds data for room ${roomName}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+        // Optionally emit error to clients
+        this.server.to(roomName).emit('odds_error', {
+          error: 'Failed to fetch odds data',
+          room: roomName,
+        });
+      }
+    }, 2500); // 2.5 seconds (between 2-3 seconds)
+
+    this.intervals.set(roomName, interval);
+    this.logger.log(`Started polling for room: ${roomName}`);
   }
 
   @SubscribeMessage('unsubscribe_match')
@@ -94,12 +140,11 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const clients = this.server.sockets.adapter.rooms.get(roomName);
 
     if (!clients || clients.size === 0) {
-      this.roomMetadata.delete(roomName);
-      this.logger.log(`Room ${roomName} unregistered (no clients remaining)`);
+      this.clearIntervalForRoom(roomName);
     }
   }
 
-  private clearClientRooms(client: Socket) {
+  private clearClientIntervals(client: Socket) {
     const clientRoomSet = this.clientRooms.get(client.id);
     if (!clientRoomSet) return;
 
@@ -107,117 +152,18 @@ export class OddsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Check if room still has other clients
       const clients = this.server.sockets.adapter.rooms.get(roomName);
       if (!clients || clients.size === 0) {
-        this.roomMetadata.delete(roomName);
-        this.logger.log(`Room ${roomName} unregistered (client disconnected)`);
+        this.clearIntervalForRoom(roomName);
       }
     });
   }
 
-  /**
-   * Fetch and emit odds for all active rooms
-   * Called by cron job every 3-5 seconds
-   * Merges match odds (Betfair) and bookmaker fancy data
-   */
-  async fetchAndEmitOddsForAllRooms() {
-    const activeRooms = Array.from(this.roomMetadata.entries());
-    
-    if (activeRooms.length === 0) {
-      return;
+  private clearIntervalForRoom(roomName: string) {
+    const interval = this.intervals.get(roomName);
+    if (interval) {
+      clearInterval(interval);
+      this.intervals.delete(roomName);
+      this.logger.log(`Stopped polling for room: ${roomName}`);
     }
-
-    // Process all rooms in parallel
-    await Promise.allSettled(
-      activeRooms.map(async ([roomName, metadata]) => {
-        try {
-          // Verify room still has clients
-          const clients = this.server.sockets.adapter.rooms.get(roomName);
-          if (!clients || clients.size === 0) {
-            this.roomMetadata.delete(roomName);
-            return;
-          }
-
-          let matchOdds: any = null;
-          let bookmakerFancy: any = null;
-
-          if (metadata.marketIds) {
-            // Direct odds fetch if marketIds provided
-            matchOdds = await this.cricketService.getBetfairOdds(metadata.marketIds);
-          } else if (metadata.eventId) {
-            // Fetch both match odds and bookmaker fancy in parallel
-            const [marketsResult, fancyResult] = await Promise.allSettled([
-              // Get markets first, then get odds for all markets
-              this.cricketService.getMarketList(metadata.eventId).then(async (markets) => {
-                if (markets && Array.isArray(markets)) {
-                  const marketIdList = markets
-                    .map((m: any) => m.marketId)
-                    .filter((id: any) => id)
-                    .join(',');
-
-                  if (marketIdList) {
-                    return await this.cricketService.getBetfairOdds(marketIdList);
-                  } else {
-                    return markets; // Return markets if no marketIds found
-                  }
-                }
-                return markets;
-              }),
-              // Get bookmaker fancy
-              this.cricketService.getBookmakerFancy(metadata.eventId),
-            ]);
-
-            // Extract results
-            if (marketsResult.status === 'fulfilled') {
-              matchOdds = marketsResult.value;
-            } else {
-              this.logger.warn(
-                `Failed to fetch match odds for eventId ${metadata.eventId}:`,
-                marketsResult.reason,
-              );
-            }
-
-            if (fancyResult.status === 'fulfilled') {
-              bookmakerFancy = fancyResult.value;
-            } else {
-              this.logger.warn(
-                `Failed to fetch bookmaker fancy for eventId ${metadata.eventId}:`,
-                fancyResult.reason,
-              );
-            }
-          }
-
-          // Merge match odds and bookmaker fancy into a single result
-          const mergedResult: any = {
-            matchOdds: matchOdds || null,
-            bookmakerFancy: bookmakerFancy || null,
-          };
-
-          // If matchOdds is an object (not array), spread its properties
-          if (matchOdds && typeof matchOdds === 'object' && !Array.isArray(matchOdds)) {
-            Object.assign(mergedResult, matchOdds);
-          }
-
-          // If bookmakerFancy is an object (not array), spread its properties
-          if (bookmakerFancy && typeof bookmakerFancy === 'object' && !Array.isArray(bookmakerFancy)) {
-            Object.assign(mergedResult, bookmakerFancy);
-          }
-
-          // If we have data, emit it
-          if (matchOdds || bookmakerFancy) {
-            this.server.to(roomName).emit('odds_update', mergedResult);
-          }
-        } catch (error) {
-          this.logger.error(
-            `Error fetching odds data for room ${roomName}:`,
-            error instanceof Error ? error.message : String(error),
-          );
-          // Emit error to clients
-          this.server.to(roomName).emit('odds_error', {
-            error: 'Failed to fetch odds data',
-            room: roomName,
-          });
-        }
-      }),
-    );
   }
 }
 

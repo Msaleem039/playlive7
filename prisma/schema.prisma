@@ -96,6 +96,9 @@ model Bet {
   toReturn  Float?
   metadata  Json?
   status    BetStatus @default(PENDING)
+  pnl       Float    @default(0)
+  settledAt DateTime?
+  rollbackAt DateTime?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 
@@ -192,4 +195,39 @@ model TransferLog {
   createdAt  DateTime       @default(now())
 
   @@map("transfer_logs")
+}
+
+model Settlement {
+  id            String      @id @default(cuid())
+  settlementId  String      @unique
+  eventId       String
+  marketType    MarketType
+  marketId      String?
+  winnerId      String?
+  settledBy     String      // ADMIN ID or "AUTO"
+  isRollback    Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+
+  @@map("settlements")
+}
+
+enum MarketType {
+  FANCY
+  BOOKMAKER
+  MATCH_ODDS
+}
+
+model UserPnl {
+  id        String      @id @default(cuid())
+  userId    String
+  eventId   String
+  marketType MarketType
+  profit    Float       @default(0)
+  loss      Float       @default(0)
+  netPnl    Float       @default(0)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@unique([userId, eventId, marketType])
+  @@map("user_pnl")
 }
