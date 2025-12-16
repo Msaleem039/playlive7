@@ -89,7 +89,7 @@ export class AuthController {
       message: 'User roles and creation hierarchy',
       hierarchy: {
         SUPER_ADMIN: {
-          canCreate: ['ADMIN', 'AGENT', 'CLIENT'],
+          canCreate: ['ADMIN', 'AGENT', 'CLIENT', 'SETTLEMENT_ADMIN'],
           description: 'System administrator with full access'
         },
         ADMIN: {
@@ -103,6 +103,10 @@ export class AuthController {
         CLIENT: {
           canCreate: [],
           description: 'End user/client'
+        },
+        SETTLEMENT_ADMIN: {
+          canCreate: [],
+          description: 'Settlement administrator - can only settle markets, no wallet, cannot create users'
         }
       },
       unifiedEndpoint: {

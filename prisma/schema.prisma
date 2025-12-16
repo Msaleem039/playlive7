@@ -162,6 +162,7 @@ enum UserRole {
   ADMIN
   AGENT
   CLIENT
+  SETTLEMENT_ADMIN
 }
 
 enum TransactionType {

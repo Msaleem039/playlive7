@@ -42,3 +42,5 @@ CREATE UNIQUE INDEX "settlements_settlementId_key" ON "settlements"("settlementI
 -- CreateIndex
 CREATE UNIQUE INDEX "user_pnl_userId_eventId_marketType_key" ON "user_pnl"("userId", "eventId", "marketType");
 
+
+

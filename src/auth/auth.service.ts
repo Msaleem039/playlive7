@@ -93,10 +93,11 @@ export class AuthService {
   // Role hierarchy validation
   private canCreateRole(creatorRole: UserRole, targetRole: UserRole): boolean {
     const hierarchy: Record<UserRole, UserRole[]> = {
-      [UserRole.SUPER_ADMIN]: [UserRole.ADMIN, UserRole.AGENT, UserRole.CLIENT],
+      [UserRole.SUPER_ADMIN]: [UserRole.ADMIN, UserRole.AGENT, UserRole.CLIENT, UserRole.SETTLEMENT_ADMIN],
       [UserRole.ADMIN]: [UserRole.AGENT, UserRole.CLIENT],
       [UserRole.AGENT]: [UserRole.CLIENT],
       [UserRole.CLIENT]: [], // Clients cannot create other users
+      [UserRole.SETTLEMENT_ADMIN]: [], // Settlement admins cannot create users
     };
 
     return hierarchy[creatorRole].includes(targetRole);
@@ -126,8 +127,16 @@ export class AuthService {
           console.log('SuperAdmin creation denied:', { creatorRole: creator?.role });
           throw new ForbiddenException(`Only Super Admins can create users with role: ${role}`);
         }
+      } else if (role === UserRole.SETTLEMENT_ADMIN) {
+        // SETTLEMENT_ADMIN can only be created by SUPER_ADMIN
+        if (!creator) {
+          throw new ForbiddenException('Authentication required to create SETTLEMENT_ADMIN users. Use POST /auth/create-user with JWT token.');
+        }
+        if (creator.role !== UserRole.SUPER_ADMIN) {
+          throw new ForbiddenException('Only Super Admins can create SETTLEMENT_ADMIN users');
+        }
       } else {
-        // For non-SUPER_ADMIN roles, authentication is required
+        // For other roles, authentication is required
         if (!creator) {
           throw new ForbiddenException('Authentication required to create users. Use POST /auth/create-user with JWT token.');
         }
@@ -177,6 +186,19 @@ export class AuthService {
           commissionPercentage: commissionPercentage ?? 0,
           balance: resolvedBalance, // Pass balance so wallet is created with correct balance
         });
+      } else if (role === UserRole.SETTLEMENT_ADMIN) {
+        // SETTLEMENT_ADMIN: No wallet, no hierarchy, no commission
+        console.log('Creating SETTLEMENT_ADMIN without wallet or hierarchy...');
+        user = await this.usersService.create({
+          name,
+          username,
+          email: email || null,
+          password: hashedPassword,
+          role: UserRole.SETTLEMENT_ADMIN,
+          parentId: undefined,
+          commissionPercentage: 0,
+          // No balance - wallet will not be created
+        });
       } else {
         // Create user with hierarchy (set parentId to creator's id)
         console.log('Creating user with hierarchy...');
@@ -210,9 +232,12 @@ export class AuthService {
       const accessToken = this.jwtService.sign(payload);
 
       // Fetch the wallet that was created by usersService.create()
-      const wallet = await this.prisma.wallet.findUnique({
-        where: { userId: user.id },
-      });
+      // SETTLEMENT_ADMIN does not have a wallet
+      const wallet = user.role === UserRole.SETTLEMENT_ADMIN 
+        ? null 
+        : await this.prisma.wallet.findUnique({
+            where: { userId: user.id },
+          });
 
       return {
         user: {
@@ -220,7 +245,7 @@ export class AuthService {
           name: user.name,
           username: user.username,
           role: user.role,
-          balance: wallet?.balance ?? resolvedBalance,
+          balance: wallet?.balance ?? (user.role === UserRole.SETTLEMENT_ADMIN ? 0 : resolvedBalance),
           createdAt: user.createdAt,
           updatedAt: user.updatedAt,
         },

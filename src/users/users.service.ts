@@ -75,13 +75,16 @@ export class UsersService {
       },
     });
 
-    await this.prisma.wallet.create({
-      data: {
-        userId: user.id,
-        balance: balance ?? 0,
-        liability: 0,
-      },
-    });
+    // SETTLEMENT_ADMIN should not have a wallet (zero balance, no wallet)
+    if (user.role !== UserRole.SETTLEMENT_ADMIN) {
+      await this.prisma.wallet.create({
+        data: {
+          userId: user.id,
+          balance: balance ?? 0,
+          liability: 0,
+        },
+      });
+    }
 
     return user;
   }
