@@ -28,20 +28,17 @@ export class CricketIdService {
         const responseData = error.response?.data;
         const requestParams = JSON.stringify(params);
         
-        this.logger.error(
-          `Vendor API Error [${status}] for ${url} with params: ${requestParams}`,
-          {
-            url,
-            params,
-            status,
-            statusText: error.response?.statusText,
-            responseData,
-            message: error.message,
-          },
-        );
-        
-        // For 400 errors, provide more helpful error message
+        // For 400 errors (invalid/expired IDs), log as warning instead of error
+        // This is expected behavior when competitionId/eventId is invalid or expired
         if (status === 400) {
+          this.logger.warn(
+            `Vendor API returned 400 for ${url} - Invalid or expired resource (competitionId/eventId may be invalid)`,
+            {
+              params,
+              responseData: responseData || {},
+            },
+          );
+          
           const errorMessage = 
             responseData?.message || 
             responseData?.error || 
@@ -61,6 +58,19 @@ export class CricketIdService {
             status,
           );
         }
+        
+        // For other errors (5xx, network errors, etc.), log as error
+        this.logger.error(
+          `Vendor API Error [${status}] for ${url} with params: ${requestParams}`,
+          {
+            url,
+            params,
+            status,
+            statusText: error.response?.statusText,
+            responseData,
+            message: error.message,
+          },
+        );
         
         const message = responseData?.message || error.message || 'Failed to fetch data from vendor API';
         
