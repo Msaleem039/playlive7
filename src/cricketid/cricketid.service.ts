@@ -22,22 +22,64 @@ export class CricketIdService {
       );
       return data;
     } catch (error) {
-      this.logger.error(`Error fetching ${url}:`, error instanceof Error ? error.message : String(error));
-      
+      // Log detailed error information for debugging
       if (error instanceof AxiosError) {
         const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
-        const message = error.response?.data?.message || error.message || 'Failed to fetch data from vendor API';
+        const responseData = error.response?.data;
+        const requestParams = JSON.stringify(params);
+        
+        this.logger.error(
+          `Vendor API Error [${status}] for ${url} with params: ${requestParams}`,
+          {
+            url,
+            params,
+            status,
+            statusText: error.response?.statusText,
+            responseData,
+            message: error.message,
+          },
+        );
+        
+        // For 400 errors, provide more helpful error message
+        if (status === 400) {
+          const errorMessage = 
+            responseData?.message || 
+            responseData?.error || 
+            `Invalid request parameters. Check if competitionId/eventId is valid and not expired.`;
+          
+          throw new HttpException(
+            {
+              statusCode: status,
+              message: errorMessage,
+              error: 'Vendor API Error',
+              details: {
+                ...responseData,
+                params,
+                suggestion: 'The requested resource may be invalid, expired, or no longer available from the vendor API.',
+              },
+            },
+            status,
+          );
+        }
+        
+        const message = responseData?.message || error.message || 'Failed to fetch data from vendor API';
         
         throw new HttpException(
           {
             statusCode: status,
             message,
             error: 'Vendor API Error',
-            details: error.response?.data || undefined,
+            details: responseData || undefined,
           },
           status,
         );
       }
+      
+      // Non-Axios errors
+      this.logger.error(
+        `Unexpected error fetching ${url} with params: ${JSON.stringify(params)}:`,
+        error instanceof Error ? error.stack : String(error),
+      );
       
       throw new HttpException(
         {
