@@ -12,6 +12,7 @@ import {
   Optional,
   Delete,
 } from '@nestjs/common';
+import { IsNotEmpty, IsString, IsOptional, IsBoolean, IsNumber } from 'class-validator';
 import { SettlementService } from './settlement.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -21,22 +22,52 @@ import { UserRole, MarketType } from '@prisma/client';
 import type { User } from '@prisma/client';
 
 class SettleFancyDto {
+  @IsNotEmpty()
+  @IsString()
   eventId: string;
+
+  @IsNotEmpty()
+  @IsString()
   selectionId: string;
+
+  @IsOptional()
+  @IsNumber()
   decisionRun?: number | null;
+
+  @IsNotEmpty()
+  @IsBoolean()
   isCancel: boolean;
+
+  @IsOptional()
+  @IsString()
   marketId?: string | null;
 }
 
 class SettleMatchOddsDto {
+  @IsNotEmpty()
+  @IsString()
   eventId: string;
+
+  @IsNotEmpty()
+  @IsString()
   marketId: string;
+
+  @IsNotEmpty()
+  @IsString()
   winnerSelectionId: string;
 }
 
 class SettleBookmakerDto {
+  @IsNotEmpty()
+  @IsString()
   eventId: string;
+
+  @IsNotEmpty()
+  @IsString()
   marketId: string;
+
+  @IsNotEmpty()
+  @IsString()
   winnerSelectionId: string;
 }
 
@@ -80,6 +111,13 @@ export class SettlementAdminController {
     @Body() dto: SettleMatchOddsDto,
     @CurrentUser() user: User,
   ) {
+    // Validate DTO is properly parsed
+    if (!dto.eventId || !dto.marketId || !dto.winnerSelectionId) {
+      throw new BadRequestException(
+        `Missing required fields. Received: eventId=${dto?.eventId}, marketId=${dto?.marketId}, winnerSelectionId=${dto?.winnerSelectionId}`,
+      );
+    }
+
     return this.settlementService.settleMatchOddsManual(
       dto.eventId,
       dto.marketId,

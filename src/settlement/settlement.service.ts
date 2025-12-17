@@ -415,71 +415,109 @@ export class SettlementService {
     winnerSelectionId: string,
     adminId: string,
   ) {
-    const settlementId = `CRICKET:MATCHODDS:${eventId}:${marketId}`;
+    try {
+      // Validate required parameters
+      if (!eventId || eventId === 'undefined' || eventId.trim() === '') {
+        throw new BadRequestException('eventId is required and cannot be empty');
+      }
+      if (!marketId || marketId === 'undefined' || marketId.trim() === '') {
+        throw new BadRequestException('marketId is required and cannot be empty');
+      }
+      if (!winnerSelectionId || winnerSelectionId === 'undefined' || winnerSelectionId.trim() === '') {
+        throw new BadRequestException('winnerSelectionId is required and cannot be empty');
+      }
+      if (!adminId || adminId.trim() === '') {
+        throw new BadRequestException('adminId is required');
+      }
 
-    // Check if settlement already exists (prevent double settlement)
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    const existingSettlement = await this.prisma.settlement.findUnique({
-      where: { settlementId },
-    });
+      const settlementId = `CRICKET:MATCHODDS:${eventId}:${marketId}`;
 
-    if (existingSettlement && !existingSettlement.isRollback) {
-      throw new BadRequestException(
-        `Settlement ${settlementId} already exists`,
-      );
-    }
+      // Check if settlement already exists (prevent double settlement)
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
 
-    // Find bets with new format first
-    let bets = await this.prisma.bet.findMany({
-      where: {
-        settlementId,
-        status: BetStatus.PENDING,
-        eventId: eventId,
-        marketId: marketId,
-      },
-    });
+      if (existingSettlement && !existingSettlement.isRollback) {
+        throw new BadRequestException(
+          `Settlement ${settlementId} already exists`,
+        );
+      }
 
-    // If no bets found with new format, try to find bets with old format (legacy: ${match_id}_${selection_id})
-    // For match odds, we need to find all bets for this eventId and marketId regardless of selectionId
-    if (bets.length === 0) {
-      // Try finding bets by eventId and marketId (for match odds, all selections in same market should be settled together)
-      bets = await this.prisma.bet.findMany({
+      // Find bets with new format first
+      let bets = await this.prisma.bet.findMany({
         where: {
-          eventId: eventId,
-          marketId: marketId,
+          settlementId,
           status: BetStatus.PENDING,
-          // Match odds bets typically have gtype containing "match" and "odd"
-          OR: [
-            { gtype: { contains: 'match', mode: 'insensitive' } },
-            { gtype: { contains: 'odd', mode: 'insensitive' } },
-            { marketType: { contains: 'match', mode: 'insensitive' } },
-            { marketType: { contains: 'odd', mode: 'insensitive' } },
-          ],
+          ...(eventId && { eventId: eventId }),
+          ...(marketId && { marketId: marketId }),
         },
       });
 
-      // If we found bets with old format, update their settlementId to the new format
+    // If no bets found with new format, try to find bets with legacy formats
+    // This includes:
+    // 1. Old format: ${match_id}_${selection_id}
+    // 2. New format with undefined: CRICKET:MATCHODDS:undefined:undefined
+    // 3. Bets matching by eventId (marketId might be missing from old bets)
+    if (bets.length === 0) {
+      // Query all pending bets for this eventId first (most reliable)
+      const allEventBets = await this.prisma.bet.findMany({
+        where: {
+          eventId: eventId,
+          status: BetStatus.PENDING,
+        },
+      });
+
+      // Filter to match odds bets - check settlementId patterns
+      bets = allEventBets.filter((bet) => {
+        const sid = bet.settlementId || '';
+        // Match if:
+        // 1. Has "undefined" in settlementId (legacy format issue)
+        // 2. Has "MATCHODDS" or "MATCH_ODDS" in settlementId
+        // 3. Starts with eventId_ (old format)
+        // 4. Or if marketId matches (if both are provided)
+        return (
+          sid.includes('undefined') ||
+          sid.includes('MATCHODDS') ||
+          sid.includes('MATCH_ODDS') ||
+          sid.startsWith(`${eventId}_`) ||
+          (marketId && bet.marketId === marketId) ||
+          (!bet.marketId && marketId) // If bet doesn't have marketId but we're settling with one
+        );
+      });
+
+      this.logger.log(
+        `Found ${bets.length} match odds bets for eventId ${eventId} (out of ${allEventBets.length} total pending bets)`,
+      );
+
+      // If we found bets with old format, update their settlementId and marketId to the new format
       if (bets.length > 0) {
         this.logger.log(
-          `Found ${bets.length} bets with legacy format for eventId ${eventId}, marketId ${marketId}. Updating settlementId to new format.`,
+          `Found ${bets.length} bets with legacy format for eventId ${eventId}, marketId ${marketId}. Updating settlementId and marketId to new format.`,
         );
         
-        // Update settlementId for all found bets
-        await this.prisma.bet.updateMany({
-          where: {
-            id: { in: bets.map((b) => b.id) },
-          },
-          data: {
-            settlementId: settlementId,
-          },
-        });
+        const betIds = bets.map((b) => b.id).filter((id) => id); // Filter out any null/undefined IDs
+        if (betIds.length > 0) {
+          // Update settlementId and marketId for all found bets
+          // This fixes bets that have "undefined" in their settlementId or missing marketId
+          await this.prisma.bet.updateMany({
+            where: {
+              id: { in: betIds },
+            },
+            data: {
+              settlementId: settlementId,
+              ...(marketId && { marketId: marketId }), // Update marketId if provided
+              ...(eventId && { eventId: eventId }), // Ensure eventId is set
+            },
+          });
 
-        // Refresh bets to get updated settlementId
-        bets = await this.prisma.bet.findMany({
-          where: {
-            id: { in: bets.map((b) => b.id) },
-          },
-        });
+          // Refresh bets to get updated settlementId
+          bets = await this.prisma.bet.findMany({
+            where: {
+              id: { in: betIds },
+            },
+          });
+        }
       }
     }
 
@@ -543,6 +581,22 @@ export class SettlementService {
     }
 
     return { success: true, message: 'Match odds bets settled successfully' };
+    } catch (error) {
+      this.logger.error(
+        `Error settling match odds for eventId ${eventId}, marketId ${marketId}: ${(error as Error).message}`,
+        (error as Error).stack,
+      );
+      
+      // Re-throw BadRequestException as-is
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      
+      // Wrap other errors in BadRequestException for proper HTTP response
+      throw new BadRequestException(
+        `Failed to settle match odds: ${(error as Error).message}`,
+      );
+    }
   }
 
   private async applyOutcome(
