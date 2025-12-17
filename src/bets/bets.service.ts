@@ -187,7 +187,42 @@ export class BetsService {
     const normalizedSelectionId = Number(selection_id) || 0;
 
     const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    const settlement_id = `${match_id}_${selection_id}`;
+    
+    // Generate settlementId based on market type to match settlement service format
+    let settlement_id: string;
+    const normalizedGtype = (gtype || '').toLowerCase();
+    const normalizedMarketType = (market_type || '').toLowerCase();
+    
+    if (normalizedGtype.includes('fancy') || normalizedMarketType.includes('fancy')) {
+      // Fancy format: CRICKET:FANCY:${eventId}:${selectionId}
+      settlement_id = eventId 
+        ? `CRICKET:FANCY:${eventId}:${normalizedSelectionId}`
+        : `${match_id}_${selection_id}`; // Fallback if eventId not provided
+    } else if (
+      normalizedGtype.includes('match') && normalizedGtype.includes('odd') ||
+      normalizedGtype === 'match_odds' ||
+      normalizedMarketType.includes('match') && normalizedMarketType.includes('odd') ||
+      normalizedMarketType === 'match_odds'
+    ) {
+      // Match Odds format: CRICKET:MATCHODDS:${eventId}:${marketId}
+      settlement_id = (eventId && marketId)
+        ? `CRICKET:MATCHODDS:${eventId}:${marketId}`
+        : `${match_id}_${selection_id}`; // Fallback if eventId or marketId not provided
+    } else if (
+      normalizedGtype.includes('bookmaker') ||
+      normalizedGtype.includes('book') ||
+      normalizedMarketType.includes('bookmaker') ||
+      normalizedMarketType.includes('book')
+    ) {
+      // Bookmaker format: CRICKET:BOOKMAKER:${eventId}:${marketId}
+      settlement_id = (eventId && marketId)
+        ? `CRICKET:BOOKMAKER:${eventId}:${marketId}`
+        : `${match_id}_${selection_id}`; // Fallback if eventId or marketId not provided
+    } else {
+      // Default/legacy format for unknown types
+      settlement_id = `${match_id}_${selection_id}`;
+    }
+    
     const status = BetStatus.PENDING;
     const to_return = normalizedWinAmount + normalizedLossAmount;
 

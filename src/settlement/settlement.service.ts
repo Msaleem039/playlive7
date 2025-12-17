@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
-import { BetStatus, PrismaClient } from '@prisma/client';
+import { BetStatus, PrismaClient, TransactionType } from '@prisma/client';
 // @ts-ignore - MarketType exists after Prisma client regeneration
 import { MarketType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -146,12 +146,57 @@ export class SettlementService {
       );
     }
 
-    const bets = await this.prisma.bet.findMany({
+    // Find bets with new format first
+    let bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
         status: BetStatus.PENDING,
+        eventId: eventId,
+        selectionId: Number(selectionId),
       },
     });
+
+    // If no bets found with new format, try to find bets with old format (legacy: ${match_id}_${selection_id})
+    // For fancy, the old format was ${match_id}_${selection_id}, so we can match by eventId and selectionId
+    if (bets.length === 0) {
+      // Try finding bets by eventId and selectionId
+      bets = await this.prisma.bet.findMany({
+        where: {
+          eventId: eventId,
+          selectionId: Number(selectionId),
+          status: BetStatus.PENDING,
+          // Fancy bets typically have gtype containing "fancy"
+          OR: [
+            { gtype: { contains: 'fancy', mode: 'insensitive' } },
+            { marketType: { contains: 'fancy', mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      // If we found bets with old format, update their settlementId to the new format
+      if (bets.length > 0) {
+        this.logger.log(
+          `Found ${bets.length} bets with legacy format for eventId ${eventId}, selectionId ${selectionId}. Updating settlementId to new format.`,
+        );
+        
+        // Update settlementId for all found bets
+        await this.prisma.bet.updateMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+          data: {
+            settlementId: settlementId,
+          },
+        });
+
+        // Refresh bets to get updated settlementId
+        bets = await this.prisma.bet.findMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+        });
+      }
+    }
 
     if (bets.length === 0) {
       return { success: true, message: 'No pending bets to settle' };
@@ -248,12 +293,59 @@ export class SettlementService {
       );
     }
 
-    const bets = await this.prisma.bet.findMany({
+    // Find bets with new format first
+    let bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
         status: BetStatus.PENDING,
+        eventId: eventId,
+        marketId: marketId,
       },
     });
+
+    // If no bets found with new format, try to find bets with old format (legacy: ${match_id}_${selection_id})
+    // For bookmaker, we need to find all bets for this eventId and marketId regardless of selectionId
+    if (bets.length === 0) {
+      // Try finding bets by eventId and marketId (for bookmaker, all selections in same market should be settled together)
+      bets = await this.prisma.bet.findMany({
+        where: {
+          eventId: eventId,
+          marketId: marketId,
+          status: BetStatus.PENDING,
+          // Bookmaker bets typically have gtype containing "bookmaker" or "book"
+          OR: [
+            { gtype: { contains: 'bookmaker', mode: 'insensitive' } },
+            { gtype: { contains: 'book', mode: 'insensitive' } },
+            { marketType: { contains: 'bookmaker', mode: 'insensitive' } },
+            { marketType: { contains: 'book', mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      // If we found bets with old format, update their settlementId to the new format
+      if (bets.length > 0) {
+        this.logger.log(
+          `Found ${bets.length} bets with legacy format for eventId ${eventId}, marketId ${marketId}. Updating settlementId to new format.`,
+        );
+        
+        // Update settlementId for all found bets
+        await this.prisma.bet.updateMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+          data: {
+            settlementId: settlementId,
+          },
+        });
+
+        // Refresh bets to get updated settlementId
+        bets = await this.prisma.bet.findMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+        });
+      }
+    }
 
     if (bets.length === 0) {
       return { success: true, message: 'No pending bets to settle' };
@@ -337,12 +429,59 @@ export class SettlementService {
       );
     }
 
-    const bets = await this.prisma.bet.findMany({
+    // Find bets with new format first
+    let bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
         status: BetStatus.PENDING,
+        eventId: eventId,
+        marketId: marketId,
       },
     });
+
+    // If no bets found with new format, try to find bets with old format (legacy: ${match_id}_${selection_id})
+    // For match odds, we need to find all bets for this eventId and marketId regardless of selectionId
+    if (bets.length === 0) {
+      // Try finding bets by eventId and marketId (for match odds, all selections in same market should be settled together)
+      bets = await this.prisma.bet.findMany({
+        where: {
+          eventId: eventId,
+          marketId: marketId,
+          status: BetStatus.PENDING,
+          // Match odds bets typically have gtype containing "match" and "odd"
+          OR: [
+            { gtype: { contains: 'match', mode: 'insensitive' } },
+            { gtype: { contains: 'odd', mode: 'insensitive' } },
+            { marketType: { contains: 'match', mode: 'insensitive' } },
+            { marketType: { contains: 'odd', mode: 'insensitive' } },
+          ],
+        },
+      });
+
+      // If we found bets with old format, update their settlementId to the new format
+      if (bets.length > 0) {
+        this.logger.log(
+          `Found ${bets.length} bets with legacy format for eventId ${eventId}, marketId ${marketId}. Updating settlementId to new format.`,
+        );
+        
+        // Update settlementId for all found bets
+        await this.prisma.bet.updateMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+          data: {
+            settlementId: settlementId,
+          },
+        });
+
+        // Refresh bets to get updated settlementId
+        bets = await this.prisma.bet.findMany({
+          where: {
+            id: { in: bets.map((b) => b.id) },
+          },
+        });
+      }
+    }
 
     if (bets.length === 0) {
       return { success: true, message: 'No pending bets to settle' };
@@ -497,6 +636,107 @@ export class SettlementService {
   }
 
   /**
+   * Delete a bet for a specific user (Admin only)
+   * Refunds the wallet balance and releases liability
+   * Can delete by betId or settlementId
+   */
+  async deleteBet(betIdOrSettlementId: string, adminId: string) {
+    // Try to find bet by ID first, then by settlementId
+    let bet = await this.prisma.bet.findFirst({
+      where: {
+        OR: [
+          { id: betIdOrSettlementId },
+          { settlementId: betIdOrSettlementId },
+        ],
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        },
+      },
+    });
+
+    if (!bet) {
+      throw new BadRequestException(
+        `Bet not found with ID or settlementId: ${betIdOrSettlementId}`,
+      );
+    }
+
+    // Only allow deletion of PENDING bets
+    if (bet.status !== BetStatus.PENDING) {
+      throw new BadRequestException(
+        `Cannot delete bet with status ${bet.status}. Only PENDING bets can be deleted.`,
+      );
+    }
+
+    // Calculate refund amount
+    // For pending bets, lossAmount contains the locked liability
+    const refundAmount = bet.lossAmount || bet.amount || 0;
+
+    if (refundAmount <= 0) {
+      throw new BadRequestException(
+        'Bet has no amount to refund. Cannot delete bet.',
+      );
+    }
+
+    // Get wallet
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId: bet.userId },
+    });
+
+    if (!wallet) {
+      throw new BadRequestException(`Wallet not found for user ${bet.userId}`);
+    }
+
+    // Refund balance and release liability in a transaction
+    await this.prisma.$transaction(async (tx) => {
+      // Refund balance and release liability
+      await tx.wallet.update({
+        where: { userId: bet.userId },
+        data: {
+          balance: { increment: refundAmount },
+          liability: { decrement: refundAmount },
+        },
+      });
+
+      // Create refund transaction record
+      await tx.transaction.create({
+        data: {
+          walletId: wallet.id,
+          amount: refundAmount,
+          type: TransactionType.REFUND,
+          description: `Bet deleted by admin. Bet ID: ${bet.id}, Settlement ID: ${bet.settlementId || 'N/A'}, Bet Name: ${bet.betName || 'N/A'}`,
+        },
+      });
+
+      // Delete the bet
+      await tx.bet.delete({
+        where: { id: bet.id },
+      });
+    });
+
+    this.logger.log(
+      `Bet ${bet.id} (settlementId: ${bet.settlementId || 'N/A'}) deleted by admin ${adminId}. Refunded ${refundAmount} to user ${bet.userId}`,
+    );
+
+    return {
+      success: true,
+      message: 'Bet deleted successfully',
+      data: {
+        betId: bet.id,
+        settlementId: bet.settlementId,
+        userId: bet.userId,
+        userName: bet.user.name,
+        refundAmount,
+      },
+    };
+  }
+
+  /**
    * Get pending bets for a user
    */
   async getUserPendingBets(userId: string) {
@@ -581,6 +821,103 @@ export class SettlementService {
    * Get all pending bets grouped by match and market type
    * Returns matches with pending fancy, match-odds, and bookmaker bets
    */
+  /**
+   * Extract selectionId from settlementId format: "{marketId}_{selectionId}"
+   * Example: "611629359_49050" -> "49050"
+   */
+  private getSelectionIdFromSettlementId(settlementId: string): string | null {
+    if (!settlementId || !settlementId.includes('_')) {
+      return null;
+    }
+    const parts = settlementId.split('_');
+    return parts.length > 1 ? parts[parts.length - 1] : null;
+  }
+
+  /**
+   * Clean team name by removing market type strings
+   */
+  private cleanTeamName(teamName: string | null | undefined): string {
+    if (!teamName) return '';
+    
+    // Remove common market type strings
+    const marketTypes = ['MATCH_ODDS', 'MATCHODDS', 'FANCY', 'BOOKMAKER', 'BOOK'];
+    let cleaned = teamName.trim();
+    
+    for (const marketType of marketTypes) {
+      // Remove exact matches
+      if (cleaned.toUpperCase() === marketType) {
+        return '';
+      }
+      // Remove if it's part of the string (case insensitive)
+      const regex = new RegExp(`\\b${marketType}\\b`, 'gi');
+      cleaned = cleaned.replace(regex, '').trim();
+    }
+    
+    return cleaned;
+  }
+
+  /**
+   * Get proper match title from bet and match data
+   */
+  private getMatchTitle(bet: any): string {
+    // First priority: eventName from match (usually has the correct format)
+    if (bet.match?.eventName) {
+      // Clean eventName if it contains market type strings
+      const cleanedEventName = this.cleanTeamName(bet.match.eventName);
+      if (cleanedEventName && !cleanedEventName.includes('MATCH_ODDS')) {
+        return bet.match.eventName;
+      }
+    }
+
+    // Second priority: Clean homeTeam and awayTeam
+    let homeTeam = this.cleanTeamName(bet.match?.homeTeam);
+    let awayTeam = this.cleanTeamName(bet.match?.awayTeam);
+
+    // If awayTeam is empty or contains market type, try to extract from betName
+    // For match odds, betName often contains the team name
+    if (!awayTeam || awayTeam === '' || awayTeam.toUpperCase().includes('MATCH')) {
+      // If homeTeam is valid, we might be able to infer awayTeam from context
+      // But for now, if we have a valid homeTeam, use it
+      if (homeTeam) {
+        // Try to get awayTeam from marketName if available
+        if (bet.marketName && !bet.marketName.toUpperCase().includes('MATCH_ODDS')) {
+          awayTeam = bet.marketName.trim();
+        } else {
+          // If we can't find awayTeam, just show homeTeam
+          return homeTeam;
+        }
+      }
+    }
+
+    // If both teams are valid (not empty after cleaning)
+    if (homeTeam && awayTeam && homeTeam !== awayTeam) {
+      return `${homeTeam} vs ${awayTeam}`;
+    }
+
+    // If only homeTeam is valid
+    if (homeTeam && !awayTeam) {
+      return homeTeam;
+    }
+
+    // Third priority: Try to extract from betName if it contains "vs"
+    if (bet.betName && bet.betName.includes(' vs ')) {
+      return bet.betName;
+    }
+
+    // Fallback: Use original values or defaults
+    const finalHomeTeam = homeTeam || bet.match?.homeTeam || 'Team A';
+    const finalAwayTeam = awayTeam || bet.match?.awayTeam || 'Team B';
+    
+    // Only show "vs" if both teams are different and not market types
+    if (finalHomeTeam !== finalAwayTeam && 
+        !finalHomeTeam.toUpperCase().includes('MATCH') && 
+        !finalAwayTeam.toUpperCase().includes('MATCH')) {
+      return `${finalHomeTeam} vs ${finalAwayTeam}`;
+    }
+    
+    return finalHomeTeam;
+  }
+
   async getPendingBetsByMatch() {
     // Get all pending bets (don't filter by eventId - we'll handle nulls)
     const pendingBets = await this.prisma.bet.findMany({
@@ -614,6 +951,10 @@ export class SettlementService {
           count: number;
           totalAmount: number;
           bets: any[];
+          runners: Array<{
+            selectionId: number;
+            name: string;
+          }>;
         };
         bookmaker: {
           count: number;
@@ -677,19 +1018,19 @@ export class SettlementService {
 
       // Get or create match entry
       if (!matchMap.has(matchKey)) {
-        const matchTitle =
-          bet.match?.eventName ||
-          `${bet.match?.homeTeam || 'Team A'} vs ${bet.match?.awayTeam || 'Team B'}`;
+        const matchTitle = this.getMatchTitle(bet);
+        const homeTeam = this.cleanTeamName(bet.match?.homeTeam) || bet.match?.homeTeam || '';
+        const awayTeam = this.cleanTeamName(bet.match?.awayTeam) || bet.match?.awayTeam || '';
 
         matchMap.set(matchKey, {
           eventId: bet.eventId,
           matchId: bet.matchId,
           matchTitle,
-          homeTeam: bet.match?.homeTeam || '',
-          awayTeam: bet.match?.awayTeam || '',
+          homeTeam,
+          awayTeam,
           startTime: bet.match?.startTime || new Date(),
           fancy: { count: 0, totalAmount: 0, bets: [] },
-          matchOdds: { count: 0, totalAmount: 0, bets: [] },
+          matchOdds: { count: 0, totalAmount: 0, bets: [], runners: [] },
           bookmaker: { count: 0, totalAmount: 0, bets: [] },
         });
       }
@@ -710,17 +1051,79 @@ export class SettlementService {
         eventId: bet.eventId,
         createdAt: bet.createdAt,
       });
+
+      // For match odds, extract runners from settlementId
+      if (marketType === 'matchOdds') {
+        const selectionIdStr = this.getSelectionIdFromSettlementId(settlementId);
+        if (selectionIdStr) {
+          const selectionId = parseInt(selectionIdStr, 10);
+          if (!isNaN(selectionId)) {
+            // Check if runner already exists
+            const existingRunner = matchData.matchOdds.runners.find(
+              (r) => r.selectionId === selectionId,
+            );
+            if (!existingRunner) {
+              // Add runner with selectionId and name from betName
+              matchData.matchOdds.runners.push({
+                selectionId,
+                name: bet.betName || `Selection ${selectionId}`,
+              });
+            }
+          }
+        }
+      }
     }
 
-    // Convert map to array and sort by startTime
-    const matches = Array.from(matchMap.values()).sort(
+    // Post-process matches to improve titles by collecting team names from bets
+    const processedMatches = Array.from(matchMap.values()).map((match) => {
+      // If match title or awayTeam contains "MATCH_ODDS", try to extract from bets
+      if (match.matchTitle.includes('MATCH_ODDS') || 
+          match.awayTeam.toUpperCase().includes('MATCH_ODDS') ||
+          (!match.awayTeam || match.awayTeam === '')) {
+        
+        // Collect unique team names from match odds bets (excluding "The Draw")
+        const teamNames = new Set<string>();
+        for (const bet of match.matchOdds.bets) {
+          if (bet.betName && 
+              bet.betName !== 'The Draw' && 
+              !bet.betName.toUpperCase().includes('MATCH') &&
+              !bet.betName.toUpperCase().includes('ODDS')) {
+            teamNames.add(bet.betName.trim());
+          }
+        }
+
+        // If we found team names, use them
+        if (teamNames.size >= 2) {
+          const teams = Array.from(teamNames);
+          match.matchTitle = `${teams[0]} vs ${teams[1]}`;
+          match.homeTeam = teams[0];
+          match.awayTeam = teams[1];
+        } else if (teamNames.size === 1 && match.homeTeam && 
+                   !match.homeTeam.toUpperCase().includes('MATCH')) {
+          // If we have one team from bets and homeTeam is valid, use both
+          const teamFromBet = Array.from(teamNames)[0];
+          if (teamFromBet !== match.homeTeam) {
+            match.matchTitle = `${match.homeTeam} vs ${teamFromBet}`;
+            match.awayTeam = teamFromBet;
+          }
+        } else if (match.homeTeam && !match.homeTeam.toUpperCase().includes('MATCH')) {
+          // If only homeTeam is valid, just show it
+          match.matchTitle = match.homeTeam;
+        }
+      }
+
+      return match;
+    });
+
+    // Sort by startTime
+    const sortedMatches = processedMatches.sort(
       (a, b) => a.startTime.getTime() - b.startTime.getTime(),
     );
 
     return {
       success: true,
-      data: matches,
-      totalMatches: matches.length,
+      data: sortedMatches,
+      totalMatches: sortedMatches.length,
       totalPendingBets: pendingBets.length,
     };
   }
@@ -1045,15 +1448,15 @@ export class SettlementService {
       if (!bet.eventId) continue;
 
       if (!matchMap.has(bet.eventId)) {
-        const matchTitle =
-          bet.match?.eventName ||
-          `${bet.match?.homeTeam || 'Team A'} vs ${bet.match?.awayTeam || 'Team B'}`;
+        const matchTitle = this.getMatchTitle(bet);
+        const homeTeam = this.cleanTeamName(bet.match?.homeTeam) || bet.match?.homeTeam || '';
+        const awayTeam = this.cleanTeamName(bet.match?.awayTeam) || bet.match?.awayTeam || '';
 
         matchMap.set(bet.eventId, {
           eventId: bet.eventId,
           matchTitle,
-          homeTeam: bet.match?.homeTeam || '',
-          awayTeam: bet.match?.awayTeam || '',
+          homeTeam,
+          awayTeam,
           startTime: bet.match?.startTime || new Date(),
           bets: [],
           totalAmount: 0,

@@ -10,6 +10,7 @@ import {
   ParseBoolPipe,
   ParseIntPipe,
   Optional,
+  Delete,
 } from '@nestjs/common';
 import { SettlementService } from './settlement.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -232,5 +233,25 @@ export class SettlementAdminController {
   async getSettlementById(@Param('settlementId') settlementId: string) {
     return this.settlementService.getSettlementById(settlementId);
   }
-}
 
+  /**
+   * Delete a bet for a specific user (Admin only)
+   * DELETE /admin/settlement/bet/:betIdOrSettlementId
+   * 
+   * This will:
+   * - Refund the user's wallet balance and release liability
+   * - Create a refund transaction record
+   * - Delete the bet (only if status is PENDING)
+   * 
+   * You can use either:
+   * - Bet ID: DELETE /admin/settlement/bet/cmirm7k73000kv380tjra2djr
+   * - Settlement ID: DELETE /admin/settlement/bet/705374333_690220
+   */
+  @Delete('bet/:betIdOrSettlementId')
+  async deleteBet(
+    @Param('betIdOrSettlementId') betIdOrSettlementId: string,
+    @CurrentUser() user: User,
+  ) {
+    return this.settlementService.deleteBet(betIdOrSettlementId, user.id);
+  }
+}

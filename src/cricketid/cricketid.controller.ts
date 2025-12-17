@@ -101,17 +101,6 @@ export class CricketIdController {
   }
 
   /**
-   * Get bookmaker fancy for a specific event
-   * GET /cricketid/bookmaker-fancy?eventId=34917574
-   * Returns bookmaker fancy data with markets, sections, odds, etc.
-   * @param eventId - Event ID (e.g., "34917574")
-   */
-  @Get('bookmaker-fancy')
-  getBookmakerFancy(@Query('eventId') eventId: string | number) {
-    return this.cricketIdService.getBookmakerFancy(eventId);
-  }
-
-  /**
    * Get fancy bet results for a specific event
    * GET /cricketid/fancy-result?eventId=34917574
    * Returns fancy bet results with odds, runners, etc.
