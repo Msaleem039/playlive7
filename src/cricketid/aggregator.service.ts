@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, HttpException } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import * as https from 'https';
 
@@ -181,8 +181,34 @@ export class AggregatorService {
     try {
       const response = await this.fetch<any[]>(`/cricketid/matches`, { competitionId });
       return Array.isArray(response) ? response : [];
-    } catch (error) {
-      this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
+    } catch (error: any) {
+      // Check if it's a 400 Bad Request (invalid/expired competitionId) - this is expected
+      let statusCode: number | undefined;
+      
+      if (error instanceof HttpException) {
+        statusCode = error.getStatus();
+      } else if (error?.statusCode) {
+        statusCode = error.statusCode;
+      } else if (error?.response?.status) {
+        statusCode = error.response.status;
+      } else if (error?.status) {
+        statusCode = error.status;
+      }
+      
+      if (statusCode === 400) {
+        // Log as debug instead of error - invalid competitionIds are common and expected
+        // This prevents log noise from expired/invalid competition IDs
+        this.logger.debug(
+          `CompetitionId ${competitionId} returned 400 (invalid/expired) - skipping silently`,
+        );
+      } else {
+        // For other errors (5xx, network issues), log as error
+        this.logger.error(
+          `Error fetching matches for competitionId ${competitionId}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      
       return []; // return empty array on error to continue
     }
   }
