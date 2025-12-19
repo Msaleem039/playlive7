@@ -232,3 +232,16 @@ model UserPnl {
   @@unique([userId, eventId, marketType])
   @@map("user_pnl")
 }
+
+model HierarchyPnl {
+  id          String      @id @default(cuid())
+  eventId     String
+  marketType  MarketType
+  fromUserId  String      // client or child
+  toUserId    String      // parent
+  amount      Float       // profit (+) or loss (-)
+  percentage  Float
+  createdAt   DateTime    @default(now())
+
+  @@map("hierarchy_pnl")
+}

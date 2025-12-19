@@ -34,7 +34,7 @@ export class AuthService {
     // Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      console.log('Login failed: Password mismatch');
+      // Don't log password failures to avoid information disclosure
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -105,7 +105,7 @@ export class AuthService {
 
   // Create user with role hierarchy validation
   async createUser(createUserDto: CreateUserDto, creator: any): Promise<AuthResponseDto> {
-    console.log('createUser called with:', { createUserDto, creator });
+    // Removed console.log to avoid exposing user creation details
     
     try {
       const { name, username, email, password, role, balance, initialBalance, commissionPercentage } = createUserDto;
@@ -116,15 +116,12 @@ export class AuthService {
 
       // Check if creator can create this role
       if (role === UserRole.SUPER_ADMIN) {
-        console.log('Handling SuperAdmin creation logic');
         const existingSuperAdmin = await this.usersService.findByRole(UserRole.SUPER_ADMIN);
 
         // Allow creating first super admin without authentication
         if (!existingSuperAdmin && !creator) {
-          console.log('Creating first SuperAdmin without authentication');
           // This is allowed - proceed
         } else if (existingSuperAdmin && (!creator || creator.role !== UserRole.SUPER_ADMIN)) {
-          console.log('SuperAdmin creation denied:', { creatorRole: creator?.role });
           throw new ForbiddenException(`Only Super Admins can create users with role: ${role}`);
         }
       } else if (role === UserRole.SETTLEMENT_ADMIN) {
@@ -141,7 +138,6 @@ export class AuthService {
           throw new ForbiddenException('Authentication required to create users. Use POST /auth/create-user with JWT token.');
         }
         if (!this.canCreateRole(creator.role, role)) {
-          console.log('Role hierarchy check failed:', { creatorRole: creator.role, targetRole: role });
           throw new ForbiddenException(`You don't have permission to create users with role: ${role}`);
         }
       }
@@ -152,10 +148,8 @@ export class AuthService {
       }
       
       // Check if user already exists by username
-      console.log('Checking if user exists with username:', username);
       const existingUserByUsername = await this.usersService.findByUsername(username);
       if (existingUserByUsername) {
-        console.log('User already exists with username:', existingUserByUsername);
         throw new ConflictException('User with this username already exists');
       }
       
@@ -163,19 +157,16 @@ export class AuthService {
       if (email) {
         const existingUserByEmail = await this.usersService.findByEmail(email);
         if (existingUserByEmail) {
-          console.log('User already exists with email:', existingUserByEmail);
           throw new ConflictException('User with this email already exists');
         }
       }
 
       // Hash password
-      console.log('Hashing password...');
       const hashedPassword = await bcrypt.hash(password, 10);
 
       let user;
 
       if (role === UserRole.SUPER_ADMIN) {
-        console.log('Creating SuperAdmin without hierarchy...');
         user = await this.usersService.create({
           name,
           username,
@@ -188,7 +179,6 @@ export class AuthService {
         });
       } else if (role === UserRole.SETTLEMENT_ADMIN) {
         // SETTLEMENT_ADMIN: No wallet, no hierarchy, no commission
-        console.log('Creating SETTLEMENT_ADMIN without wallet or hierarchy...');
         user = await this.usersService.create({
           name,
           username,
@@ -201,16 +191,16 @@ export class AuthService {
         });
       } else {
         // Create user with hierarchy (set parentId to creator's id)
-        console.log('Creating user with hierarchy...');
-        // share (commissionPercentage) is REQUIRED and represents parent's share percentage
-        // For Admin: share = SA% (SuperAdmin's share percentage)
-        // For Agent: share = AD% (Admin's share percentage)
-        // For Client: share is not used (always 100% to Agent)
+        // commissionPercentage = percentage THIS USER keeps from downline PnL
+        // Parent will get the remaining difference automatically during settlement
+        // For Admin: commissionPercentage = % Admin keeps (e.g., 50%)
+        // For Agent: commissionPercentage = % Agent keeps (e.g., 70%)
+        // For Client: commissionPercentage is not used (always 100% to Agent)
         if (commissionPercentage === undefined || commissionPercentage === null) {
-          throw new BadRequestException('share (commissionPercentage) is required when creating Admin or Agent');
+          throw new BadRequestException('commissionPercentage is required when creating Admin or Agent');
         }
         if (commissionPercentage < 1 || commissionPercentage > 100) {
-          throw new BadRequestException('share (commissionPercentage) must be between 1 and 99');
+          throw new BadRequestException('commissionPercentage must be between 1 and 100');
         }
         const share = commissionPercentage;
         user = await this.usersService.create({
@@ -220,12 +210,12 @@ export class AuthService {
           password: hashedPassword,
           role,
           parentId: creator.id,
-          commissionPercentage: share, // Store parent's share % (SA% or AD%) in DB field
+          commissionPercentage: commissionPercentage, // Store what THIS USER keeps from downline PnL
           balance: resolvedBalance, // Pass balance so wallet is created with correct balance
         });
       }
 
-      console.log('User created successfully:', user);
+      // User created successfully - removed console.log to avoid exposing user details
 
       // Generate JWT token with username included
       const payload = { sub: user.id, username: user.username, role: user.role };

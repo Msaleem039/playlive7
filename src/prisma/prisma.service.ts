@@ -11,18 +11,82 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   private migrationsRun = false;
   private isConnected = false;
 
+  /**
+   * Normalize connection string to fix common Neon connection issues
+   * Static method so it can be called before super() in constructor
+   */
+  private static normalizeConnectionString(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      
+      // Remove channel_binding=require as it can cause connection issues
+      urlObj.searchParams.delete('channel_binding');
+      
+      // Ensure sslmode is set (required for Neon)
+      if (!urlObj.searchParams.has('sslmode')) {
+        urlObj.searchParams.set('sslmode', 'require');
+      }
+      
+      // Add connection timeout
+      if (!urlObj.searchParams.has('connect_timeout')) {
+        urlObj.searchParams.set('connect_timeout', '10');
+      }
+      
+      // Configure connection pool settings for better concurrency
+      // connection_limit: Maximum number of connections in the pool (default: 5)
+      // pool_timeout: Maximum time to wait for a connection (default: 10 seconds)
+      // For Neon pooler, increase these values to handle concurrent operations
+      if (!urlObj.searchParams.has('connection_limit')) {
+        urlObj.searchParams.set('connection_limit', '20'); // Increased from default 5
+      }
+      if (!urlObj.searchParams.has('pool_timeout')) {
+        urlObj.searchParams.set('pool_timeout', '20'); // Increased from default 10
+      }
+      
+      return urlObj.toString();
+    } catch (error) {
+      // If URL parsing fails, return original
+      return url;
+    }
+  }
+
   constructor() {
     // PrismaClient requires DATABASE_URL at instantiation
     // If not set in development, use a placeholder that won't actually connect
     const originalDbUrl = process.env.DATABASE_URL;
+    let dbUrl = originalDbUrl;
+    
     if (!originalDbUrl) {
       if (process.env.NODE_ENV === 'production') {
         throw new Error('DATABASE_URL is required in production. Please set it in your .env file.');
       }
       // Use a placeholder URL for development (PrismaClient needs it, but we won't connect)
-      process.env.DATABASE_URL = 'postgresql://placeholder:placeholder@placeholder:5432/placeholder';
+      dbUrl = 'postgresql://placeholder:placeholder@placeholder:5432/placeholder';
+      process.env.DATABASE_URL = dbUrl;
+    } else {
+      // Normalize connection string early to apply pool settings before PrismaClient instantiation
+      // This ensures connection pool settings are applied from the start
+      dbUrl = PrismaService.normalizeConnectionString(originalDbUrl);
+      if (dbUrl !== originalDbUrl) {
+        process.env.DATABASE_URL = dbUrl;
+      }
     }
-    super();
+    
+    // Configure PrismaClient with connection pool settings
+    // Increase connection limit and timeout to handle concurrent operations
+    super({
+      datasources: {
+        db: {
+          url: dbUrl,
+        },
+      },
+      // Connection pool configuration
+      // Default is 5 connections, increase to handle concurrent queries
+      // For Neon pooler, recommended is 10-20 connections
+      log: process.env.NODE_ENV === 'development' 
+        ? ['error', 'warn'] 
+        : ['error'],
+    });
     
     // Log warning after super() call
     if (!originalDbUrl && process.env.NODE_ENV !== 'production') {
@@ -63,19 +127,78 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       this.isConnected = true;
       this.logger.log('✅ Database connection established');
     } catch (error) {
-      this.logger.error('Failed to connect to database after retries');
-      this.logger.error(`Error: ${error.message}`);
-      this.logger.error(`Error Code: ${error.code || 'N/A'}`);
+      // If pooler connection fails with P1001, try direct connection as fallback
+      const isConnectionError = error.code === 'P1001' || error.message?.includes("Can't reach database server");
+      const directUrl = process.env.DIRECT_URL;
       
-      // Provide helpful troubleshooting information
-      this.logTroubleshootingTips(error);
-      
-      if (process.env.NODE_ENV === 'production') {
-        throw error;
+      if (isConnectionError && directUrl && normalizedUrl.includes('pooler')) {
+        this.logger.warn('Pooler connection failed, attempting fallback to direct connection...');
+        
+        // Store original URL before switching
+        const originalDbUrl = process.env.DATABASE_URL;
+        
+        try {
+          // Normalize direct URL
+          const normalizedDirectUrl = this.normalizeConnectionString(directUrl);
+          
+          // Disconnect current connection attempt
+          await this.$disconnect().catch(() => {});
+          
+          // Switch to direct connection
+          process.env.DATABASE_URL = normalizedDirectUrl;
+          
+          const directHost = normalizedDirectUrl.split('@')[1]?.split('/')[0] || 'database';
+          this.logger.log(`Retrying with direct connection: ${directHost}`);
+          
+          // Try connecting with direct URL
+          await this.connectWithRetry(3, 1000);
+          this.isConnected = true;
+          this.logger.log('✅ Database connection established via direct connection (fallback)');
+          this.logger.warn('⚠️  Using direct connection instead of pooler. Consider checking pooler availability.');
+          
+          // Keep using direct URL for this session
+          // Note: This only affects this instance, not the PrismaClient's initial config
+        } catch (directError) {
+          // Restore original URL
+          process.env.DATABASE_URL = originalDbUrl;
+          
+          this.logger.error('Direct connection also failed');
+          this.logger.error(`Direct connection error: ${directError.message}`);
+          this.logger.error(`Error Code: ${directError.code || 'N/A'}`);
+          
+          // Provide helpful troubleshooting information
+          this.logTroubleshootingTips(error);
+          
+          if (process.env.NODE_ENV === 'production') {
+            throw directError;
+          } else {
+            this.logger.warn('Application will continue without database connection (development mode)');
+            this.logger.warn('Fix the connection issue and restart the application');
+            return;
+          }
+        }
       } else {
-        this.logger.warn('Application will continue without database connection (development mode)');
-        this.logger.warn('Fix the connection issue and restart the application');
-        return;
+        this.logger.error('Failed to connect to database after retries');
+        this.logger.error(`Error: ${error.message}`);
+        this.logger.error(`Error Code: ${error.code || 'N/A'}`);
+        
+        // If pooler failed but DIRECT_URL is not set, suggest it
+        if (isConnectionError && normalizedUrl.includes('pooler') && !directUrl) {
+          this.logger.error('\n💡 Tip: Pooler connection failed. Set DIRECT_URL in your .env file to enable automatic fallback.');
+          this.logger.error('   DIRECT_URL should use the direct endpoint (without "-pooler" in hostname)');
+          this.logger.error('   Get it from Neon Console: https://console.neon.tech -> Connection Details');
+        }
+        
+        // Provide helpful troubleshooting information
+        this.logTroubleshootingTips(error);
+        
+        if (process.env.NODE_ENV === 'production') {
+          throw error;
+        } else {
+          this.logger.warn('Application will continue without database connection (development mode)');
+          this.logger.warn('Fix the connection issue and restart the application');
+          return;
+        }
       }
     }
     
@@ -95,30 +218,19 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 
   /**
    * Normalize connection string to fix common Neon connection issues
+   * Instance method that calls the static method
    */
   private normalizeConnectionString(url: string): string {
-    try {
-      const urlObj = new URL(url);
-      
-      // Remove channel_binding=require as it can cause connection issues
-      urlObj.searchParams.delete('channel_binding');
-      
-      // Ensure sslmode is set (required for Neon)
-      if (!urlObj.searchParams.has('sslmode')) {
-        urlObj.searchParams.set('sslmode', 'require');
+    const normalized = PrismaService.normalizeConnectionString(url);
+    if (normalized !== url) {
+      // Only log if we're in a context where logger is available (after super())
+      try {
+        this.logger?.warn('Connection string normalized (applied pool settings)');
+      } catch {
+        // Logger not available yet, that's okay
       }
-      
-      // Add connection timeout
-      if (!urlObj.searchParams.has('connect_timeout')) {
-        urlObj.searchParams.set('connect_timeout', '10');
-      }
-      
-      return urlObj.toString();
-    } catch (error) {
-      // If URL parsing fails, return original
-      this.logger.warn('Failed to parse connection string, using as-is');
-      return url;
     }
+    return normalized;
   }
 
   /**

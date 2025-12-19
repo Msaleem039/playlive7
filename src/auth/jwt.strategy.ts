@@ -48,9 +48,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     
     try {
       const user = await this.usersService.findById(payload.sub);
-      console.log('User found:', user);
       if (!user) {
-        console.log('User not found for ID:', payload.sub);
+        // Only log in debug mode to avoid exposing user IDs in production
+        if (process.env.NODE_ENV === 'development') {
+          console.debug('User not found for ID:', payload.sub);
+        }
         throw new UnauthorizedException('Invalid token');
       }
       return user;

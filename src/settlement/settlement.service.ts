@@ -6,6 +6,7 @@ import { MarketType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CricketIdService } from '../cricketid/cricketid.service';
 import { PnlService } from './pnl.service';
+import { HierarchyPnlService } from './hierarchy-pnl.service';
 
 @Injectable()
 export class SettlementService {
@@ -15,6 +16,7 @@ export class SettlementService {
     private readonly prisma: PrismaService,
     private readonly cricketIdService: CricketIdService,
     private readonly pnlService: PnlService,
+    private readonly hierarchyPnlService: HierarchyPnlService,
   ) {}
 
   async settleFancyAuto(eventId: string) {
@@ -115,6 +117,25 @@ export class SettlementService {
             userId,
             eventId,
           );
+          // Distribute hierarchical P/L for FANCY market
+          // @ts-ignore - userPnl property exists after Prisma client regeneration
+          const userPnl = await this.prisma.userPnl.findUnique({
+            where: {
+              userId_eventId_marketType: {
+                userId,
+                eventId,
+                marketType: MarketType.FANCY,
+              },
+            },
+          });
+          if (userPnl) {
+            await this.hierarchyPnlService.distributePnL(
+              userId,
+              eventId,
+              MarketType.FANCY,
+              userPnl.netPnl,
+            );
+          }
       } catch (error) {
           this.logger.warn(
             `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
@@ -263,6 +284,25 @@ export class SettlementService {
           userId,
           eventId,
         );
+        // Distribute hierarchical P/L for FANCY market
+        // @ts-ignore - userPnl property exists after Prisma client regeneration
+        const userPnl = await this.prisma.userPnl.findUnique({
+          where: {
+            userId_eventId_marketType: {
+              userId,
+              eventId,
+              marketType: MarketType.FANCY,
+            },
+          },
+        });
+        if (userPnl) {
+          await this.hierarchyPnlService.distributePnL(
+            userId,
+            eventId,
+            MarketType.FANCY,
+            userPnl.netPnl,
+          );
+        }
       } catch (error) {
         this.logger.warn(
           `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
@@ -399,6 +439,25 @@ export class SettlementService {
           userId,
           eventId,
         );
+        // Distribute hierarchical P/L for BOOKMAKER market
+        // @ts-ignore - userPnl property exists after Prisma client regeneration
+        const userPnl = await this.prisma.userPnl.findUnique({
+          where: {
+            userId_eventId_marketType: {
+              userId,
+              eventId,
+              marketType: MarketType.BOOKMAKER,
+            },
+          },
+        });
+        if (userPnl) {
+          await this.hierarchyPnlService.distributePnL(
+            userId,
+            eventId,
+            MarketType.BOOKMAKER,
+            userPnl.netPnl,
+          );
+        }
         } catch (error) {
           this.logger.warn(
           `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
@@ -573,6 +632,25 @@ export class SettlementService {
           userId,
           eventId,
         );
+        // Distribute hierarchical P/L for MATCH_ODDS market
+        // @ts-ignore - userPnl property exists after Prisma client regeneration
+        const userPnl = await this.prisma.userPnl.findUnique({
+          where: {
+            userId_eventId_marketType: {
+              userId,
+              eventId,
+              marketType: MarketType.MATCH_ODDS,
+            },
+          },
+        });
+        if (userPnl) {
+          await this.hierarchyPnlService.distributePnL(
+            userId,
+            eventId,
+            MarketType.MATCH_ODDS,
+            userPnl.netPnl,
+          );
+        }
       } catch (error) {
         this.logger.warn(
           `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
@@ -685,6 +763,41 @@ export class SettlementService {
             },
           });
     });
+
+    // Delete hierarchical PnL ledger records (NO WALLET REVERSAL - wallet is never touched in PnL distribution)
+    const userIds = new Set(bets.map((b) => b.userId));
+    for (const userId of userIds) {
+      try {
+        // Delete hierarchical PnL ledger records
+        // Wallet balance is never updated by hierarchy PnL, so no reversal needed
+        // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+        await this.prisma.hierarchyPnl.deleteMany({
+          where: {
+            eventId: settlement.eventId,
+            marketType: settlement.marketType,
+            fromUserId: userId, // sourceUserId (original client)
+          },
+        });
+      } catch (error) {
+        this.logger.warn(
+          `Failed to delete hierarchical PnL records for user ${userId} during rollback: ${(error as Error).message}`,
+        );
+      }
+    }
+
+    // Recalculate P/L for all affected users after rollback
+    for (const userId of userIds) {
+      try {
+        await this.pnlService.recalculateUserPnlAfterSettlement(
+          userId,
+          settlement.eventId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
+        );
+      }
+    }
 
     return { success: true, message: 'Settlement rolled back successfully' };
   }

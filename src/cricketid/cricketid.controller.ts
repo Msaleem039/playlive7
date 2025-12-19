@@ -73,7 +73,10 @@ export class CricketIdController {
     try {
       return await this.cricketIdService.getMarketList(eventId);
     } catch (error) {
-      this.logger.error(`Error getting market list for eventId ${eventId}:`, error);
+      // Only log non-400 errors (400 errors are expected for invalid/expired eventIds)
+      if (error instanceof HttpException && error.getStatus() !== 400) {
+        this.logger.error(`Error getting market list for eventId ${eventId}:`, error);
+      }
       throw error;
     }
   }
@@ -109,6 +112,36 @@ export class CricketIdController {
   @Get('fancy-result')
   getFancyResult(@Query('eventId') eventId: string | number) {
     return this.cricketIdService.getFancyResult(eventId);
+  }
+
+  /**
+   * Get bookmaker fancy for a specific event
+   * GET /cricketid/bookmaker-fancy?eventId=34917574
+   * Returns bookmaker fancy data with markets, sections, odds, etc.
+   * @param eventId - Event ID (e.g., "34917574")
+   */
+  @Get('bookmaker-fancy')
+  async getBookmakerFancy(@Query('eventId') eventId: string | number) {
+    if (!eventId) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'eventId query parameter is required',
+          error: 'Bad Request',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    try {
+      return await this.cricketIdService.getBookmakerFancy(eventId);
+    } catch (error) {
+      // Only log non-400 errors (400 errors are expected for invalid/expired eventIds)
+      if (error instanceof HttpException && error.getStatus() !== 400) {
+        this.logger.error(`Error getting bookmaker fancy for eventId ${eventId}:`, error);
+      }
+      throw error;
+    }
   }
 
   /**

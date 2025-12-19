@@ -35,14 +35,17 @@ export class BetsService {
       where: { userId },
     });
 
+    // Return wallet balance as available credit (not profit/loss)
+    // Balance represents usable credit from top-ups, not earnings
     return {
       fs_id: userId,
       status: 1,
-      sports_exp: wallet?.balance ?? 0,
+      sports_exp: wallet?.balance ?? 0, // Available credit for betting
     };
   }
 
   async selectWalletTotalAmountBetPlcae(userId: string) {
+    // Get wallet balance (credit only, not profit/loss)
     const wallet = await this.prisma.wallet.upsert({
       where: { userId },
       update: {},
@@ -52,7 +55,7 @@ export class BetsService {
       },
     });
 
-    return wallet.balance;
+    return wallet.balance; // Returns available credit
   }
 
   async selectExposureBalance(
@@ -187,42 +190,7 @@ export class BetsService {
     const normalizedSelectionId = Number(selection_id) || 0;
 
     const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    
-    // Generate settlementId based on market type to match settlement service format
-    let settlement_id: string;
-    const normalizedGtype = (gtype || '').toLowerCase();
-    const normalizedMarketType = (market_type || '').toLowerCase();
-    
-    if (normalizedGtype.includes('fancy') || normalizedMarketType.includes('fancy')) {
-      // Fancy format: CRICKET:FANCY:${eventId}:${selectionId}
-      settlement_id = eventId 
-        ? `CRICKET:FANCY:${eventId}:${normalizedSelectionId}`
-        : `${match_id}_${selection_id}`; // Fallback if eventId not provided
-    } else if (
-      normalizedGtype.includes('match') && normalizedGtype.includes('odd') ||
-      normalizedGtype === 'match_odds' ||
-      normalizedMarketType.includes('match') && normalizedMarketType.includes('odd') ||
-      normalizedMarketType === 'match_odds'
-    ) {
-      // Match Odds format: CRICKET:MATCHODDS:${eventId}:${marketId}
-      settlement_id = (eventId && marketId)
-        ? `CRICKET:MATCHODDS:${eventId}:${marketId}`
-        : `${match_id}_${selection_id}`; // Fallback if eventId or marketId not provided
-    } else if (
-      normalizedGtype.includes('bookmaker') ||
-      normalizedGtype.includes('book') ||
-      normalizedMarketType.includes('bookmaker') ||
-      normalizedMarketType.includes('book')
-    ) {
-      // Bookmaker format: CRICKET:BOOKMAKER:${eventId}:${marketId}
-      settlement_id = (eventId && marketId)
-        ? `CRICKET:BOOKMAKER:${eventId}:${marketId}`
-        : `${match_id}_${selection_id}`; // Fallback if eventId or marketId not provided
-    } else {
-      // Default/legacy format for unknown types
-      settlement_id = `${match_id}_${selection_id}`;
-    }
-    
+    const settlement_id = `${match_id}_${selection_id}`;
     const status = BetStatus.PENDING;
     const to_return = normalizedWinAmount + normalizedLossAmount;
 
@@ -239,6 +207,9 @@ export class BetsService {
     }
 
     // 2. WALLET & EXPOSURE
+    // IMPORTANT: Wallet balance = CREDIT ONLY (not profit/loss)
+    // Profit/Loss is calculated and distributed ONLY during settlement
+    // Commission is earned ONLY when bets are settled, not during bet placement
     const wallet_balance = await this.selectWalletTotalAmountBetPlcae(userId);
     const current_exposure = await this.selectExposureBalance(
       userId,
@@ -357,6 +328,9 @@ export class BetsService {
         });
 
         // Step 2: Deduct balance and lock liability (if required)
+        // CREDIT FLOW ONLY: This is pure accounting - no profit/loss calculation
+        // Balance = usable credit, Liability = locked exposure
+        // Profit/Loss distribution happens ONLY during settlement (via HierarchyPnlService)
         if (required_amount > 0) {
           // Ensure wallet exists (upsert to handle edge cases)
           const currentWallet = await tx.wallet.upsert({
@@ -383,6 +357,8 @@ export class BetsService {
             );
           }
 
+          // Lock liability: move credit from balance to liability
+          // This is NOT profit/loss - it's just locking credit for potential exposure
           await tx.wallet.update({
             where: { userId },
             data: {

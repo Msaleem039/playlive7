@@ -28,16 +28,17 @@ export class CricketIdService {
         const responseData = error.response?.data;
         const requestParams = JSON.stringify(params);
         
-        // For 400 errors (invalid/expired IDs), log as warning instead of error
+        // For 400 errors (invalid/expired IDs), log as debug instead of warning
         // This is expected behavior when competitionId/eventId is invalid or expired
+        // Only log in debug mode to reduce log noise
         if (status === 400) {
-          this.logger.warn(
-            `Vendor API returned 400 for ${url} - Invalid or expired resource (competitionId/eventId may be invalid)`,
-            {
-              params,
-              responseData: responseData || {},
-            },
-          );
+          // Only log in debug mode - these are expected errors
+          if (process.env.NODE_ENV === 'development') {
+            this.logger.debug(
+              `Vendor API returned 400 for ${url} - Invalid or expired resource`,
+              { params, eventId: params.eventId || params.competitionId },
+            );
+          }
           
           const errorMessage = 
             responseData?.message || 

@@ -6,6 +6,7 @@ import {
   Param,
   Post,
   UseGuards,
+  Logger,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
@@ -19,6 +20,8 @@ import { UserRole } from '@prisma/client';
 @Controller('transfer')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class BalanceTransferController {
+  private readonly logger = new Logger(BalanceTransferController.name);
+  
   constructor(private readonly transferService: TransferService) {}
 
   // 🔼 Top-up endpoint
@@ -28,7 +31,12 @@ export class BalanceTransferController {
     @Body() dto: BalanceChangeDto,
     @CurrentUser() currentUser: User,
   ) {
-    return this.transferService.topUpBalance(currentUser, targetUserId, dto);
+    try {
+      return await this.transferService.topUpBalance(currentUser, targetUserId, dto);
+    } catch (error) {
+      this.logger.error(`Error in topUpBalance endpoint: ${error instanceof Error ? error.message : String(error)}`);
+      throw error; // Re-throw to let NestJS handle the response
+    }
   }
 
   // 🔽 Top-down (withdraw) endpoint

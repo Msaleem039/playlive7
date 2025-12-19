@@ -2,13 +2,17 @@ import {
   Injectable,
   ForbiddenException,
   BadRequestException,
+  Logger,
+  InternalServerErrorException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { UserRole, type User } from '@prisma/client';
+import { UserRole, TransferLogType, type User } from '@prisma/client';
 import { BalanceChangeDto } from './dto/balance-change.dto';
 
 @Injectable()
 export class TransferService {
+  private readonly logger = new Logger(TransferService.name);
+  
   constructor(private prisma: PrismaService) {}
 
   // =======================================================
@@ -19,131 +23,127 @@ export class TransferService {
     targetUserId: string,
     dto: BalanceChangeDto,
   ) {
-    const { balance, remarks } = dto;
+    try {
+      const { balance, remarks } = dto;
 
-    const [fromUser, toUser] = await Promise.all([
-      this.prisma.user.findUnique({ where: { id: currentUser.id } }),
-      this.prisma.user.findUnique({ where: { id: targetUserId } }),
-    ]);
-    if (!fromUser || !toUser) throw new BadRequestException('User not found');
+      this.logger.log(`Top-up request: from ${currentUser.id} to ${targetUserId}, amount: ${balance}`);
 
-    // ✅ Validate who can top-up whom
-    this.validateRoleHierarchy(fromUser, toUser, 'TOPUP');
+      const [fromUser, toUser] = await Promise.all([
+        this.prisma.user.findUnique({ where: { id: currentUser.id } }),
+        this.prisma.user.findUnique({ where: { id: targetUserId } }),
+      ]);
+      if (!fromUser || !toUser) throw new BadRequestException('User not found');
 
-    // ✅ Super Admin self top-up doesn't deduct from anyone
-    const shouldDeduct = !(
-      fromUser.role === UserRole.SUPER_ADMIN && fromUser.id === toUser.id
-    );
+      // ✅ Validate who can top-up whom
+      this.validateRoleHierarchy(fromUser, toUser, 'TOPUP');
 
-    return this.prisma.$transaction(async (tx) => {
-      let updatedFromWallet:
-        | {
-            id: string;
-            balance: number;
+      // ✅ Super Admin self top-up doesn't deduct from anyone
+      const shouldDeduct = !(
+        fromUser.role === UserRole.SUPER_ADMIN && fromUser.id === toUser.id
+      );
+
+      // Configure transaction with timeout to prevent transaction invalidation
+      // Note: Prisma automatically uses DIRECT_URL for transactions when configured in schema
+      // Neon pooler doesn't support transactions well, so Prisma switches to direct connection
+      return await this.prisma.$transaction(
+        async (tx) => {
+          let updatedFromWallet:
+            | {
+                id: string;
+                balance: number;
+              }
+            | null = null;
+
+          // ✅ Ensure wallets exist
+          const fromWallet =
+            shouldDeduct
+              ? await tx.wallet.upsert({
+                  where: { userId: fromUser.id },
+                  update: {},
+                  create: { userId: fromUser.id, balance: 0, liability: 0 },
+                })
+              : null;
+
+          const toWalletInitial = await tx.wallet.upsert({
+            where: { userId: toUser.id },
+            update: {},
+            create: { userId: toUser.id, balance: 0, liability: 0 },
+          });
+
+          // ✅ TOP-UP LOGIC - Simple accounting operation only
+          // Transfer = cash movement, NO commission/share/profit calculation
+          // Commission is earned ONLY when bets are settled, not during transfers
+          const TOPUP_AMOUNT = balance;
+          
+          if (shouldDeduct) {
+            // Check initiator balance (must have enough to cover the full top-up amount)
+            if (fromWallet && fromWallet.balance < TOPUP_AMOUNT) {
+              throw new BadRequestException('Insufficient balance');
+            }
+
+            // Deduct full amount from parent (simple accounting)
+            if (fromWallet) {
+              updatedFromWallet = await tx.wallet.update({
+                where: { id: fromWallet.id },
+                data: { 
+                  balance: { decrement: TOPUP_AMOUNT }
+                },
+                select: { id: true, balance: true },
+              });
+            }
           }
-        | null = null;
 
-      // ✅ Ensure wallets exist
-      const fromWallet =
-        shouldDeduct
-          ? await tx.wallet.upsert({
-              where: { userId: fromUser.id },
-              update: {},
-              create: { userId: fromUser.id, balance: 0, liability: 0 },
-            })
-          : null;
-
-      const toWalletInitial = await tx.wallet.upsert({
-        where: { userId: toUser.id },
-        update: {},
-        create: { userId: toUser.id, balance: 0, liability: 0 },
-      });
-
-      // ✅ TOP-UP LOGIC WITH SHARE PERCENTAGES
-      const TOPUP_AMOUNT = balance; // Full amount target receives (100%)
-      
-      // Get share percentage from target user (stored in commissionPercentage field)
-      // share = parent's share percentage (SA% when SuperAdmin→Admin, AD% when Admin→Agent)
-      // For CLIENT, commissionPercentage is typically 100 (agent gets 100% share)
-      const share = toUser.commissionPercentage;
-      
-      // Validate share percentage exists and is valid
-      if (shouldDeduct) {
-        if (share === null || share === undefined || isNaN(share)) {
-          throw new BadRequestException(
-            `Target user (${toUser.role}) must have a valid share percentage (commissionPercentage) set. Current value: ${share}`
-          );
-        }
-        if (share < 1 || share > 100) {
-          throw new BadRequestException(
-            `Invalid share percentage (${share}). Share must be between 1 and 100 for ${toUser.role} users.`
-          );
-        }
-      }
-      
-      let parentShareAmount = 0;
-      
-      if (shouldDeduct && share) {
-        // Calculate parent's share and liability
-        // share = SA% (when SuperAdmin tops up Admin) or AD% (when Admin tops up Agent)
-        parentShareAmount = TOPUP_AMOUNT * (share / 100); // Parent's share/profit
-        const parentLiability = TOPUP_AMOUNT * (1 - share / 100); // Parent's exposure
-        
-        // Check initiator balance (must have enough to cover the full top-up amount)
-        if (fromWallet && fromWallet.balance < TOPUP_AMOUNT) {
-          throw new BadRequestException('Insufficient balance');
-        }
-
-        // Update parent balance:
-        // Net change = -TOPUP_AMOUNT + parentShareAmount = -(1 - share/100) * TOPUP_AMOUNT
-        // We need to calculate the net change first, then apply it
-        const netBalanceChange = -TOPUP_AMOUNT + parentShareAmount;
-        
-        if (fromWallet) {
-          updatedFromWallet = await tx.wallet.update({
-            where: { id: fromWallet.id },
-            data: { 
-              balance: netBalanceChange >= 0 
-                ? { increment: netBalanceChange }
-                : { decrement: Math.abs(netBalanceChange) }
-            },
+          // ✅ Add full amount to target (100% playable credit)
+          const updatedToWallet = await tx.wallet.update({
+            where: { id: toWalletInitial.id },
+            data: { balance: { increment: TOPUP_AMOUNT } },
             select: { id: true, balance: true },
           });
+
+          // Log the transfer - do this BEFORE returning to ensure it completes
+          await tx.transferLog.create({
+            data: {
+              fromUserId: fromUser.id,
+              toUserId: toUser.id,
+              amount: TOPUP_AMOUNT,
+              remarks,
+              type: TransferLogType.TOPUP,
+            },
+          });
+
+          return {
+            message: 'Top-up successful',
+            fromUser: {
+              id: fromUser.id,
+              name: fromUser.name,
+              balance: updatedFromWallet?.balance ?? null,
+            },
+            toUser: {
+              id: toUser.id,
+              name: toUser.name,
+              balance: updatedToWallet.balance,
+            },
+          };
+        },
+        {
+          maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)
+          timeout: 20000, // Maximum time the transaction can run (20 seconds)
         }
+      );
+    } catch (error) {
+      this.logger.error(`Error in topUpBalance: ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.error(`Stack trace: ${error instanceof Error ? error.stack : 'No stack trace'}`);
+      
+      // Re-throw known exceptions
+      if (error instanceof BadRequestException || error instanceof ForbiddenException) {
+        throw error;
       }
-
-      // ✅ Add full amount to target (100% playable credit)
-      const updatedToWallet = await tx.wallet.update({
-        where: { id: toWalletInitial.id },
-        data: { balance: { increment: TOPUP_AMOUNT } },
-        select: { id: true, balance: true },
-      });
-
-      // Log the transfer
-      await tx.transferLog.create({
-        data: {
-          fromUserId: fromUser.id,
-          toUserId: toUser.id,
-          amount: TOPUP_AMOUNT,
-          remarks,
-          type: 'TOPUP',
-        },
-      });
-
-      return {
-        message: 'Top-up successful',
-        fromUser: {
-          id: fromUser.id,
-          name: fromUser.name,
-          balance: updatedFromWallet?.balance ?? null,
-        },
-        toUser: {
-          id: toUser.id,
-          name: toUser.name,
-          balance: updatedToWallet.balance,
-        },
-      };
-    });
+      
+      // Wrap unknown errors
+      throw new InternalServerErrorException(
+        `Failed to process top-up: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   // =======================================================
@@ -166,65 +166,78 @@ export class TransferService {
     // ✅ Role validation
     this.validateRoleHierarchy(initiator, subordinate, 'TOPDOWN');
 
-    return this.prisma.$transaction(async (tx) => {
-      // Ensure wallets
-      const subordinateWallet = await tx.wallet.upsert({
-        where: { userId: subordinate.id },
-        update: {},
-        create: { userId: subordinate.id, balance: 0, liability: 0 },
-      });
+    return this.prisma.$transaction(
+      async (tx) => {
+        // Ensure wallets
+        const subordinateWallet = await tx.wallet.upsert({
+          where: { userId: subordinate.id },
+          update: {},
+          create: { userId: subordinate.id, balance: 0, liability: 0 },
+        });
 
-      const initiatorWallet = await tx.wallet.upsert({
-        where: { userId: initiator.id },
-        update: {},
-        create: { userId: initiator.id, balance: 0, liability: 0 },
-      });
+        const initiatorWallet = await tx.wallet.upsert({
+          where: { userId: initiator.id },
+          update: {},
+          create: { userId: initiator.id, balance: 0, liability: 0 },
+        });
 
-      if (subordinateWallet.balance < balance) {
-        throw new BadRequestException(
-          'Subordinate has insufficient balance',
-        );
+        if (subordinateWallet.balance < balance) {
+          throw new BadRequestException(
+            'Subordinate has insufficient balance',
+          );
+        }
+
+        // ✅ Safety validation: Prevent withdrawal when user has active exposure
+        if (subordinateWallet.liability > 0) {
+          throw new BadRequestException(
+            'Cannot withdraw while user has active exposure (locked liability)',
+          );
+        }
+
+        // ✅ Deduct from subordinate (agent/client)
+        const updatedSubordinateWallet = await tx.wallet.update({
+          where: { id: subordinateWallet.id },
+          data: { balance: { decrement: balance } },
+          select: { id: true, balance: true },
+        });
+
+        // ✅ Add to initiator (admin/agent)
+        const updatedInitiatorWallet = await tx.wallet.update({
+          where: { id: initiatorWallet.id },
+          data: { balance: { increment: balance } },
+          select: { id: true, balance: true },
+        });
+
+        // Log transfer - do this BEFORE returning to ensure it completes
+        await tx.transferLog.create({
+          data: {
+            fromUserId: subordinate.id,
+            toUserId: initiator.id,
+            amount: balance,
+            remarks,
+            type: TransferLogType.TOPDOWN,
+          },
+        });
+
+        return {
+          message: 'Top-down (withdraw) successful',
+          initiator: {
+            id: initiator.id,
+            name: initiator.name,
+            balance: updatedInitiatorWallet.balance,
+          },
+          subordinate: {
+            id: subordinate.id,
+            name: subordinate.name,
+            balance: updatedSubordinateWallet.balance,
+          },
+        };
+      },
+      {
+        maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)
+        timeout: 20000, // Maximum time the transaction can run (20 seconds)
       }
-
-      // ✅ Deduct from subordinate (agent/client)
-      const updatedSubordinateWallet = await tx.wallet.update({
-        where: { id: subordinateWallet.id },
-        data: { balance: { decrement: balance } },
-        select: { id: true, balance: true },
-      });
-
-      // ✅ Add to initiator (admin/agent)
-      const updatedInitiatorWallet = await tx.wallet.update({
-        where: { id: initiatorWallet.id },
-        data: { balance: { increment: balance } },
-        select: { id: true, balance: true },
-      });
-
-      // Log transfer
-      await tx.transferLog.create({
-        data: {
-          fromUserId: subordinate.id,
-          toUserId: initiator.id,
-          amount: balance,
-          remarks,
-          type: 'TOPDOWN',
-        },
-      });
-
-      return {
-        message: 'Top-down (withdraw) successful',
-        initiator: {
-          id: initiator.id,
-          name: initiator.name,
-          balance: updatedInitiatorWallet.balance,
-        },
-        subordinate: {
-          id: subordinate.id,
-          name: subordinate.name,
-          balance: updatedSubordinateWallet.balance,
-        },
-      };
-    });
+    );
   }
 
   // =======================================================
@@ -311,12 +324,12 @@ export class TransferService {
 
     // 3️⃣ Calculate total deposit (TOPUP done by this user)
     const totalDeposit = transfers
-      .filter((t) => t.type === 'TOPUP' && t.fromUserId === userId)
+      .filter((t) => t.type === TransferLogType.TOPUP && t.fromUserId === userId)
       .reduce((sum, t) => sum + t.amount, 0);
 
     // 4️⃣ Calculate total withdraw (TOPDOWN initiated by this user)
     const totalWithdraw = transfers
-      .filter((t) => t.type === 'TOPDOWN' && t.toUserId === userId)
+      .filter((t) => t.type === TransferLogType.TOPDOWN && t.toUserId === userId)
       .reduce((sum, t) => sum + t.amount, 0);
 
     // 5️⃣ Client Balance (sum of all direct clients' wallet balances)

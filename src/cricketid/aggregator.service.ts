@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable, Logger, HttpException } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import * as https from 'https';
 
@@ -135,21 +135,34 @@ export class AggregatorService {
       return data;
     } catch (error: any) {
       // Extract detailed error information
+      const status = error?.response?.status;
       const errorDetails = {
         url,
         params,
-        status: error?.response?.status,
+        status,
         statusText: error?.response?.statusText,
         message: error?.message || String(error),
         responseData: error?.response?.data,
         code: error?.code,
       };
       
-      this.logger.error(`Error fetching ${url}:`, JSON.stringify(errorDetails, null, 2));
+      // For 400 errors (invalid/expired IDs), only log in debug mode
+      // These are expected when competitionId/eventId is invalid or expired
+      if (status === 400) {
+        if (process.env.NODE_ENV === 'development') {
+          this.logger.debug(
+            `Vendor API returned 400 for ${url} - Invalid or expired resource`,
+            { params, competitionId: params.competitionId || params.eventId },
+          );
+        }
+      } else {
+        // For other errors (5xx, network errors, etc.), log as error
+        this.logger.error(`Error fetching ${url}:`, JSON.stringify(errorDetails, null, 2));
+      }
       
       // Create a more informative error
       const enhancedError = new Error(
-        `API request failed: ${errorDetails.message}${errorDetails.status ? ` (Status: ${errorDetails.status})` : ''}`,
+        `API request failed: ${errorDetails.message}${status ? ` (Status: ${status})` : ''}`,
       );
       (enhancedError as any).details = errorDetails;
       throw enhancedError;
@@ -181,34 +194,8 @@ export class AggregatorService {
     try {
       const response = await this.fetch<any[]>(`/cricketid/matches`, { competitionId });
       return Array.isArray(response) ? response : [];
-    } catch (error: any) {
-      // Check if it's a 400 Bad Request (invalid/expired competitionId) - this is expected
-      let statusCode: number | undefined;
-      
-      if (error instanceof HttpException) {
-        statusCode = error.getStatus();
-      } else if (error?.statusCode) {
-        statusCode = error.statusCode;
-      } else if (error?.response?.status) {
-        statusCode = error.response.status;
-      } else if (error?.status) {
-        statusCode = error.status;
-      }
-      
-      if (statusCode === 400) {
-        // Log as debug instead of error - invalid competitionIds are common and expected
-        // This prevents log noise from expired/invalid competition IDs
-        this.logger.debug(
-          `CompetitionId ${competitionId} returned 400 (invalid/expired) - skipping silently`,
-        );
-      } else {
-        // For other errors (5xx, network issues), log as error
-        this.logger.error(
-          `Error fetching matches for competitionId ${competitionId}:`,
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-      
+    } catch (error) {
+      this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
       return []; // return empty array on error to continue
     }
   }
