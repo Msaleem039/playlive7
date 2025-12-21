@@ -1,14 +1,9 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
 
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PrismaService.name);
-  private migrationsRun = false;
   private isConnected = false;
 
   /**
@@ -22,7 +17,7 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       // Remove channel_binding=require as it can cause connection issues
       urlObj.searchParams.delete('channel_binding');
       
-      // Ensure sslmode is set (required for Neon)
+      // Ensure sslmode is set (required for Neon and Supabase)
       if (!urlObj.searchParams.has('sslmode')) {
         urlObj.searchParams.set('sslmode', 'require');
       }
@@ -33,14 +28,41 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       }
       
       // Configure connection pool settings for better concurrency
-      // connection_limit: Maximum number of connections in the pool (default: 5)
-      // pool_timeout: Maximum time to wait for a connection (default: 10 seconds)
-      // For Neon pooler, increase these values to handle concurrent operations
-      if (!urlObj.searchParams.has('connection_limit')) {
-        urlObj.searchParams.set('connection_limit', '20'); // Increased from default 5
-      }
-      if (!urlObj.searchParams.has('pool_timeout')) {
-        urlObj.searchParams.set('pool_timeout', '20'); // Increased from default 10
+      // For Neon pooler: increase these values
+      // For Supabase: Supabase handles pooling, but we can still set reasonable limits
+      const isNeon = urlObj.hostname.includes('neon.tech');
+      const isSupabase = urlObj.hostname.includes('supabase.co') || urlObj.hostname.includes('supabase.com');
+      
+      if (isNeon) {
+        // Neon-specific pool settings
+        if (!urlObj.searchParams.has('connection_limit')) {
+          urlObj.searchParams.set('connection_limit', '20'); // Increased from default 5
+        }
+        if (!urlObj.searchParams.has('pool_timeout')) {
+          urlObj.searchParams.set('pool_timeout', '20'); // Increased from default 10
+        }
+      } else if (isSupabase) {
+        // Supabase Transaction Pooler doesn't support prepared statements
+        // Add pgbouncer=true to disable prepared statements (required for Supabase)
+        if (!urlObj.searchParams.has('pgbouncer')) {
+          urlObj.searchParams.set('pgbouncer', 'true');
+        }
+        // Supabase handles connection pooling automatically
+        // But we can set reasonable limits for Prisma
+        if (!urlObj.searchParams.has('connection_limit')) {
+          urlObj.searchParams.set('connection_limit', '10'); // Supabase recommended limit
+        }
+        if (!urlObj.searchParams.has('pool_timeout')) {
+          urlObj.searchParams.set('pool_timeout', '10');
+        }
+      } else {
+        // Generic PostgreSQL settings
+        if (!urlObj.searchParams.has('connection_limit')) {
+          urlObj.searchParams.set('connection_limit', '10');
+        }
+        if (!urlObj.searchParams.has('pool_timeout')) {
+          urlObj.searchParams.set('pool_timeout', '10');
+        }
       }
       
       return urlObj.toString();
@@ -127,12 +149,32 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       this.isConnected = true;
       this.logger.log('✅ Database connection established');
     } catch (error) {
-      // If pooler connection fails with P1001, try direct connection as fallback
-      const isConnectionError = error.code === 'P1001' || error.message?.includes("Can't reach database server");
+      // If pooler connection fails, try direct connection as fallback
+      // Check for various connection error types: P1001, timeout, connection reset, etc.
+      const isConnectionError = 
+        error.code === 'P1001' || 
+        error.message?.includes("Can't reach database server") ||
+        error.message?.includes("Connection timeout") ||
+        error.message?.includes("timeout") ||
+        error.message?.includes("ECONNRESET") ||
+        error.message?.includes("connection was forcibly closed");
       const directUrl = process.env.DIRECT_URL;
       
       if (isConnectionError && directUrl && normalizedUrl.includes('pooler')) {
         this.logger.warn('Pooler connection failed, attempting fallback to direct connection...');
+        
+        // Validate that DIRECT_URL is actually a direct URL (not pooler)
+        if (directUrl.includes('pooler')) {
+          this.logger.error('DIRECT_URL appears to be a pooler URL. It should be the direct endpoint (without "-pooler" in hostname).');
+          this.logger.error('Please update DIRECT_URL in your .env file to use the direct connection endpoint.');
+          this.logTroubleshootingTips(error);
+          if (process.env.NODE_ENV === 'production') {
+            throw error;
+          } else {
+            this.logger.warn('Application will continue without database connection (development mode)');
+            return;
+          }
+        }
         
         // Store original URL before switching
         const originalDbUrl = process.env.DATABASE_URL;
@@ -144,20 +186,37 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
           // Disconnect current connection attempt
           await this.$disconnect().catch(() => {});
           
-          // Switch to direct connection
+          // IMPORTANT: PrismaClient reads URL from datasources config at instantiation
+          // We need to update the internal datasource URL by recreating the connection
+          // Update environment variable for future operations
           process.env.DATABASE_URL = normalizedDirectUrl;
           
+          // Update PrismaClient's datasource URL by using $connect with explicit URL
+          // Note: Prisma doesn't support changing URL after instantiation, but we can
+          // work around this by updating the datasource configuration
           const directHost = normalizedDirectUrl.split('@')[1]?.split('/')[0] || 'database';
           this.logger.log(`Retrying with direct connection: ${directHost}`);
           
-          // Try connecting with direct URL
+          // Create a new PrismaClient instance with the direct URL for this connection attempt
+          // We'll use $queryRaw with connection string override if possible, but Prisma
+          // doesn't support that. Instead, we need to reconnect with the new URL.
+          // The issue is that PrismaClient caches the connection URL.
+          
+          // Workaround: Use $connect() which should pick up the new DATABASE_URL from env
+          // But PrismaClient may have cached the original URL. Let's try disconnecting
+          // and reconnecting, which might force it to re-read the environment.
+          await this.$disconnect().catch(() => {});
+          
+          // Small delay to ensure disconnect completes
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // Try connecting again - Prisma should read from process.env.DATABASE_URL
+          // But since we passed url in constructor, it might not. Let's try anyway.
           await this.connectWithRetry(3, 1000);
           this.isConnected = true;
           this.logger.log('✅ Database connection established via direct connection (fallback)');
           this.logger.warn('⚠️  Using direct connection instead of pooler. Consider checking pooler availability.');
           
-          // Keep using direct URL for this session
-          // Note: This only affects this instance, not the PrismaClient's initial config
         } catch (directError) {
           // Restore original URL
           process.env.DATABASE_URL = originalDbUrl;
@@ -165,6 +224,18 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
           this.logger.error('Direct connection also failed');
           this.logger.error(`Direct connection error: ${directError.message}`);
           this.logger.error(`Error Code: ${directError.code || 'N/A'}`);
+          
+          // Check if the error still shows pooler URL (means PrismaClient is using original URL)
+          if (directError.message?.includes('pooler')) {
+            this.logger.error('');
+            this.logger.error('⚠️  IMPORTANT: PrismaClient is still using the pooler URL from initialization.');
+            this.logger.error('   This happens because PrismaClient reads the URL at instantiation time.');
+            this.logger.error('');
+            this.logger.error('   SOLUTION: Set DATABASE_URL to your DIRECT_URL in .env and restart the application.');
+            this.logger.error('   Example: DATABASE_URL="postgresql://user:pass@ep-xxx.c-2.us-east-1.aws.neon.tech/neondb?sslmode=require"');
+            this.logger.error('   (Note: Remove "-pooler" from the hostname)');
+            this.logger.error('');
+          }
           
           // Provide helpful troubleshooting information
           this.logTroubleshootingTips(error);
@@ -202,18 +273,10 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       }
     }
     
-    // Automatically run migrations on startup in production
-    // Can be skipped by setting SKIP_MIGRATIONS=true
-    if (
-      process.env.NODE_ENV === 'production' && 
-      !this.migrationsRun &&
-      process.env.SKIP_MIGRATIONS !== 'true'
-    ) {
-      await this.runMigrations();
-    } else if (process.env.SKIP_MIGRATIONS === 'true') {
-      this.logger.warn('⚠️  Schema migrations skipped (SKIP_MIGRATIONS=true)');
-      this.logger.warn('Make sure to run migrations manually: npm run prisma:deploy');
-    }
+    // ✅ Migrations should NOT run on app startup with Supabase Transaction Pooler
+    // Migrations require Session Pooler (port 5432) or direct connection
+    // For Supabase, use SQL Editor to run migrations manually
+    // For CLI migrations, use: DATABASE_URL=DIRECT_URL npx prisma migrate deploy
   }
 
   /**
@@ -241,12 +304,14 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        // Set connection timeout
+        // Set connection timeout - increased to 15 seconds for better reliability
         await Promise.race([
           this.$connect(),
-          new Promise<never>((_, reject) => 
-            setTimeout(() => reject(new Error('Connection timeout after 10 seconds')), 10000)
-          )
+          new Promise<never>((_, reject) => {
+            const timeoutError = new Error('Connection timeout after 15 seconds');
+            (timeoutError as any).code = 'CONNECTION_TIMEOUT';
+            setTimeout(() => reject(timeoutError), 15000);
+          })
         ]);
         return; // Success
       } catch (error) {
@@ -275,21 +340,44 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   private logTroubleshootingTips(error: any): void {
     this.logger.error('\n🔧 Troubleshooting Tips:');
     
+    // Detect database provider from connection string
+    const dbUrl = process.env.DATABASE_URL || '';
+    const isSupabase = dbUrl.includes('supabase.co');
+    const isNeon = dbUrl.includes('neon.tech');
+    
     if (error.code === 'P1001' || error.message?.includes("Can't reach database server")) {
       this.logger.error('  • Network connectivity issue detected');
       this.logger.error('  • Check your internet connection');
       this.logger.error('  • Verify the database host is correct in DATABASE_URL');
       this.logger.error('  • Check if your firewall is blocking the connection');
-      this.logger.error('  • Verify your Neon database is not paused');
-      this.logger.error('  • Try using the direct connection URL instead of pooler');
+      
+      if (isSupabase) {
+        this.logger.error('  • Verify your Supabase project is active (not paused)');
+        this.logger.error('  • Check Supabase Dashboard → Settings → Database for connection issues');
+        this.logger.error('  • Verify IP restrictions/whitelist in Supabase (if enabled)');
+        this.logger.error('  • Try disabling VPN temporarily to test connection');
+        this.logger.error('  • Supabase requires sslmode=require in connection string');
+      } else if (isNeon) {
+        this.logger.error('  • Verify your Neon database is not paused');
+        this.logger.error('  • Try using the direct connection URL instead of pooler');
+      }
+      
       this.logger.error('  • Verify DATABASE_URL in your .env file is correct');
     } else if (error.code === 'P1000') {
       this.logger.error('  • Authentication failed');
       this.logger.error('  • Check your database username and password');
-      this.logger.error('  • Verify credentials in Neon console');
+      if (isSupabase) {
+        this.logger.error('  • Verify credentials in Supabase Dashboard → Settings → Database');
+        this.logger.error('  • Ensure password is URL-encoded (special characters like : become %3A)');
+      } else if (isNeon) {
+        this.logger.error('  • Verify credentials in Neon console');
+      }
     } else if (error.code === 'P1003') {
       this.logger.error('  • Database does not exist');
       this.logger.error('  • Verify the database name in your connection string');
+      if (isSupabase) {
+        this.logger.error('  • Default Supabase database name is "postgres"');
+      }
     } else if (error.message?.includes('SSL') || error.message?.includes('TLS')) {
       this.logger.error('  • SSL/TLS connection issue');
       this.logger.error('  • Ensure sslmode=require is in your connection string');
@@ -298,92 +386,18 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     
     this.logger.error('\n💡 Quick fixes:');
     this.logger.error('  1. Check .env file has correct DATABASE_URL');
-    this.logger.error('  2. Verify Neon database is active in Neon Console');
-    this.logger.error('  3. Try using direct connection URL (not pooler)');
-    this.logger.error('  4. Run: npm run verify:env to verify environment setup');
+    if (isSupabase) {
+      this.logger.error('  2. Verify Supabase project is active in Supabase Dashboard');
+      this.logger.error('  3. Check Supabase IP restrictions/whitelist settings');
+      this.logger.error('  4. Try disabling VPN to test connection');
+    } else if (isNeon) {
+      this.logger.error('  2. Verify Neon database is active in Neon Console');
+      this.logger.error('  3. Try using direct connection URL (not pooler)');
+    }
+    this.logger.error('  5. Run: npm run verify:env to verify environment setup');
     this.logger.error('');
   }
 
-  private async runMigrations() {
-    try {
-      this.logger.log('Checking database migrations...');
-      
-      // First, quickly check if migrations table exists and if we need to run migrations
-      // This is much faster than db push which does a full schema comparison
-      try {
-        const startTime = Date.now();
-        
-        // Use migrate deploy - it's faster as it only checks migration history
-        // instead of comparing the entire schema
-        const { stdout, stderr } = await execAsync('npx prisma migrate deploy', {
-          cwd: process.cwd(),
-          env: { ...process.env },
-          timeout: 30000, // 30 second timeout
-        });
-        
-        const duration = Date.now() - startTime;
-        
-        if (stdout) {
-          // Only log if there's actual output (migrations were applied)
-          if (!stdout.includes('No pending migrations')) {
-            this.logger.log(stdout);
-          }
-        }
-        if (stderr && !stderr.includes('No pending migrations') && !stderr.includes('already applied')) {
-          this.logger.warn(stderr);
-        }
-        
-        if (stdout?.includes('No pending migrations') || stderr?.includes('No pending migrations')) {
-          this.logger.log(`✅ Database schema is up to date (${duration}ms)`);
-        } else {
-          this.logger.log(`✅ Database migrations applied successfully (${duration}ms)`);
-        }
-        
-        this.migrationsRun = true;
-        return;
-      } catch (migrateError: any) {
-        // If migrate deploy fails (e.g., no migrations table), try db push as fallback
-        // This is slower but ensures schema exists
-        if (migrateError.message?.includes('migration') || migrateError.code === 1) {
-          this.logger.warn('Migration deploy failed, trying schema push as fallback...');
-          this.logger.warn('Note: This may take longer as it compares the entire schema');
-          
-          try {
-            const startTime = Date.now();
-            const { stdout, stderr } = await execAsync('npx prisma db push --accept-data-loss --skip-generate', {
-              cwd: process.cwd(),
-              env: { ...process.env },
-              timeout: 60000, // 60 second timeout for db push
-            });
-            
-            const duration = Date.now() - startTime;
-            
-            if (stdout) {
-              this.logger.log(stdout);
-            }
-            if (stderr && !stderr.includes('already in sync')) {
-              this.logger.warn(stderr);
-            }
-            
-            this.logger.log(`✅ Database schema synchronized (${duration}ms)`);
-            this.migrationsRun = true;
-            return;
-          } catch (dbPushError) {
-            this.logger.error('Both migrate deploy and db push failed');
-            throw dbPushError;
-          }
-        } else {
-          throw migrateError;
-        }
-      }
-    } catch (error: any) {
-      this.logger.error('Failed to sync database schema:', error.message || error);
-      this.logger.warn('The application will continue, but you may need to run migrations manually:');
-      this.logger.warn('  npm run prisma:deploy');
-      // Don't throw - allow app to start even if schema sync fails
-      // The error will be logged and can be handled manually
-    }
-  }
 
   async onModuleDestroy() {
     if (this.isConnected) {

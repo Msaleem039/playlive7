@@ -56,9 +56,37 @@ export class AuthController {
     @Body(ValidationPipe) body: CreateUserDto,
     @CurrentUser() currentUser?: User,
   ): Promise<AuthResponseDto> {
-    // Username is required, email is optional
+    // Auto-generate username from name or email if not provided
     if (!body.username) {
-      throw new BadRequestException('Username field is required');
+      let generatedUsername: string;
+      
+      if (body.email) {
+        // Use email prefix (before @) as username
+        generatedUsername = body.email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
+      } else if (body.name) {
+        // Generate username from name: lowercase, replace spaces with underscores, remove special chars
+        generatedUsername = body.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '_');
+      } else {
+        throw new BadRequestException('Either username, name, or email field is required');
+      }
+      
+      // Ensure username meets length requirements (3-30 characters)
+      // Remove leading/trailing underscores and collapse multiple underscores
+      generatedUsername = generatedUsername.replace(/^_+|_+$/g, '').replace(/_+/g, '_');
+      
+      // If too short, pad with numbers; if too long, truncate
+      if (generatedUsername.length < 3) {
+        generatedUsername = generatedUsername.padEnd(3, '0');
+      } else if (generatedUsername.length > 30) {
+        generatedUsername = generatedUsername.substring(0, 30);
+      }
+      
+      // Fallback if still empty or invalid
+      if (!generatedUsername || generatedUsername.length < 3) {
+        generatedUsername = 'user_' + Date.now().toString().slice(-6);
+      }
+      
+      body.username = generatedUsername;
     }
     
     return this.authService.createUser(body, currentUser || null);

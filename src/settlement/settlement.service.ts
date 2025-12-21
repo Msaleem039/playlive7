@@ -11,6 +11,7 @@ import { HierarchyPnlService } from './hierarchy-pnl.service';
 @Injectable()
 export class SettlementService {
   private readonly logger = new Logger(SettlementService.name);
+  private loggedTableMissing = false; // Track if we've already logged the table missing warning
 
   constructor(
     private readonly prisma: PrismaService,
@@ -1659,6 +1660,22 @@ export class SettlementService {
   @Cron('*/15 * * * * *') // every 15 seconds
   async handleFancySettlement() {
     try {
+      // Check if bets table exists first (to avoid errors during initial setup)
+      try {
+        await this.prisma.$queryRaw`SELECT 1 FROM "bets" LIMIT 1`;
+      } catch (error: any) {
+        // If table doesn't exist, skip this cron run
+        if (error.message?.includes('does not exist') || error.code === '42P01') {
+          // Table doesn't exist yet - skip silently (only log once)
+          if (!this.loggedTableMissing) {
+            this.logger.warn('Bets table does not exist yet. Skipping settlement cron. Run SQL schema in Supabase SQL Editor.');
+            this.loggedTableMissing = true;
+          }
+          return;
+        }
+        throw error; // Re-throw if it's a different error
+      }
+      
       // Get all unique eventIds that have pending fancy bets
       const pendingFancyBets = await this.prisma.bet.findMany({
         where: {

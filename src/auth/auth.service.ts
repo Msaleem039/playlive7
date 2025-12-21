@@ -167,6 +167,28 @@ export class AuthService {
       let user;
 
       if (role === UserRole.SUPER_ADMIN) {
+        // Validate commissionPercentage if provided for SUPER_ADMIN
+        if (commissionPercentage !== undefined && commissionPercentage !== null) {
+          if (commissionPercentage < 1 || commissionPercentage > 100) {
+            throw new BadRequestException('commissionPercentage must be between 1 and 100');
+          }
+          
+          // If creator exists and has commissionPercentage, validate it
+          if (creator) {
+            const creatorFullData = await this.usersService.findById(creator.id);
+            if (creatorFullData && creatorFullData.commissionPercentage !== null) {
+              const creatorCommission = creatorFullData.commissionPercentage;
+              if (commissionPercentage > creatorCommission) {
+                throw new BadRequestException(
+                  `Cannot assign commissionPercentage of ${commissionPercentage}%. ` +
+                  `Your commissionPercentage is ${creatorCommission}%, so you cannot give more than ${creatorCommission}% to your subordinate. ` +
+                  `This would result in a loss for you.`
+                );
+              }
+            }
+          }
+        }
+        
         user = await this.usersService.create({
           name,
           username,
@@ -196,13 +218,39 @@ export class AuthService {
         // For Admin: commissionPercentage = % Admin keeps (e.g., 50%)
         // For Agent: commissionPercentage = % Agent keeps (e.g., 70%)
         // For Client: commissionPercentage is not used (always 100% to Agent)
-        if (commissionPercentage === undefined || commissionPercentage === null) {
-          throw new BadRequestException('commissionPercentage is required when creating Admin or Agent');
+        
+        // Only require commissionPercentage for ADMIN and AGENT roles
+        if (role === UserRole.ADMIN || role === UserRole.AGENT) {
+          if (commissionPercentage === undefined || commissionPercentage === null) {
+            throw new BadRequestException('commissionPercentage is required when creating Admin or Agent');
+          }
+          if (commissionPercentage < 1 || commissionPercentage > 100) {
+            throw new BadRequestException('commissionPercentage must be between 1 and 100');
+          }
+          
+          // ✅ Validate that creator's commissionPercentage is not exceeded
+          // This prevents loss: if creator has 80%, they can't give more than 80% to subordinate
+          if (creator) {
+            // Fetch creator's full data to get their commissionPercentage
+            const creatorFullData = await this.usersService.findById(creator.id);
+            if (creatorFullData && creatorFullData.commissionPercentage !== null) {
+              const creatorCommission = creatorFullData.commissionPercentage;
+              
+              // Subordinate cannot have more commission than creator
+              if (commissionPercentage > creatorCommission) {
+                throw new BadRequestException(
+                  `Cannot assign commissionPercentage of ${commissionPercentage}%. ` +
+                  `Your commissionPercentage is ${creatorCommission}%, so you cannot give more than ${creatorCommission}% to your subordinate. ` +
+                  `This would result in a loss for you.`
+                );
+              }
+            }
+          }
         }
-        if (commissionPercentage < 1 || commissionPercentage > 100) {
-          throw new BadRequestException('commissionPercentage must be between 1 and 100');
-        }
-        const share = commissionPercentage;
+        
+        // For CLIENT, commissionPercentage is not used, set to 0 or null
+        const finalCommissionPercentage = (role === UserRole.CLIENT) ? 0 : commissionPercentage;
+        
         user = await this.usersService.create({
           name,
           username,
@@ -210,7 +258,7 @@ export class AuthService {
           password: hashedPassword,
           role,
           parentId: creator.id,
-          commissionPercentage: commissionPercentage, // Store what THIS USER keeps from downline PnL
+          commissionPercentage: finalCommissionPercentage ?? 0, // Store what THIS USER keeps from downline PnL (0 for CLIENT)
           balance: resolvedBalance, // Pass balance so wallet is created with correct balance
         });
       }

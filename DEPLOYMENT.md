@@ -21,13 +21,43 @@ PORT=3000
 JWT_SECRET=your-strong-random-secret-key-here
 
 # Database Configuration
-DATABASE_URL="postgresql://username:password@host:5432/database?sslmode=require"
-DIRECT_URL="postgresql://username:password@host:5432/database?sslmode=require"
+# Runtime connection (for app queries) - use Transaction Pooler for Supabase
+DATABASE_URL="postgresql://postgres.isdzyrpqrpmprnxanzdg:password@aws-1-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require"
+
+# Direct connection (for migrations only) - use Session Pooler or direct endpoint
+# ⚠️ NEVER use DIRECT_URL in running app - only for CLI migrations
+DIRECT_URL="postgresql://postgres:password@db.isdzyrpqrpmprnxanzdg.supabase.co:5432/postgres?sslmode=require"
 ```
 
 ### 2. Run Database Migrations
 
 **IMPORTANT:** You must run migrations before starting the application in production.
+
+#### For Supabase (Recommended)
+
+**⚠️ Supabase Transaction Pooler (port 6543) does NOT support Prisma migrations.**
+
+**✅ Use Supabase SQL Editor (BEST for Supabase):**
+
+1. Generate your schema SQL:
+   ```bash
+   npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > schema.sql
+   ```
+
+2. Copy the generated SQL from `schema.sql`
+
+3. Open Supabase Dashboard → SQL Editor
+
+4. Paste and run the SQL
+
+**✅ OR use DIRECT_URL for CLI migrations (local development only):**
+
+```bash
+# Use DIRECT_URL (Session Pooler on port 5432) for migrations
+DATABASE_URL="postgresql://postgres:password@db.project.supabase.co:5432/postgres?sslmode=require" npx prisma migrate deploy
+```
+
+#### For Other Databases (Neon, Standard PostgreSQL)
 
 ```bash
 # Option 1: Using npm script
@@ -149,9 +179,17 @@ This means the `DATABASE_URL` environment variable is not set or PM2 is not load
    pm2 logs backend | grep DATABASE_URL
    ```
 
-### Automatic Migration on Startup
+### ⚠️ Important: No Automatic Migrations on Startup
 
-The application will attempt to run migrations automatically on startup in production mode. However, it's recommended to run migrations manually before starting the application to avoid any issues.
+**The application does NOT run migrations automatically on startup.** This is intentional and follows best practices:
+
+- ✅ **Production apps should never auto-migrate** - migrations should be run manually as part of deployment
+- ✅ **Supabase Transaction Pooler doesn't support migrations** - requires Session Pooler or SQL Editor
+- ✅ **Better control and safety** - manual migrations allow for review and rollback
+
+**Always run migrations manually before starting the application:**
+- For Supabase: Use SQL Editor (recommended) or DIRECT_URL
+- For other databases: Use `npm run prisma:deploy`
 
 ## Quick Deployment Checklist
 

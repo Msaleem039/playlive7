@@ -207,33 +207,37 @@ export class BetsService {
     }
 
     // 2. WALLET & EXPOSURE
+    // ✅ CORRECT BETTING RULE (Industry Standard):
+    // Total Credit = Balance + Liability (because liability came from balance)
+    // Remaining Credit = Total Credit - Locked Exposure (liability)
+    // Exposure Limit = Balance + Liability
+    // 
     // IMPORTANT: Wallet balance = CREDIT ONLY (not profit/loss)
     // Profit/Loss is calculated and distributed ONLY during settlement
     // Commission is earned ONLY when bets are settled, not during bet placement
-    const wallet_balance = await this.selectWalletTotalAmountBetPlcae(userId);
-    const current_exposure = await this.selectExposureBalance(
-      userId,
-      gtype,
-      settlement_id,
-    );
-    const allowed_exposure = await this.selectBetTotalAmount(userId);
-
-    const allowed_exp = userRow.sports_exp;
-    const avl_limit = allowed_exp - allowed_exposure;
-
-    if (normalizedLossAmount > avl_limit) {
-      throw new HttpException(
-        {
-          success: false,
-          error: 'Exposure Limit crossed. Betting is not allowed.',
-          code: 'ACCOUNT_LOCKED',
+    
+    // Get wallet - single source of truth for exposure
+    let wallet = await this.prisma.wallet.findUnique({ where: { userId } });
+    if (!wallet) {
+      wallet = await this.prisma.wallet.create({
+        data: {
+          userId,
+          balance: 0,
+          liability: 0,
         },
-        400,
-      );
+      });
     }
 
-    debug.wallet_balance = wallet_balance;
-    debug.current_exposure = current_exposure;
+    // ✅ Calculate total credit and remaining credit correctly
+    const total_credit = (wallet.balance ?? 0) + (wallet.liability ?? 0);
+    const locked_exposure = wallet.liability ?? 0; // Single source of truth
+    const remaining_credit = total_credit - locked_exposure; // This equals balance
+
+    debug.wallet_balance = wallet.balance;
+    debug.wallet_liability = wallet.liability;
+    debug.total_credit = total_credit;
+    debug.locked_exposure = locked_exposure;
+    debug.remaining_credit = remaining_credit;
 
     // 3. REQUIRED AMOUNT CALCULATION
     let required_amount = 0;
@@ -270,38 +274,26 @@ export class BetsService {
 
     debug.required_amount_to_place_bet = required_amount;
 
-    // 3. WALLET - Pending exposure check
-    const pending_exposure = await this.get_total_pending_exposure(userId);
-    const available_wallet = wallet_balance - pending_exposure;
-
-    debug.pending_exposure = pending_exposure;
-    debug.available_wallet_after_exposure = available_wallet;
-
-    if (available_wallet < required_amount) {
+    // ✅ Validate remaining credit is sufficient for the bet
+    // Use wallet.liability as single source of truth (not recalculating from bets)
+    if (normalizedLossAmount > remaining_credit) {
       throw new HttpException(
         {
           success: false,
-          error: 'Insufficient available wallet after pending exposures.',
-          debug,
+          error: 'Insufficient available balance',
+          code: 'INSUFFICIENT_FUNDS',
+          debug: {
+            total_credit,
+            balance: wallet.balance,
+            liability: wallet.liability,
+            remaining_credit,
+            requested: normalizedLossAmount,
+            required_amount,
+          },
         },
         400,
       );
     }
-
-    // Ensure wallet exists before locking liability
-    let wallet = await this.prisma.wallet.findUnique({ where: { userId } });
-    if (!wallet) {
-      wallet = await this.prisma.wallet.create({
-        data: {
-          userId,
-          balance: wallet_balance,
-          liability: 0,
-        },
-      });
-    }
-
-    debug.wallet_balance = wallet.balance;
-    debug.wallet_liability = wallet.liability ?? 0;
 
     // 4. LOCK LIABILITY AND CREATE BET IN A SINGLE TRANSACTION
     // This ensures atomicity - if bet creation fails, balance deduction is rolled back
@@ -329,29 +321,38 @@ export class BetsService {
 
         // Step 2: Deduct balance and lock liability (if required)
         // CREDIT FLOW ONLY: This is pure accounting - no profit/loss calculation
-        // Balance = usable credit, Liability = locked exposure
+        // Balance = free credit, Liability = locked exposure
+        // Total Credit = Balance + Liability
         // Profit/Loss distribution happens ONLY during settlement (via HierarchyPnlService)
         if (required_amount > 0) {
-          // Ensure wallet exists (upsert to handle edge cases)
+          // Get current wallet state within transaction (ensure it exists)
           const currentWallet = await tx.wallet.upsert({
             where: { userId },
             update: {},
             create: {
               userId,
-              balance: wallet_balance,
+              balance: 0,
               liability: 0,
             },
           });
 
-          if (currentWallet.balance < required_amount) {
+          // ✅ Check remaining credit (balance) is sufficient
+          // Remaining credit = total_credit - liability = balance
+          const current_remaining = currentWallet.balance;
+          
+          if (current_remaining < required_amount) {
             throw new HttpException(
               {
                 success: false,
-                error: 'Insufficient wallet balance to lock liability.',
+                error: 'Insufficient available balance to lock liability.',
                 code: 'INSUFFICIENT_FUNDS',
-                balance: currentWallet.balance,
-                liability: currentWallet.liability,
-                required_amount: required_amount,
+                debug: {
+                  balance: currentWallet.balance,
+                  liability: currentWallet.liability,
+                  total_credit: currentWallet.balance + currentWallet.liability,
+                  remaining_credit: current_remaining,
+                  required_amount: required_amount,
+                },
               },
               400,
             );
@@ -419,13 +420,8 @@ export class BetsService {
 
       debug.bet_id = result.betId;
 
-      // 5. UPDATE EXPOSURE (this is just a calculation, doesn't need to be in transaction)
-      await this.updateExposureBalance(
-        userId,
-        required_amount,
-        settlement_id,
-        gtype,
-      );
+      // 5. Exposure is already tracked via wallet.liability (single source of truth)
+      // No need to recalculate from bets - that would cause double counting
 
       // 6. PLACE BET WITH VENDOR API (non-critical, can fail without affecting bet)
       // Only place bet with vendor if marketId and eventId are provided
@@ -464,7 +460,7 @@ export class BetsService {
       }
 
       this.logger.log(`Bet placed successfully: ${result.betId} for user ${userId}`);
-      return { success: true, debug, avl_limit };
+      return { success: true, debug, remaining_credit };
     } catch (error) {
       this.logger.error(`Error placing bet for user ${userId}:`, error);
       
