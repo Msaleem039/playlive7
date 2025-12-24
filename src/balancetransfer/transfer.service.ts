@@ -279,98 +279,155 @@ export class TransferService {
   }
 
   // =======================================================
-  // 📊 DASHBOARD SUMMARY FOR CURRENT USER (Wallet-based)
+  // 📊 DASHBOARD SUMMARY FOR CURRENT USER (Wallet + PnL based)
   // =======================================================
+  /**
+   * Get comprehensive dashboard summary for current user
+   * 
+   * Separates:
+   * - Cash flow (transfers) - NOT profit
+   * - Risk (exposure/liability)
+   * - PnL (settled bets only) - actual profit/loss
+   * - Users (subordinate counts)
+   * 
+   * CRITICAL: Uses userPnl and hierarchyPnl tables which aggregate
+   * settled bet.pnl values (single source of truth from settlement).
+   */
   async getDashboardSummary(currentUser: User) {
     const userId = currentUser.id;
 
-    // 1️⃣ Get subordinates + wallet balances
-    type Subordinate = {
-      id: string;
-      username: string;
-      role: UserRole;
-      balance: number;
-    };
-
-    const rawSubordinates = await this.prisma.user.findMany({
+    // ───────────────────────────────────────
+    // 1️⃣ FETCH DIRECT SUBORDINATES + WALLETS
+    // ───────────────────────────────────────
+    const subordinates = await this.prisma.user.findMany({
       where: { parentId: userId },
-      include: {
+      select: {
+        id: true,
+        role: true,
         wallet: {
-          select: { balance: true },
+          select: {
+            balance: true,
+            liability: true,
+          },
         },
       },
     });
 
-    const subordinates: Subordinate[] = rawSubordinates.map((u) => ({
-      id: u.id,
-      username: (u as any).username,
-      role: u.role,
-      balance: u.wallet?.balance ?? 0,
-    }));
+    const subordinateIds = subordinates.map((u) => u.id);
 
-    const subordinateIds = subordinates.map((s) => s.id);
+    // ───────────────────────────────────────
+    // 2️⃣ CLIENT BALANCE & EXPOSURE (CRITICAL)
+    // ───────────────────────────────────────
+    let clientBalance = 0;
+    let totalExposure = 0;
 
-    // 2️⃣ Get transfer logs where current user is involved
+    for (const u of subordinates) {
+      if (u.role === UserRole.CLIENT && u.wallet) {
+        clientBalance += u.wallet.balance;
+        totalExposure += u.wallet.liability;
+      }
+    }
+
+    // ───────────────────────────────────────
+    // 3️⃣ CLIENT TOTAL PnL (SETTLED ONLY)
+    // ───────────────────────────────────────
+    // Uses userPnl table which aggregates bet.pnl (settlement truth)
+    // @ts-ignore - userPnl property exists after Prisma client regeneration
+    const clientPnls = await this.prisma.userPnl.findMany({
+      where: {
+        userId: { in: subordinateIds },
+      },
+      select: { netPnl: true },
+    });
+
+    const totalClientPnl = clientPnls.reduce((sum, p) => sum + p.netPnl, 0);
+
+    // ───────────────────────────────────────
+    // 4️⃣ ADMIN / AGENT NET PROFIT (HIERARCHY)
+    // ───────────────────────────────────────
+    // Uses hierarchyPnl table which distributes client PnL up the chain
+    // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+    const hierarchyPnls = await this.prisma.hierarchyPnl.findMany({
+      where: {
+        toUserId: userId,
+      },
+      select: { amount: true },
+    });
+
+    const adminNetPnl = hierarchyPnls.reduce((sum, p) => sum + p.amount, 0);
+
+    // ───────────────────────────────────────
+    // 5️⃣ CASH FLOW (NOT PROFIT)
+    // ───────────────────────────────────────
+    // Transfers are cash movements, not profit calculations
+    // Commission is earned ONLY when bets are settled, not during transfers
     const transfers = await this.prisma.transferLog.findMany({
       where: {
-        OR: [
-          { fromUserId: userId },
-          { toUserId: userId },
-          { fromUserId: { in: subordinateIds } },
-          { toUserId: { in: subordinateIds } },
-        ],
+        OR: [{ fromUserId: userId }, { toUserId: userId }],
+      },
+      select: {
+        type: true,
+        amount: true,
+        fromUserId: true,
+        toUserId: true,
       },
     });
 
-    // 3️⃣ Calculate total deposit (TOPUP done by this user)
     const totalDeposit = transfers
       .filter((t) => t.type === TransferLogType.TOPUP && t.fromUserId === userId)
       .reduce((sum, t) => sum + t.amount, 0);
 
-    // 4️⃣ Calculate total withdraw (TOPDOWN initiated by this user)
     const totalWithdraw = transfers
       .filter((t) => t.type === TransferLogType.TOPDOWN && t.toUserId === userId)
       .reduce((sum, t) => sum + t.amount, 0);
 
-    // 5️⃣ Client Balance (sum of all direct clients' wallet balances)
-    const clientBalance = subordinates
-      .filter((s) => s.role === UserRole.CLIENT)
-      .reduce((sum, s) => sum + s.balance, 0);
-
-    // 6️⃣ Total exposure (can be computed later — 0 for now)
-    const totalExposure = 0;
-
-    // 7️⃣ User count by role
-    const userCountByRole = Object.entries(
-      subordinates.reduce((acc, s) => {
-        acc[s.role] = (acc[s.role] || 0) + 1;
+    // ───────────────────────────────────────
+    // 6️⃣ USER COUNTS
+    // ───────────────────────────────────────
+    const userCountByRole = subordinates.reduce(
+      (acc, u) => {
+        acc[u.role] = (acc[u.role] || 0) + 1;
         return acc;
-      }, {} as Record<UserRole, number>),
-    ).map(([role, count]) => ({ role, count }));
+      },
+      {} as Record<UserRole, number>,
+    );
 
-    // 8️⃣ Active clients (placeholder logic)
-    const totalActiveClient =
-      userCountByRole.find((r) => r.role === UserRole.CLIENT)?.count || 0;
+    const totalActiveClient = userCountByRole[UserRole.CLIENT] || 0;
 
-    // 9️⃣ Top 5 winning / losing players (optional placeholders)
-    const topWinningPlayers: any[] = [];
-    const topLosingPlayers: any[] = [];
+    // ───────────────────────────────────────
+    // 7️⃣ ZERO-SUM VALIDATION (OPTIONAL LOG)
+    // ───────────────────────────────────────
+    // Client losses should ≈ admin + super-admin profit
+    // This helps detect settlement bugs
+    if (process.env.NODE_ENV !== 'production') {
+      this.logger.log(
+        `Dashboard Check → ClientPnL: ${totalClientPnl}, AdminPnL: ${adminNetPnl}`,
+      );
+    }
 
-    // 🔟 Top 5 markets (optional placeholders)
-    const topWinningMarkets: any[] = [];
-    const topLosingMarkets: any[] = [];
-
+    // ───────────────────────────────────────
+    // ✅ FINAL DASHBOARD RESPONSE
+    // ───────────────────────────────────────
     return {
-      totalDeposit,
-      totalWithdraw,
-      clientBalance,
-      totalExposure,
-      userCount: userCountByRole,
-      totalActiveClient,
-      topWinningPlayers,
-      topLosingPlayers,
-      topWinningMarkets,
-      topLosingMarkets,
+      cash: {
+        totalDeposit,
+        totalWithdraw,
+        clientBalance,
+      },
+      risk: {
+        totalExposure,
+      },
+      pnl: {
+        clientTotalPnl: totalClientPnl,
+        adminNetPnl,
+      },
+      users: {
+        byRole: Object.entries(userCountByRole).map(([role, count]) => ({
+          role,
+          count,
+        })),
+        totalActiveClient,
+      },
     };
   }
 }

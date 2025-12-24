@@ -168,10 +168,144 @@ export class CricketIdService {
    * Get bookmaker fancy for a specific event
    * Endpoint: /v3/bookmakerFancy?eventId={eventId}
    * Returns bookmaker fancy data with markets, sections, odds, etc.
+   * Data is sorted in the following order:
+   * 1. match_odds (MATCH_ODDS)
+   * 2. bookmakerfancy (Bookmaker, Bookmaker 2)
+   * 3. tie match (Tied Match, TIED_MATCH)
+   * 4. normal fancy (all other fancy types)
    * @param eventId - Event ID (e.g., "34917574")
    */
   async getBookmakerFancy(eventId: string | number) {
-    return this.fetch('/v3/bookmakerFancy', { eventId });
+    const response = await this.fetch<{
+      success: boolean;
+      msg: string;
+      status: number;
+      data: Array<{
+        mname: string;
+        gtype: string;
+        [key: string]: any;
+      }>;
+    }>('/v3/bookmakerFancy', { eventId });
+
+    // Sort the data array according to the required sequence
+    if (response && response.data && Array.isArray(response.data)) {
+      response.data.sort((a, b) => {
+        // Helper function to get sort priority
+        const getPriority = (item: { mname: string; gtype: string }): number => {
+          const mname = item.mname?.toUpperCase() || '';
+          const gtype = item.gtype?.toLowerCase() || '';
+
+          // 1. match_odds (MATCH_ODDS)
+          if (mname === 'MATCH_ODDS') {
+            return 1;
+          }
+
+          // 3. tie match (Tied Match, TIED_MATCH) - check this before bookmakerfancy
+          if (mname.includes('TIED')) {
+            return 3;
+          }
+
+          // 2. bookmakerfancy (Bookmaker, Bookmaker 2, or gtype match1 that's not Tied Match)
+          if (mname.includes('BOOKMAKER') || (gtype === 'match1' && !mname.includes('TIED'))) {
+            return 2;
+          }
+
+          // 4. normal fancy (all other types)
+          return 4;
+        };
+
+        const priorityA = getPriority(a);
+        const priorityB = getPriority(b);
+
+        // If priorities are different, sort by priority
+        if (priorityA !== priorityB) {
+          return priorityA - priorityB;
+        }
+
+        // If priorities are the same, maintain original order (stable sort)
+        // You can also sort by sno if available for sub-ordering within same priority
+        const snoA = a.sno || 0;
+        const snoB = b.sno || 0;
+        return snoA - snoB;
+      });
+
+      // Filter to ONLY include these exact market names (all others are skipped):
+      // - "Normal"
+      // - "MATCH_ODDS"
+      // - "Bookmaker"
+      // - "TIED_MATCH"
+      response.data = response.data.filter((market) => {
+        const mname = market.mname?.toUpperCase() || '';
+        const originalMname = market.mname || '';
+
+        // 1. MATCH_ODDS (case-insensitive)
+        if (mname === 'MATCH_ODDS') {
+          return true;
+        }
+
+        // 2. Bookmaker (exact match, case-sensitive)
+        if (originalMname === 'Bookmaker') {
+          return true;
+        }
+
+        // 3. TIED_MATCH (case-insensitive)
+        if (mname === 'TIED_MATCH') {
+          return true;
+        }
+
+        // 4. Normal (exact match, case-sensitive)
+        if (originalMname === 'Normal') {
+          return true;
+        }
+
+        // Exclude all other markets
+        return false;
+      });
+
+      // Add isSuspended field to each market
+      response.data.forEach((market) => {
+        market.isSuspended = this.isMarketSuspended(market);
+      });
+    }
+
+    return response;
+  }
+
+  /**
+   * Determine if a market is suspended based on various conditions
+   * @param market - Market object with gstatus/status, min, max, odds properties
+   * @returns boolean indicating if the market is suspended
+   */
+  private isMarketSuspended(market: {
+    gstatus?: string;
+    status?: string;
+    min?: number;
+    max?: number;
+    odds?: Array<{ psid?: number; [key: string]: any }>;
+    [key: string]: any;
+  }): boolean {
+    // Check if gstatus is not ACTIVE (also check status field as fallback)
+    const marketStatus = market.gstatus || market.status;
+    if (marketStatus && marketStatus !== 'ACTIVE' && marketStatus !== 'OPEN') {
+      return true;
+    }
+
+    // Check if min or max is <= 0
+    if ((market.min !== undefined && market.min <= 0) || (market.max !== undefined && market.max <= 0)) {
+      return true;
+    }
+
+    // Check if odds array is missing or empty
+    if (!market.odds || market.odds.length === 0) {
+      return true;
+    }
+
+    // Check if all odds have psid === 0
+    if (market.odds.every((odd) => odd.psid === 0)) {
+      return true;
+    }
+
+    return false;
   }
 
   /**

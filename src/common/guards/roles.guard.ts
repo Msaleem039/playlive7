@@ -8,13 +8,16 @@ export class RolesGuard implements CanActivate {
   constructor(private reflector: Reflector) {}
 
   canActivate(context: ExecutionContext): boolean {
-    const requiredRoles = this.reflector.getAllAndOverride<UserRole[]>(ROLES_KEY, [
-      context.getHandler(),
-      context.getClass(),
-    ]);
+    // Get required roles from method-level first, then class-level
+    const handlerRoles = this.reflector.get<UserRole[]>(ROLES_KEY, context.getHandler());
+    const classRoles = this.reflector.get<UserRole[]>(ROLES_KEY, context.getClass());
+    
+    // Method-level roles take precedence over class-level
+    const requiredRoles = handlerRoles || classRoles;
 
-    if (!requiredRoles) {
-      return true;
+    // If no roles are required, deny access by default (secure by default)
+    if (!requiredRoles || requiredRoles.length === 0) {
+      return false;
     }
 
     const { user } = context.switchToHttp().getRequest();
@@ -23,6 +26,7 @@ export class RolesGuard implements CanActivate {
       return false;
     }
 
+    // Check if user's role matches one of the required roles
     return requiredRoles.some((role) => user.role === role);
   }
 }

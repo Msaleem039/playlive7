@@ -15,13 +15,13 @@ datasource db {
 }
 
 model User {
-  id                   String   @id @default(cuid())
-  name                 String
-  username             String   @unique
-  email                String?  @unique
-  password             String
-  role                 UserRole @default(CLIENT)
-  isActive             Boolean  @default(true)
+  id       String   @id @default(cuid())
+  name     String
+  username String   @unique
+  email    String?  @unique
+  password String
+  role     UserRole @default(CLIENT)
+  isActive Boolean  @default(true)
 
   parentId             String?
   commissionPercentage Float    @default(100)
@@ -29,12 +29,12 @@ model User {
   updatedAt            DateTime @updatedAt
 
   // Relations
-  bets                 Bet[]
-  wallet               Wallet?
-  parent                User?     @relation("UserHierarchy", fields: [parentId], references: [id])
-  children              User[]     @relation("UserHierarchy")
-  sentTransfers         TransferTransaction[] @relation("SentTransfers")
-  receivedTransfers     TransferTransaction[] @relation("ReceivedTransfers")
+  bets              Bet[]
+  wallet            Wallet?
+  parent            User?                 @relation("UserHierarchy", fields: [parentId], references: [id])
+  children          User[]                @relation("UserHierarchy")
+  sentTransfers     TransferTransaction[] @relation("SentTransfers")
+  receivedTransfers TransferTransaction[] @relation("ReceivedTransfers")
 
   @@map("users")
 }
@@ -48,97 +48,96 @@ model Wallet {
   updatedAt DateTime @updatedAt
 
   // Relations
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   transactions Transaction[]
 
   @@map("wallets")
 }
 
 model Match {
-  id          String      @id @default(cuid())
-  homeTeam    String
-  awayTeam    String
-  startTime   DateTime
-  status      MatchStatus @default(UPCOMING)
-  eventId     String?
-  eventName   String?
-  marketId    String?
-  marketName  String?
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+  id         String      @id @default(cuid())
+  homeTeam   String
+  awayTeam   String
+  startTime  DateTime
+  status     MatchStatus @default(UPCOMING)
+  eventId    String?
+  eventName  String?
+  marketId   String?
+  marketName String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
 
   // Relations
-  bets        Bet[]
+  bets Bet[]
 
   @@map("matches")
 }
 
 model Bet {
-  id        String    @id @default(cuid())
-  userId    String
-  matchId   String
-  amount    Float
-  odds      Float
-  selId     Int?
-  selectionId Int?
-  betType   String?
-  betName   String?
-  marketName String?
-  marketType String?
-  marketId  String?  // Market ID from vendor API (e.g., "1.250049502")
-  eventId   String?   // Event ID from vendor API (e.g., "34917574")
-  gtype     String?
-  betValue  Float?
-  betRate   Float?
-  winAmount Float?
-  lossAmount Float?
+  id           String    @id @default(cuid())
+  userId       String
+  matchId      String
+  amount       Float
+  odds         Float
+  selId        Int?
+  selectionId  Int?
+  betType      String?
+  betName      String?
+  marketName   String?
+  marketType   String?
+  marketId     String? // Market ID from vendor API (e.g., "1.250049502")
+  eventId      String? // Event ID from vendor API (e.g., "34917574")
+  gtype        String?
+  betValue     Float?
+  betRate      Float?
+  winAmount    Float?
+  lossAmount   Float?
   settlementId String?
-  toReturn  Float?
-  metadata  Json?
-  status    BetStatus @default(PENDING)
-  pnl       Float    @default(0)
-  settledAt DateTime?
-  rollbackAt DateTime?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  toReturn     Float?
+  metadata     Json?
+  status       BetStatus @default(PENDING)
+  pnl          Float     @default(0)
+  settledAt    DateTime?
+  rollbackAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
   // Relations
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  match     Match     @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
 
   @@map("bets")
 }
 
 model Transaction {
-  id          String            @id @default(cuid())
+  id          String          @id @default(cuid())
   walletId    String
   amount      Float
   type        TransactionType
   description String?
-  createdAt   DateTime          @default(now())
+  createdAt   DateTime        @default(now())
 
   // Relations
-  wallet     Wallet            @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
 
   @@map("transactions")
 }
 
-
 model TransferTransaction {
-  id              String   @id @default(cuid())
-  fromUserId      String
-  toUserId        String
-  amount          Float
+  id                   String         @id @default(cuid())
+  fromUserId           String
+  toUserId             String
+  amount               Float
   commissionPercentage Float
-  finalAmount     Float
-  commissionAmount Float
-  status          TransferStatus @default(COMPLETED)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  finalAmount          Float
+  commissionAmount     Float
+  status               TransferStatus @default(COMPLETED)
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
 
   // Relations
-  fromUser        User     @relation("SentTransfers", fields: [fromUserId], references: [id], onDelete: Cascade)
-  toUser          User     @relation("ReceivedTransfers", fields: [toUserId], references: [id], onDelete: Cascade)
+  fromUser User @relation("SentTransfers", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser   User @relation("ReceivedTransfers", fields: [toUserId], references: [id], onDelete: Cascade)
 
   @@map("transfer_transactions")
 }
@@ -187,27 +186,27 @@ enum TransferLogType {
 }
 
 model TransferLog {
-  id        String          @id @default(cuid())
+  id         String          @id @default(cuid())
   fromUserId String
   toUserId   String
   amount     Float
   remarks    String?
   type       TransferLogType
-  createdAt  DateTime       @default(now())
+  createdAt  DateTime        @default(now())
 
   @@map("transfer_logs")
 }
 
 model Settlement {
-  id            String      @id @default(cuid())
-  settlementId  String      @unique
-  eventId       String
-  marketType    MarketType
-  marketId      String?
-  winnerId      String?
-  settledBy     String      // ADMIN ID or "AUTO"
-  isRollback    Boolean     @default(false)
-  createdAt     DateTime    @default(now())
+  id           String     @id @default(cuid())
+  settlementId String     @unique
+  eventId      String
+  marketType   MarketType
+  marketId     String?
+  winnerId     String?
+  settledBy    String // ADMIN ID or "AUTO"
+  isRollback   Boolean    @default(false)
+  createdAt    DateTime   @default(now())
 
   @@map("settlements")
 }
@@ -219,29 +218,39 @@ enum MarketType {
 }
 
 model UserPnl {
-  id        String      @id @default(cuid())
-  userId    String
-  eventId   String
+  id         String     @id @default(cuid())
+  userId     String
+  eventId    String
   marketType MarketType
-  profit    Float       @default(0)
-  loss      Float       @default(0)
-  netPnl    Float       @default(0)
-  createdAt DateTime    @default(now())
-  updatedAt DateTime    @updatedAt
+  profit     Float      @default(0)
+  loss       Float      @default(0)
+  netPnl     Float      @default(0)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
 
   @@unique([userId, eventId, marketType])
   @@map("user_pnl")
 }
 
 model HierarchyPnl {
-  id          String      @id @default(cuid())
-  eventId     String
-  marketType  MarketType
-  fromUserId  String      // client or child
-  toUserId    String      // parent
-  amount      Float       // profit (+) or loss (-)
-  percentage  Float
-  createdAt   DateTime    @default(now())
+  id         String     @id @default(cuid())
+  eventId    String
+  marketType MarketType
+  fromUserId String // client or child
+  toUserId   String // parent
+  amount     Float // profit (+) or loss (-)
+  percentage Float
+  createdAt  DateTime   @default(now())
 
   @@map("hierarchy_pnl")
+}
+
+model MatchVisibility {
+  id        Int      @id @default(autoincrement())
+  eventId   String   @unique
+  isEnabled Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("match_visibility")
 }

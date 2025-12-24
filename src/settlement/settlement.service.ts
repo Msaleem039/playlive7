@@ -81,10 +81,11 @@ export class SettlementService {
       for (const bet of bets) {
         let result: { status: BetStatus; pnl: number };
 
-        // Handle cancellation (refund stake)
+        // Handle cancellation (refund locked liability)
         if (fancy.isCancel || fancy.isRollback) {
-          // Refund the stake amount (amount field)
-          result = { status: BetStatus.CANCELLED, pnl: bet.amount ?? 0 };
+          // Refund the locked liability (lossAmount field)
+          // Betfair standard: On CANCELLED, refund lossAmount (not amount)
+          result = { status: BetStatus.CANCELLED, pnl: bet.lossAmount ?? 0 };
         } else if (fancy.isDeclare) {
           // Handle declared fancy with BACK/LAY logic
           if (bet.betType === 'BACK') {
@@ -153,6 +154,7 @@ export class SettlementService {
     isCancel: boolean,
     marketId: string | null,
     adminId: string,
+    betIds?: string[], // Optional: settle only specific bets
   ) {
     const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
 
@@ -164,7 +166,9 @@ export class SettlementService {
 
     if (existingSettlement && !existingSettlement.isRollback) {
       throw new BadRequestException(
-        `Settlement ${settlementId} already exists`,
+        `Settlement ${settlementId} already exists. ` +
+        `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+        `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
       );
     }
 
@@ -175,6 +179,8 @@ export class SettlementService {
         status: BetStatus.PENDING,
         eventId: eventId,
         selectionId: Number(selectionId),
+        // Filter by betIds if provided
+        ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
       },
     });
 
@@ -187,6 +193,8 @@ export class SettlementService {
           eventId: eventId,
           selectionId: Number(selectionId),
           status: BetStatus.PENDING,
+          // Filter by betIds if provided
+          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
           // Fancy bets typically have gtype containing "fancy"
           OR: [
             { gtype: { contains: 'fancy', mode: 'insensitive' } },
@@ -247,10 +255,11 @@ export class SettlementService {
     for (const bet of bets) {
       let result: { status: BetStatus; pnl: number };
 
-      // Handle cancellation (refund stake)
+      // Handle cancellation (refund locked liability)
       if (isCancel) {
-        // Refund the stake amount (amount field)
-        result = { status: BetStatus.CANCELLED, pnl: bet.amount ?? 0 };
+        // Refund the locked liability (lossAmount field)
+        // Betfair standard: On CANCELLED, refund lossAmount (not amount)
+        result = { status: BetStatus.CANCELLED, pnl: bet.lossAmount ?? 0 };
       } else if (decisionRun !== null) {
         // Handle declared fancy with BACK/LAY logic
         if (bet.betType === 'BACK') {
@@ -319,6 +328,7 @@ export class SettlementService {
     marketId: string,
     winnerSelectionId: string,
     adminId: string,
+    betIds?: string[], // Optional: settle only specific bets
   ) {
     const settlementId = `CRICKET:BOOKMAKER:${eventId}:${marketId}`;
 
@@ -330,7 +340,9 @@ export class SettlementService {
 
     if (existingSettlement && !existingSettlement.isRollback) {
       throw new BadRequestException(
-        `Settlement ${settlementId} already exists`,
+        `Settlement ${settlementId} already exists. ` +
+        `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+        `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
       );
     }
 
@@ -341,6 +353,8 @@ export class SettlementService {
         status: BetStatus.PENDING,
         eventId: eventId,
         marketId: marketId,
+        // Filter by betIds if provided
+        ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
       },
     });
 
@@ -353,6 +367,8 @@ export class SettlementService {
           eventId: eventId,
           marketId: marketId,
           status: BetStatus.PENDING,
+          // Filter by betIds if provided
+          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
           // Bookmaker bets typically have gtype containing "bookmaker" or "book"
           OR: [
             { gtype: { contains: 'bookmaker', mode: 'insensitive' } },
@@ -474,6 +490,7 @@ export class SettlementService {
     marketId: string,
     winnerSelectionId: string,
     adminId: string,
+    betIds?: string[], // Optional: settle only specific bets
   ) {
     try {
       // Validate required parameters
@@ -500,7 +517,9 @@ export class SettlementService {
 
       if (existingSettlement && !existingSettlement.isRollback) {
         throw new BadRequestException(
-          `Settlement ${settlementId} already exists`,
+          `Settlement ${settlementId} already exists. ` +
+          `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+          `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
         );
       }
 
@@ -511,6 +530,8 @@ export class SettlementService {
           status: BetStatus.PENDING,
           ...(eventId && { eventId: eventId }),
           ...(marketId && { marketId: marketId }),
+          // Filter by betIds if provided
+          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
         },
       });
 
@@ -536,7 +557,7 @@ export class SettlementService {
         // 2. Has "MATCHODDS" or "MATCH_ODDS" in settlementId
         // 3. Starts with eventId_ (old format)
         // 4. Or if marketId matches (if both are provided)
-        return (
+        const matchesMarket = (
           sid.includes('undefined') ||
           sid.includes('MATCHODDS') ||
           sid.includes('MATCH_ODDS') ||
@@ -544,6 +565,13 @@ export class SettlementService {
           (marketId && bet.marketId === marketId) ||
           (!bet.marketId && marketId) // If bet doesn't have marketId but we're settling with one
         );
+        
+        // If betIds provided, also check if bet is in the list
+        if (betIds && betIds.length > 0) {
+          return matchesMarket && betIds.includes(bet.id);
+        }
+        
+        return matchesMarket;
       });
 
       this.logger.log(
@@ -678,20 +706,48 @@ export class SettlementService {
     }
   }
 
+  /**
+   * Apply settlement outcome to a bet (Betfair-standard)
+   * 
+   * BETFAIR GOLDEN RULE: Balance is temporary. Liability is truth.
+   * 
+   * EVERY bet MUST release liability exactly once.
+   * 
+   * On settlement (ALL cases: WIN / LOSS / CANCELLED):
+   * 1. Release liability (ALWAYS decrement) - MOST IMPORTANT
+   * 2. Apply PnL to balance
+   * 3. Update bet status
+   * 
+   * Liability must be released even if pnl = 0
+   */
   private async applyOutcome(
     bet: any,
     outcome: { status: BetStatus; pnl: number },
   ) {
     await this.prisma.$transaction(async (tx) => {
-      if (outcome.pnl !== 0) {
+      const liability = bet.lossAmount ?? 0;
+
+      // 1️⃣ RELEASE LIABILITY (MOST IMPORTANT)
+      // This is CRITICAL - without this, liability stays locked forever
+      // Liability must be released even if pnl = 0
       await tx.wallet.update({
-          where: { userId: bet.userId },
+        where: { userId: bet.userId },
         data: {
-            balance: { increment: outcome.pnl },
+          liability: { decrement: liability },
         },
       });
-    }
 
+      // 2️⃣ APPLY PnL
+      if (outcome.pnl !== 0) {
+        await tx.wallet.update({
+          where: { userId: bet.userId },
+          data: {
+            balance: { increment: outcome.pnl },
+          },
+        });
+      }
+
+      // 3️⃣ UPDATE BET
       await tx.bet.update({
         where: { id: bet.id },
         data: {
@@ -705,65 +761,121 @@ export class SettlementService {
     });
   }
 
-  async rollbackSettlement(settlementId: string, adminId: string) {
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    const settlement = await this.prisma.settlement.findUnique({
-      where: { settlementId },
-    });
+  async rollbackSettlement(settlementId: string, adminId: string, betIds?: string[]) {
+    try {
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const settlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
 
-    if (!settlement || settlement.isRollback) {
-      throw new BadRequestException(
-        'Invalid or already rollbacked settlement',
+      if (!settlement) {
+        throw new BadRequestException(
+          `Settlement ${settlementId} not found`,
+        );
+      }
+
+      if (settlement.isRollback) {
+        throw new BadRequestException(
+          `Settlement ${settlementId} has already been rolled back`,
+        );
+      }
+
+      this.logger.log(
+        `Rolling back settlement ${settlementId} by admin ${adminId}. Market: ${settlement.marketType}, Event: ${settlement.eventId}`,
       );
-    }
 
     const bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
-      status: {
-        in: [BetStatus.WON, BetStatus.LOST],
-      },
+        status: {
+          in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+        },
+        // Filter by betIds if provided
+        ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
       },
     });
 
-    await this.prisma.$transaction(async (tx) => {
-      for (const bet of bets) {
-        // Reverse wallet
-        // @ts-ignore - pnl field exists after database migration
-        if (bet.pnl !== 0) {
-          await tx.wallet.update({
-            where: { userId: bet.userId },
+    if (bets.length === 0) {
+      this.logger.warn(
+        `No settled bets found for settlement ${settlementId}. Proceeding with settlement rollback only.`,
+      );
+    }
+
+    // CRITICAL FIX: Add transaction timeout to prevent "Transaction not found" errors
+    // This is especially important with pooled connections (Neon, etc.) and when rolling back many bets
+    await this.prisma.$transaction(
+      async (tx) => {
+        // Group bets by userId to optimize wallet updates (reduce number of updates)
+        const betsByUserId = new Map<string, typeof bets>();
+        for (const bet of bets) {
+          if (!betsByUserId.has(bet.userId)) {
+            betsByUserId.set(bet.userId, []);
+          }
+          betsByUserId.get(bet.userId)!.push(bet);
+        }
+
+        // Process each user's bets
+        for (const [userId, userBets] of betsByUserId.entries()) {
+          // Calculate totals for this user to minimize wallet updates
+          let totalPnlReversal = 0;
+          let totalLiabilityRestore = 0;
+
+          for (const bet of userBets) {
+            // @ts-ignore - pnl field exists after database migration
+            totalPnlReversal += bet.pnl ?? 0;
+            totalLiabilityRestore += bet.lossAmount ?? 0;
+          }
+
+          // Update wallet once per user (more efficient than per bet)
+          const walletUpdateData: any = {};
+
+          if (totalPnlReversal !== 0) {
+            walletUpdateData.balance = { increment: -totalPnlReversal };
+          }
+
+          if (totalLiabilityRestore > 0) {
+            walletUpdateData.liability = { increment: totalLiabilityRestore };
+          }
+
+          if (Object.keys(walletUpdateData).length > 0) {
+            await tx.wallet.update({
+              where: { userId },
+              data: walletUpdateData,
+            });
+          }
+
+          // Reset all bets for this user
+          const betIds = userBets.map((b) => b.id);
+          await tx.bet.updateMany({
+            where: {
+              id: { in: betIds },
+            },
             data: {
+              status: BetStatus.PENDING,
               // @ts-ignore - pnl field exists after database migration
-              balance: { increment: -bet.pnl },
+              pnl: 0,
+              rollbackAt: new Date(),
+              settledAt: null,
+              updatedAt: new Date(),
             },
           });
         }
 
-        // Reset bet
-        await tx.bet.update({
-          where: { id: bet.id },
+        // Mark settlement as rollbacked
+        // @ts-ignore - settlement property exists after Prisma client regeneration
+        await tx.settlement.update({
+          where: { settlementId },
           data: {
-            status: BetStatus.PENDING,
-            // @ts-ignore - pnl field exists after database migration
-            pnl: 0,
-            rollbackAt: new Date(),
-            settledAt: null,
-            updatedAt: new Date(),
+            isRollback: true,
+            settledBy: adminId,
           },
         });
-      }
-
-      // Mark settlement as rollbacked
-      // @ts-ignore - settlement property exists after Prisma client regeneration
-      await tx.settlement.update({
-        where: { settlementId },
-            data: {
-          isRollback: true,
-          settledBy: adminId,
-            },
-          });
-    });
+      },
+      {
+        maxWait: 15000, // Maximum time to wait for a transaction slot (15 seconds)
+        timeout: 30000, // Maximum time the transaction can run (30 seconds - longer for rollback with many bets)
+      },
+    );
 
     // Delete hierarchical PnL ledger records (NO WALLET REVERSAL - wallet is never touched in PnL distribution)
     const userIds = new Set(bets.map((b) => b.userId));
@@ -786,27 +898,71 @@ export class SettlementService {
       }
     }
 
-    // Recalculate P/L for all affected users after rollback
-    for (const userId of userIds) {
-      try {
-        await this.pnlService.recalculateUserPnlAfterSettlement(
-          userId,
-          settlement.eventId,
-        );
-      } catch (error) {
-        this.logger.warn(
-          `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
+      // Recalculate P/L for all affected users after rollback
+      for (const userId of userIds) {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
+            userId,
+            settlement.eventId,
+          );
+        } catch (error) {
+          this.logger.warn(
+            `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
+          );
+        }
+      }
+
+      this.logger.log(
+        `Settlement ${settlementId} rolled back successfully. ${bets.length} bets reset to PENDING.`,
+      );
+
+      return { success: true, message: 'Settlement rolled back successfully' };
+    } catch (error) {
+      this.logger.error(
+        `Error rolling back settlement ${settlementId}: ${(error as Error).message}`,
+        (error as Error).stack,
+      );
+
+      // Re-throw BadRequestException as-is
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      // Handle transaction errors specifically
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isTransactionError =
+        errorMessage.includes('Transaction not found') ||
+        errorMessage.includes('Transaction') ||
+        errorMessage.includes('P2034') || // Prisma transaction timeout error code
+        errorMessage.includes('P2035'); // Prisma transaction error code
+
+      if (isTransactionError) {
+        throw new BadRequestException(
+          `Transaction failed during rollback. Please try again. If the issue persists, the database connection may be experiencing issues. Error: ${errorMessage}`,
         );
       }
-    }
 
-    return { success: true, message: 'Settlement rolled back successfully' };
+      // Wrap other errors in BadRequestException for proper HTTP response
+      throw new BadRequestException(
+        `Failed to rollback settlement: ${errorMessage}`,
+      );
+    }
   }
 
   /**
    * Delete a bet for a specific user (Admin only)
    * Refunds the wallet balance and releases liability
    * Can delete by betId or settlementId
+   * 
+   * IMPORTANT: This method ONLY works for PENDING bets.
+   * For PENDING bets, both balance and liability are refunded because:
+   * - balance was decremented by lossAmount on bet placement
+   * - liability was incremented by lossAmount on bet placement
+   * So we refund both to restore the wallet to pre-bet state.
+   * 
+   * This is safe because:
+   * - Only PENDING bets can be deleted (enforced by status check)
+   * - Settled bets should use rollbackSettlement instead
    */
   async deleteBet(betIdOrSettlementId: string, adminId: string) {
     // Try to find bet by ID first, then by settlementId

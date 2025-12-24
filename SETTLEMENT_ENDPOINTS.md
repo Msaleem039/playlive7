@@ -96,7 +96,7 @@ Base URL: `/admin/settlement`
 
 All endpoints require:
 - `Authorization: Bearer {JWT_TOKEN}` header
-- User must have `ADMIN` or `SUPER_ADMIN` role
+- User must have `ADMIN`, `SUPER_ADMIN`, or `SETTLEMENT_ADMIN` role
 
 ### 4. Manual Settlement - Fancy
 **Endpoint:** `POST /admin/settlement/fancy`
@@ -120,6 +120,7 @@ All endpoints require:
 - `decisionRun` (optional): The winning run value (required if `isCancel` is false)
 - `isCancel` (required): Boolean - true to cancel/refund, false to settle with decisionRun
 - `marketId` (optional): Market ID from vendor API
+- `betIds` (optional, array of strings): Specific bet IDs to settle. If not provided, settles ALL pending bets for the market. Example: `["bet_id_1", "bet_id_2"]`
 
 **Example - Settle with Decision Run:**
 ```json
@@ -150,7 +151,7 @@ All endpoints require:
 ```
 
 **Settlement Logic:**
-- If `isCancel` is true: All bets are refunded (status = CANCELLED, P/L = stake amount)
+- If `isCancel` is true: All bets are refunded (status = CANCELLED, P/L = lossAmount - refunds the locked liability)
 - If `isCancel` is false and `decisionRun` is provided:
   - **BACK bets**: Win if `decisionRun > betValue`, Lose otherwise
   - **LAY bets**: Win if `decisionRun <= betValue`, Lose otherwise
@@ -167,7 +168,33 @@ All endpoints require:
 {
   "eventId": "34917574",
   "marketId": "1.250049502",
+  "winnerSelectionId": "15316",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
+}
+```
+
+**Request Body Parameters:**
+- `eventId` (required): Event ID from vendor API
+- `marketId` (required): Market ID from vendor API
+- `winnerSelectionId` (required): The winning selection ID
+- `betIds` (optional, array of strings): Specific bet IDs to settle. If not provided, settles ALL pending bets for the market. Example: `["bet_id_1", "bet_id_2"]`
+
+**Example - Settle All Bets (default behavior):**
+```json
+{
+  "eventId": "34917574",
+  "marketId": "1.250049502",
   "winnerSelectionId": "15316"
+}
+```
+
+**Example - Settle Specific Bets Only:**
+```json
+{
+  "eventId": "34917574",
+  "marketId": "1.250049502",
+  "winnerSelectionId": "15316",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
 }
 ```
 
@@ -191,7 +218,33 @@ All endpoints require:
 {
   "eventId": "34917574",
   "marketId": "1.250049502",
+  "winnerSelectionId": "15316",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
+}
+```
+
+**Request Body Parameters:**
+- `eventId` (required): Event ID from vendor API
+- `marketId` (required): Market ID from vendor API
+- `winnerSelectionId` (required): The winning selection ID
+- `betIds` (optional, array of strings): Specific bet IDs to settle. If not provided, settles ALL pending bets for the market. Example: `["bet_id_1", "bet_id_2"]`
+
+**Example - Settle All Bets (default behavior):**
+```json
+{
+  "eventId": "34917574",
+  "marketId": "1.250049502",
   "winnerSelectionId": "15316"
+}
+```
+
+**Example - Settle Specific Bets Only:**
+```json
+{
+  "eventId": "34917574",
+  "marketId": "1.250049502",
+  "winnerSelectionId": "15316",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
 }
 ```
 
@@ -213,18 +266,84 @@ All endpoints require:
 - Reset bet statuses to PENDING
 - Mark the settlement as rolled back
 
-**Request Body:**
+**Authentication:** Required (Bearer Token)
+- Roles: `SUPER_ADMIN`, `ADMIN`, `SETTLEMENT_ADMIN`
+
+**Request Body (JSON):**
 ```json
 {
   "settlementId": "CRICKET:MATCHODDS:34917574:1.250049502"
 }
 ```
 
-**Response:**
+**Request Body Fields:**
+- `settlementId` (string, required): The settlement ID to rollback
+  - Format: `CRICKET:{MARKET_TYPE}:{EVENT_ID}:{MARKET_ID}`
+  - Examples:
+    - Fancy: `CRICKET:FANCY:34917574:12345`
+    - Match Odds: `CRICKET:MATCHODDS:34917574:1.250049502`
+    - Bookmaker: `CRICKET:BOOKMAKER:34917574:1.250049502`
+- `betIds` (optional, array of strings): Specific bet IDs to rollback. If not provided, rolls back ALL bets for the settlement. Example: `["bet_id_1", "bet_id_2"]`
+
+**How to get settlementId:**
+1. Use `GET /admin/settlement/list` to see all settlements
+2. Copy the `settlementId` from the settlement you want to rollback
+3. The settlement must exist and not already be rolled back
+
+**Postman Example:**
+- **Method:** `POST`
+- **URL:** `http://localhost:3000/admin/settlement/rollback`
+- **Headers:**
+  ```
+  Authorization: Bearer YOUR_JWT_TOKEN
+  Content-Type: application/json
+  ```
+- **Body (raw JSON) - Rollback All Bets:**
+  ```json
+  {
+    "settlementId": "CRICKET:MATCHODDS:34917574:1.250049502"
+  }
+  ```
+
+- **Body (raw JSON) - Rollback Specific Bets:**
+  ```json
+  {
+    "settlementId": "CRICKET:MATCHODDS:34917574:1.250049502",
+    "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
+  }
+  ```
+
+**Success Response (200 OK):**
 ```json
 {
   "success": true,
   "message": "Settlement rolled back successfully"
+}
+```
+
+**Error Responses:**
+
+**400 Bad Request - Missing settlementId:**
+```json
+{
+  "success": false,
+  "message": "settlementId is required"
+}
+```
+
+**404 Not Found - Settlement doesn't exist:**
+```json
+{
+  "success": false,
+  "message": "Settlement not found"
+}
+```
+
+**400 Bad Request - Already rolled back:**
+```json
+{
+  "success": false,
+  "message": "Settlement has already been rolled back"
 }
 ```
 

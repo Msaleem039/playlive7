@@ -339,12 +339,29 @@ export class AuthService {
     }));
   }
 
+  /**
+   * Get subordinates with financial information
+   * 
+   * BETFAIR STANDARD: Uses userPnl as single source of truth for P/L
+   * 
+   * CRITICAL:
+   * - wallet.balance already includes settled P/L (updated at settlement)
+   * - Never add profitLoss to balance (would double-count)
+   * - profitLoss is for reporting only
+   * - plCash = balance (balance already includes P/L)
+   * 
+   * Validation check:
+   * balance_after_settlement === opening_balance + deposits - withdrawals + total_net_pnl
+   */
   async getSubordinates(userId: string) {
     const users = await this.prisma.user.findMany({
       where: { parentId: userId },
       include: {
         wallet: {
-          select: { balance: true, liability: true },
+          select: {
+            balance: true,
+            liability: true,
+          },
         },
       },
       orderBy: {
@@ -352,61 +369,60 @@ export class AuthService {
       },
     });
 
-    // Calculate PL+Cash for each user (balance + profit/loss from settled bets)
-    const subordinatesWithFinancials = await Promise.all(
-      users.map(async (user) => {
-        const balance = user.wallet?.balance ?? 0;
-        const liability = user.wallet?.liability ?? 0;
+    const userIds = users.map((u) => u.id);
 
-        // Calculate profit/loss from settled bets (WON or LOST)
-        const settledBets = await this.prisma.bet.findMany({
-          where: {
-            userId: user.id,
-            status: {
-              in: [BetStatus.WON, BetStatus.LOST],
-            },
-          },
-          select: {
-            winAmount: true,
-            lossAmount: true,
-            status: true,
-          },
-        });
+    // 🔹 Fetch settled PnL from userPnl table (single source of truth)
+    // Uses userPnl which aggregates bet.pnl values from settlement
+    // @ts-ignore - userPnl property exists after Prisma client regeneration
+    const pnls = await this.prisma.userPnl.findMany({
+      where: {
+        userId: { in: userIds },
+      },
+      select: {
+        userId: true,
+        netPnl: true,
+      },
+    });
 
-        // Calculate total profit/loss from settled bets
-        const profitLoss = settledBets.reduce((total, bet) => {
-          if (bet.status === BetStatus.WON) {
-            return total + (Number(bet.winAmount) || 0);
-          } else {
-            return total - (Number(bet.lossAmount) || 0);
-          }
-        }, 0);
-
-        // PL+Cash = Balance + Profit/Loss from settled bets
-        const plCash = balance + profitLoss;
-
-        // Available Balance = Balance - Liability
-        const availableBalance = balance - liability;
-
-        return {
-          id: user.id,
-          name: user.name,
-          username: user.username,
-          role: user.role,
-          balance: balance,
-          liability: liability,
-          plCash: plCash,
-          availableBalance: availableBalance,
-          parentId: user.parentId,
-          commissionPercentage: user.commissionPercentage,
-          isActive: user.isActive ?? true,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt,
-        };
-      })
+    // Create map for quick lookup
+    const pnlMap = pnls.reduce(
+      (acc, p) => {
+        acc[p.userId] = (acc[p.userId] || 0) + p.netPnl;
+        return acc;
+      },
+      {} as Record<string, number>,
     );
 
-    return subordinatesWithFinancials;
+    return users.map((user) => {
+      const balance = user.wallet?.balance ?? 0;
+      const liability = user.wallet?.liability ?? 0;
+
+      // Profit/Loss from userPnl (reporting only - NOT added to balance)
+      // Balance already includes settled P/L from settlement.applyOutcome()
+      const profitLoss = pnlMap[user.id] ?? 0;
+
+      return {
+        id: user.id,
+        name: user.name,
+        username: user.username,
+        role: user.role,
+
+        // 💰 WALLET (Betfair standard)
+        balance, // Already includes settled P/L
+        liability, // Exposure from open bets
+        availableBalance: balance - liability, // Playable balance
+
+        // 📊 REPORTING ONLY (not cash)
+        profitLoss, // Settled P/L from userPnl (for reporting/display)
+        plCash: balance, // Balance already includes P/L, so plCash = balance
+
+        parentId: user.parentId,
+        commissionPercentage: user.commissionPercentage,
+        isActive: user.isActive ?? true,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      };
+    });
   }
 
   async toggleUserStatus(currentUser: User, targetUserId: string, isActive: boolean) {

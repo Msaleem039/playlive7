@@ -2,6 +2,7 @@ import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import * as https from 'https';
+import { MatchVisibilityService } from './match-visibility.service';
 
 @Injectable()
 export class AggregatorService {
@@ -10,7 +11,10 @@ export class AggregatorService {
   private cache = new Map<string, { data: any; expiresAt: number }>();
   private activeMatches = new Map<string, { eventId: string; marketIds: string; lastAccessed: number }>();
 
-  constructor(private readonly http: HttpService) {
+  constructor(
+    private readonly http: HttpService,
+    private readonly matchVisibilityService: MatchVisibilityService,
+  ) {
     // Clean up expired cache entries every 5 minutes
     setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
     // Clean up inactive matches (not accessed in last 5 minutes)
@@ -193,7 +197,20 @@ export class AggregatorService {
   async getMatchesByCompetition(competitionId: string) {
     try {
       const response = await this.fetch<any[]>(`/cricketid/matches`, { competitionId });
-      return Array.isArray(response) ? response : [];
+      const matches = Array.isArray(response) ? response : [];
+
+      // Sync matches with visibility table (create if not exists)
+      for (const match of matches) {
+        const eventId = match?.event?.id;
+        if (eventId) {
+          // Fire and forget - don't wait for sync to complete
+          this.matchVisibilityService.syncMatch(eventId).catch((err) => {
+            this.logger.debug(`Failed to sync match ${eventId}:`, err);
+          });
+        }
+      }
+
+      return matches;
     } catch (error) {
       this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
       return []; // return empty array on error to continue
@@ -202,6 +219,7 @@ export class AggregatorService {
 
   /**
    * Fetch all cricket matches and classify Live / Upcoming
+   * Filters matches by admin-controlled visibility settings
    * @param sportId - Sport ID (default: '4' for cricket)
    * @param page - Page number (for cache key differentiation)
    * @param per_page - Items per page (for cache key differentiation)
@@ -223,11 +241,28 @@ export class AggregatorService {
           allMatches.push(...matches);
         }
 
+        // Extract eventIds and get visibility map
+        const eventIds = allMatches
+          .map((m) => m?.event?.id)
+          .filter((id): id is string => !!id);
+
+        const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
+
+        // Filter matches by visibility (only show enabled matches)
+        const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
+          allMatches,
+          visibilityMap,
+        );
+
+        // Classify by date
+        const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
+        const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
+
         return {
-          total: allMatches.length,
+          total: visibleMatches.length,
           // all: allMatches,
-          live: allMatches.filter(m => new Date(m?.event?.openDate) <= new Date()),
-          upcoming: allMatches.filter(m => new Date(m?.event?.openDate) > new Date()),
+          live,
+          upcoming,
         };
       },
     );

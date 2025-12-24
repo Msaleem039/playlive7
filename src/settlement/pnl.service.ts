@@ -32,14 +32,24 @@ export class PnlService {
   /**
    * Calculate P/L for a single user for a specific event
    * Groups by marketType
+   * 
+   * BETFAIR GOLD STANDARD: PnL is a REPORT, not a calculator
+   * Golden Rule: PnL = SUM(bet.pnl)
+   * 
+   * This method aggregates the settled bet.pnl values (single source of truth).
+   * It does NOT recompute PnL from winAmount/lossAmount (those are pre-settlement).
+   * 
+   * CANCELLED bets are excluded - they affect wallet but not PnL.
    */
   async calculateUserPnl(userId: string, eventId: string) {
+    // CRITICAL: Only include WON and LOST bets
+    // CANCELLED bets affect wallet (refund) but do NOT affect PnL
     const bets = await this.prisma.bet.findMany({
       where: {
         userId,
         eventId,
         status: {
-          in: [BetStatus.WON, BetStatus.LOST],
+          in: [BetStatus.WON, BetStatus.LOST], // ONLY these - excludes CANCELLED
         },
       },
     });
@@ -55,27 +65,31 @@ export class PnlService {
         continue;
       }
 
-      const marketKey = marketType;
-      if (!pnlByMarket[marketKey]) {
-        pnlByMarket[marketKey] = { profit: 0, loss: 0 };
+      if (!pnlByMarket[marketType]) {
+        pnlByMarket[marketType] = { profit: 0, loss: 0 };
       }
 
-      if (bet.status === BetStatus.WON) {
-        // Profit = winAmount (what user gains)
-        // @ts-ignore - pnl field exists after database migration
-        const profit = bet.winAmount ?? bet.pnl ?? 0;
-        pnlByMarket[marketKey].profit += profit;
-      } else if (bet.status === BetStatus.LOST) {
-        // Loss = lossAmount (what user loses)
-        // @ts-ignore - pnl field exists after database migration
-        const loss = bet.lossAmount ?? Math.abs(bet.pnl) ?? 0;
-        pnlByMarket[marketKey].loss += loss;
+      // CRITICAL FIX: Use bet.pnl as SINGLE SOURCE OF TRUTH
+      // Settlement already wrote the final PnL value - we just aggregate it
+      // @ts-ignore - pnl field exists after database migration
+      const pnl = bet.pnl ?? 0;
+
+      // Aggregate based on sign of pnl
+      // Positive pnl = profit (user won)
+      // Negative pnl = loss (user lost)
+      if (pnl > 0) {
+        pnlByMarket[marketType].profit += pnl;
+      } else if (pnl < 0) {
+        pnlByMarket[marketType].loss += Math.abs(pnl);
       }
+      // pnl === 0 is ignored (shouldn't happen, but safe to skip)
     }
 
     // Save per market
     for (const [marketTypeStr, { profit, loss }] of Object.entries(pnlByMarket)) {
       const marketType = marketTypeStr as MarketType;
+      // CRITICAL: Always compute netPnl from aggregated values
+      // Never trust stored math - always derive from profit - loss
       const netPnl = profit - loss;
 
       // @ts-ignore - userPnl property exists after Prisma client regeneration

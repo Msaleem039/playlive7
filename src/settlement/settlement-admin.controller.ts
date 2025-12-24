@@ -12,7 +12,7 @@ import {
   Optional,
   Delete,
 } from '@nestjs/common';
-import { IsNotEmpty, IsString, IsOptional, IsBoolean, IsNumber } from 'class-validator';
+import { IsNotEmpty, IsString, IsOptional, IsBoolean, IsNumber, IsArray } from 'class-validator';
 import { SettlementService } from './settlement.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
@@ -41,6 +41,11 @@ class SettleFancyDto {
   @IsOptional()
   @IsString()
   marketId?: string | null;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
 }
 
 class SettleMatchOddsDto {
@@ -55,6 +60,11 @@ class SettleMatchOddsDto {
   @IsNotEmpty()
   @IsString()
   winnerSelectionId: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
 }
 
 class SettleBookmakerDto {
@@ -69,10 +79,22 @@ class SettleBookmakerDto {
   @IsNotEmpty()
   @IsString()
   winnerSelectionId: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
 }
 
 class RollbackSettlementDto {
+  @IsString()
+  @IsNotEmpty()
   settlementId: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  betIds?: string[]; // Optional: rollback only specific bets. If not provided, rolls back all bets for the settlement
 }
 
 @Controller('admin/settlement')
@@ -100,6 +122,7 @@ export class SettlementAdminController {
       dto.isCancel,
       dto.marketId ?? null,
       user.id,
+      dto.betIds, // Pass optional betIds array
     );
   }
 
@@ -123,6 +146,7 @@ export class SettlementAdminController {
       dto.marketId,
       dto.winnerSelectionId,
       user.id,
+      dto.betIds, // Pass optional betIds array
     );
   }
 
@@ -139,6 +163,7 @@ export class SettlementAdminController {
       dto.marketId,
       dto.winnerSelectionId,
       user.id,
+      dto.betIds, // Pass optional betIds array
     );
   }
 
@@ -153,6 +178,7 @@ export class SettlementAdminController {
     return this.settlementService.rollbackSettlement(
       dto.settlementId,
       user.id,
+      dto.betIds, // Pass optional betIds array
     );
   }
 

@@ -240,43 +240,17 @@ export class BetsService {
     debug.remaining_credit = remaining_credit;
 
     // 3. REQUIRED AMOUNT CALCULATION
-    let required_amount = 0;
-
-    if (
-      ['match_odds', 'bookmatch', 'bookmaker'].includes(gtype.toLowerCase())
-    ) {
-      const previous_loss = await this.get_max_loss(
-        bet_name,
-        match_id,
-        normalizedSelectionId,
-        userId,
-      );
-      const new_loss = await this.calculateExposureWithNewBet(
-        userId,
-        match_id,
-        normalizedSelectionId,
-        bet_type,
-        normalizedBetRate,
-        normalizedBetValue,
-        gtype,
-        bet_name,
-      );
-      const additional_exposure = new_loss - previous_loss;
-
-      required_amount = additional_exposure > 0 ? additional_exposure : 0;
-
-      debug.previous_possible_loss = previous_loss;
-      debug.new_possible_loss = new_loss;
-      debug.additional_exposure = additional_exposure;
-    } else {
-      required_amount = normalizedLossAmount;
-    }
+    // BETFAIR STANDARD:
+    // Every BACK bet locks full stake as liability
+    // No netting unless opposite selections (not implemented yet)
+    const required_amount = normalizedLossAmount;
 
     debug.required_amount_to_place_bet = required_amount;
 
     // ✅ Validate remaining credit is sufficient for the bet
     // Use wallet.liability as single source of truth (not recalculating from bets)
-    if (normalizedLossAmount > remaining_credit) {
+    // Always validate against what you actually deduct
+    if (required_amount > remaining_credit) {
       throw new HttpException(
         {
           success: false,
@@ -300,123 +274,123 @@ export class BetsService {
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}`);
     
     try {
-      const result = await this.prisma.$transaction(async (tx) => {
-        // Step 1: Ensure match exists (update with eventId if provided)
-        await tx.match.upsert({
-          where: { id: String(match_id) },
-          update: {
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-          create: {
-            id: String(match_id),
-            homeTeam: bet_name ?? 'Unknown',
-            awayTeam: market_name ?? 'Unknown',
-            startTime: new Date(),
-            status: MatchStatus.LIVE,
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-        });
-
-        // Step 2: Deduct balance and lock liability (if required)
-        // CREDIT FLOW ONLY: This is pure accounting - no profit/loss calculation
-        // Balance = free credit, Liability = locked exposure
-        // Total Credit = Balance + Liability
-        // Profit/Loss distribution happens ONLY during settlement (via HierarchyPnlService)
-        if (required_amount > 0) {
-          // Get current wallet state within transaction (ensure it exists)
-          const currentWallet = await tx.wallet.upsert({
-            where: { userId },
-            update: {},
+      // CRITICAL FIX: Add transaction timeout to prevent "Transaction not found" errors
+      // This is especially important with pooled connections (Neon, etc.)
+      const result = await this.prisma.$transaction(
+        async (tx) => {
+          // Step 1: Ensure match exists (update with eventId if provided)
+          await tx.match.upsert({
+            where: { id: String(match_id) },
+            update: {
+              ...(eventId && { eventId }),
+              ...(marketId && { marketId }),
+            },
             create: {
-              userId,
-              balance: 0,
-              liability: 0,
+              id: String(match_id),
+              homeTeam: bet_name ?? 'Unknown',
+              awayTeam: market_name ?? 'Unknown',
+              startTime: new Date(),
+              status: MatchStatus.LIVE,
+              ...(eventId && { eventId }),
+              ...(marketId && { marketId }),
             },
           });
 
-          // ✅ Check remaining credit (balance) is sufficient
-          // Remaining credit = total_credit - liability = balance
-          const current_remaining = currentWallet.balance;
-          
-          if (current_remaining < required_amount) {
-            throw new HttpException(
-              {
-                success: false,
-                error: 'Insufficient available balance to lock liability.',
-                code: 'INSUFFICIENT_FUNDS',
-                debug: {
-                  balance: currentWallet.balance,
-                  liability: currentWallet.liability,
-                  total_credit: currentWallet.balance + currentWallet.liability,
-                  remaining_credit: current_remaining,
-                  required_amount: required_amount,
-                },
+          // Step 2: Deduct balance and lock liability (if required)
+          // CREDIT FLOW ONLY: This is pure accounting - no profit/loss calculation
+          // Balance = free credit, Liability = locked exposure
+          // Total Credit = Balance + Liability
+          // Profit/Loss distribution happens ONLY during settlement (via HierarchyPnlService)
+          if (required_amount > 0) {
+            // Get current wallet state within transaction (ensure it exists)
+            const currentWallet = await tx.wallet.upsert({
+              where: { userId },
+              update: {},
+              create: {
+                userId,
+                balance: 0,
+                liability: 0,
               },
-              400,
-            );
+            });
+
+            // ✅ Check remaining credit (balance) is sufficient
+            // Remaining credit = total_credit - liability = balance
+            const current_remaining = currentWallet.balance;
+            
+            if (current_remaining < required_amount) {
+              // CRITICAL FIX: Use Error instead of HttpException inside transaction
+              // HttpException can cause transaction issues with pooled connections
+              throw new Error(
+                `Insufficient available balance to lock liability. ` +
+                `Balance: ${currentWallet.balance}, Liability: ${currentWallet.liability}, ` +
+                `Required: ${required_amount}, Remaining: ${current_remaining}`,
+              );
+            }
+
+            // Lock liability: move credit from balance to liability
+            // This is NOT profit/loss - it's just locking credit for potential exposure
+            await tx.wallet.update({
+              where: { userId },
+              data: {
+                balance: { decrement: required_amount },
+                liability: { increment: required_amount },
+              },
+            });
+
+            // Create transaction record
+            await tx.transaction.create({
+              data: {
+                walletId: currentWallet.id,
+                amount: required_amount,
+                type: TransactionType.BET_PLACED,
+                description: `Liability locked for ${bet_name}`,
+              },
+            });
+
+            debug.wallet_debited = required_amount;
           }
 
-          // Lock liability: move credit from balance to liability
-          // This is NOT profit/loss - it's just locking credit for potential exposure
-          await tx.wallet.update({
-            where: { userId },
-            data: {
-              balance: { decrement: required_amount },
-              liability: { increment: required_amount },
-            },
+          // Step 3: Create the bet
+          // Build bet data object with conditional selId to handle Prisma client type issues
+          const betData: any = {
+            userId: userId,
+            matchId: String(match_id),
+            amount: normalizedBetValue,
+            odds: normalizedBetRate,
+            selectionId: normalizedSelectionId,
+            betType: bet_type,
+            betName: bet_name,
+            marketName: market_name,
+            marketType: market_type,
+            betValue: normalizedBetValue,
+            betRate: normalizedBetRate,
+            winAmount: normalizedWinAmount,
+            lossAmount: required_amount,
+            gtype,
+            settlementId: settlement_id,
+            toReturn: to_return,
+            status: BetStatus.PENDING,
+            ...(marketId && { marketId }),
+            ...(eventId && { eventId }),
+            metadata: runner_name_2 ? { runner_name_2 } : undefined,
+          };
+
+          // Add selId if it exists in the schema (handles Prisma client version differences)
+          if (selid) {
+            betData.selId = selid;
+          }
+
+          const bet = await tx.bet.create({
+            data: betData,
           });
 
-          // Create transaction record
-          await tx.transaction.create({
-            data: {
-              walletId: currentWallet.id,
-              amount: required_amount,
-              type: TransactionType.BET_PLACED,
-              description: `Liability locked for ${bet_name}`,
-            },
-          });
-
-          debug.wallet_debited = required_amount;
-        }
-
-        // Step 3: Create the bet
-        // Build bet data object with conditional selId to handle Prisma client type issues
-        const betData: any = {
-          userId: userId,
-          matchId: String(match_id),
-          amount: normalizedBetValue,
-          odds: normalizedBetRate,
-          selectionId: normalizedSelectionId,
-          betType: bet_type,
-          betName: bet_name,
-          marketName: market_name,
-          marketType: market_type,
-          betValue: normalizedBetValue,
-          betRate: normalizedBetRate,
-          winAmount: normalizedWinAmount,
-          lossAmount: required_amount,
-          gtype,
-          settlementId: settlement_id,
-          toReturn: to_return,
-          status: BetStatus.PENDING,
-          ...(marketId && { marketId }),
-          ...(eventId && { eventId }),
-          metadata: runner_name_2 ? { runner_name_2 } : undefined,
-        };
-
-        // Add selId if it exists in the schema (handles Prisma client version differences)
-        if (selid) {
-          betData.selId = selid;
-        }
-
-        const bet = await tx.bet.create({
-          data: betData,
-        });
-
-        return { betId: bet.id };
-      });
+          return { betId: bet.id };
+        },
+        {
+          maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)
+          timeout: 20000, // Maximum time the transaction can run (20 seconds)
+        },
+      );
 
       debug.bet_id = result.betId;
 
@@ -469,11 +443,55 @@ export class BetsService {
         throw error;
       }
 
+      // Handle transaction errors specifically
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isTransactionError = 
+        errorMessage.includes('Transaction not found') ||
+        errorMessage.includes('Transaction') ||
+        errorMessage.includes('P2034') || // Prisma transaction timeout error code
+        errorMessage.includes('P2035');   // Prisma transaction error code
+
+      if (isTransactionError) {
+        this.logger.error(
+          `Transaction error placing bet for user ${userId}. This may be due to connection timeout or pool exhaustion.`,
+          error instanceof Error ? error.stack : undefined,
+        );
+        throw new HttpException(
+          {
+            success: false,
+            error: 'Transaction failed. Please try again. If the issue persists, the database connection may be experiencing issues.',
+            code: 'TRANSACTION_ERROR',
+            debug: {
+              ...debug,
+              error_details: errorMessage,
+              suggestion: 'Retry the bet placement. If it continues to fail, check database connection health.',
+            },
+          },
+          HttpStatus.INTERNAL_SERVER_ERROR,
+        );
+      }
+
+      // Handle insufficient funds error (thrown from transaction)
+      if (errorMessage.includes('Insufficient available balance')) {
+        throw new HttpException(
+          {
+            success: false,
+            error: 'Insufficient available balance to lock liability.',
+            code: 'INSUFFICIENT_FUNDS',
+            debug: {
+              ...debug,
+              error_details: errorMessage,
+            },
+          },
+          400,
+        );
+      }
+
       // For other errors, wrap in a proper error response
       throw new HttpException(
         {
           success: false,
-          error: error instanceof Error ? error.message : 'Failed to place bet',
+          error: errorMessage,
           code: 'BET_PLACEMENT_FAILED',
           debug: {
             ...debug,
@@ -491,40 +509,29 @@ export class BetsService {
     type: 'debit' | 'credit',
     description: string,
   ) {
-    return this.prisma.$transaction(async (tx) => {
-      const user = await tx.user.findUnique({ where: { id: userId } });
-      if (!user) {
-        throw new HttpException(
-          {
-            success: false,
-            error: 'User not found.',
-            code: 'USER_NOT_FOUND',
-          },
-          400,
-        );
-      }
-
-      let wallet = await tx.wallet.findUnique({ where: { userId } });
-      if (!wallet) {
-        wallet = await tx.wallet.create({
-          data: { userId, balance: 0, liability: 0 },
-        });
-      }
-
-      if (type === 'debit') {
-        if (wallet.balance < amount) {
-          throw new HttpException(
-            {
-              success: false,
-              error: 'Insufficient wallet balance to lock liability.',
-              code: 'INSUFFICIENT_FUNDS',
-              balance: wallet.balance,
-              liability: wallet.liability,
-              required_amount: amount,
-            },
-            400,
-          );
+    // CRITICAL FIX: Add transaction timeout to prevent "Transaction not found" errors
+    return this.prisma.$transaction(
+      async (tx) => {
+        const user = await tx.user.findUnique({ where: { id: userId } });
+        if (!user) {
+          // Use Error instead of HttpException inside transaction
+          throw new Error(`User not found: ${userId}`);
         }
+
+        let wallet = await tx.wallet.findUnique({ where: { userId } });
+        if (!wallet) {
+          wallet = await tx.wallet.create({
+            data: { userId, balance: 0, liability: 0 },
+          });
+        }
+
+        if (type === 'debit') {
+          if (wallet.balance < amount) {
+            // Use Error instead of HttpException inside transaction
+            throw new Error(
+              `Insufficient wallet balance. Balance: ${wallet.balance}, Required: ${amount}`,
+            );
+          }
 
         await tx.wallet.update({
           where: { userId },
@@ -550,18 +557,23 @@ export class BetsService {
         });
       }
 
-      await tx.transaction.create({
-        data: {
-          walletId: wallet.id,
-          amount,
-          type:
-            type === 'debit'
-              ? TransactionType.BET_PLACED
-              : TransactionType.BET_WON,
-          description,
-        },
-      });
-    });
+        await tx.transaction.create({
+          data: {
+            walletId: wallet.id,
+            amount,
+            type:
+              type === 'debit'
+                ? TransactionType.BET_PLACED
+                : TransactionType.BET_WON,
+            description,
+          },
+        });
+      },
+      {
+        maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)
+        timeout: 20000, // Maximum time the transaction can run (20 seconds)
+      },
+    );
   }
 
   private async ensureMatchExists(

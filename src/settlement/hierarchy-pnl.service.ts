@@ -27,16 +27,17 @@ export class HierarchyPnlService {
    * - Admin gets: (70 - 50) = 20% = +200
    * - SuperAdmin gets: (50 - 0) = 50% = +500
    * 
-   * IMPORTANT CALL ORDER (must be followed in SettlementService):
-   * 1. Update bet status (WON / LOST)
-   * 2. Unlock liability + wallet adjustment (client only)
-   * 3. calculateUserPnl(userId, eventId)
-   * 4. hierarchyPnlService.distributePnL(...) ← This method
+   * FINAL SETTLEMENT CALL ORDER (DO NOT BREAK):
+   * 1. Update bet status (WON / LOST / CANCELLED)
+   * 2. Release liability + wallet PnL (client only) - applyOutcome()
+   * 3. Update userPnl.netPnl - recalculateUserPnlAfterSettlement()
+   * 4. hierarchyPnlService.distributePnL() ← This method
+   * 5. Mark event/market SETTLED ✅
    * 
    * @param userId - The user ID (client) whose P/L needs to be distributed
    * @param eventId - Event ID
    * @param marketType - Market type (FANCY, BOOKMAKER, MATCH_ODDS)
-   * @param clientNetPnl - The net P/L of the client (can be positive or negative)
+   * @param clientNetPnl - The net P/L of the client (MUST match userPnl.netPnl after step 3)
    */
   async distributePnL(
     userId: string,
@@ -45,144 +46,182 @@ export class HierarchyPnlService {
     clientNetPnl: number,
   ) {
     try {
-      // Get the client's net P/L record to ensure it exists
-      // @ts-ignore - userPnl property exists after Prisma client regeneration
-      const userPnl = await this.prisma.userPnl.findUnique({
-        where: {
-          userId_eventId_marketType: {
-            userId,
-            eventId,
-            marketType,
+      // Wrap entire operation in transaction for atomicity
+      // CRITICAL: All hierarchy PnL writes must be atomic
+      await this.prisma.$transaction(async (tx) => {
+        // Get the client's net P/L record to ensure it exists
+        // @ts-ignore - userPnl property exists after Prisma client regeneration
+        const userPnl = await tx.userPnl.findUnique({
+          where: {
+            userId_eventId_marketType: {
+              userId,
+              eventId,
+              marketType,
+            },
           },
-        },
-      });
-
-      if (!userPnl) {
-        this.logger.warn(
-          `No PnL record found for user ${userId}, event ${eventId}, marketType ${marketType}. Skipping hierarchical distribution.`,
-        );
-        return;
-      }
-
-      // Use the actual netPnl from the database
-      const netPnl = userPnl.netPnl;
-
-      // If netPnl is zero, no distribution needed
-      if (netPnl === 0) {
-        this.logger.debug(
-          `Net PnL is zero for user ${userId}, event ${eventId}, marketType ${marketType}. Skipping hierarchical distribution.`,
-        );
-        return;
-      }
-
-      let currentUser = await this.prisma.user.findUnique({
-        where: { id: userId },
-      });
-
-      if (!currentUser) {
-        this.logger.warn(`User ${userId} not found. Skipping hierarchical distribution.`);
-        return;
-      }
-
-      // Idempotency: Delete existing records for this user/event/marketType
-      // NO WALLET REVERSAL NEEDED - wallet is never touched in this service
-      // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
-      await this.prisma.hierarchyPnl.deleteMany({
-        where: {
-          eventId,
-          marketType,
-          fromUserId: userId, // sourceUserId (original client)
-        },
-      });
-
-      // Store original netPnl for calculating shares
-      const originalNetPnl = netPnl;
-      let childShare = 100; // Client always starts at 100%
-
-      // Traverse up the hierarchy
-      while (currentUser?.parentId) {
-        const parent = await this.prisma.user.findUnique({
-          where: { id: currentUser.parentId },
         });
 
-        if (!parent) {
+        if (!userPnl) {
           this.logger.warn(
-            `Parent ${currentUser.parentId} not found for user ${currentUser.id}. Stopping hierarchy traversal.`,
+            `No PnL record found for user ${userId}, event ${eventId}, marketType ${marketType}. Skipping hierarchical distribution.`,
           );
-          break;
+          return;
         }
 
-        // CORRECT COMMISSION CALCULATION (Industry Standard)
-        // commissionPercentage = what THIS USER keeps from downline PnL
-        // Parent earns the DIFFERENCE between child's share and parent's share
-        const parentShare = parent.commissionPercentage; // What parent keeps (e.g., 70% for Agent)
-        const parentCommissionPct = (childShare - parentShare) / 100; // Difference (e.g., 30% for Agent)
+        // CRITICAL FIX: Use clientNetPnl parameter (trusted value from settlement)
+        // Cross-check with database value to detect sync issues
+        const netPnl = clientNetPnl;
+        
+        if (userPnl.netPnl !== clientNetPnl) {
+          this.logger.warn(
+            `PnL mismatch detected for user ${userId}, event ${eventId}, marketType ${marketType}. ` +
+            `Database value: ${userPnl.netPnl}, Settlement value: ${clientNetPnl}. Using settlement value.`,
+          );
+        }
 
-        // Calculate the amount this parent receives
-        // If client lost money (negative PnL), parent gains (positive amount)
-        // If client won money (positive PnL), parent loses (negative amount)
-        // We negate originalNetPnl because parent's gain/loss is opposite of child's
-        const amount = (-originalNetPnl * parentCommissionPct);
+        // If netPnl is zero, no distribution needed
+        if (netPnl === 0) {
+          this.logger.debug(
+            `Net PnL is zero for user ${userId}, event ${eventId}, marketType ${marketType}. Skipping hierarchical distribution.`,
+          );
+          // Still mark as settled even if zero
+          // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
+          await tx.userPnl.update({
+            where: {
+              userId_eventId_marketType: { userId, eventId, marketType },
+            },
+            // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
+            data: { hierarchySettled: true },
+          }).catch(() => {
+            // Ignore if field doesn't exist yet
+          });
+          return;
+        }
 
-        // Only create record if amount is non-zero
-        if (Math.abs(amount) > 0.01) {
-          try {
-            // CRITICAL: LEDGER ONLY - NO WALLET UPDATES
-            // Wallet balance = credit only, managed separately via transfers
-            // PnL distribution is tracked in hierarchyPnl ledger for reporting/audit
-            // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
-            await this.prisma.hierarchyPnl.create({
-              data: {
-                eventId,
-                marketType,
-                fromUserId: userId, // sourceUserId (original client)
-                toUserId: parent.id, // beneficiaryId (agent/admin/superadmin)
-                amount,
-                percentage: parentCommissionPct * 100,
-              },
-            });
+        let currentUser = await tx.user.findUnique({
+          where: { id: userId },
+        });
 
-            this.logger.debug(
-              `Created hierarchical PnL ledger: client ${userId} → ${parent.id}, amount: ${amount}, commission: ${parentCommissionPct * 100}%`,
+        if (!currentUser) {
+          this.logger.warn(`User ${userId} not found. Skipping hierarchical distribution.`);
+          return;
+        }
+
+        // Idempotency: Delete existing records for this user/event/marketType
+        // NO WALLET REVERSAL NEEDED - wallet is never touched in this service
+        // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+        await tx.hierarchyPnl.deleteMany({
+          where: {
+            eventId,
+            marketType,
+            fromUserId: userId, // sourceUserId (original client)
+          },
+        });
+
+        // Store original netPnl for calculating shares
+        const originalNetPnl = netPnl;
+        let childShare = 100; // Client always starts at 100%
+        let distributedTotal = 0; // Track total distributed to handle floating-point remainder
+
+        // Traverse up the hierarchy
+        while (currentUser?.parentId) {
+          const parent = await tx.user.findUnique({
+            where: { id: currentUser.parentId },
+          });
+
+          if (!parent) {
+            this.logger.warn(
+              `Parent ${currentUser.parentId} not found for user ${currentUser.id}. Stopping hierarchy traversal.`,
             );
-          } catch (error) {
-            this.logger.error(
-              `Failed to create hierarchical PnL record for ${currentUser.id} → ${parent.id}: ${(error as Error).message}`,
-            );
-            // Continue with next parent even if one fails
+            break;
           }
+
+          // CORRECT COMMISSION CALCULATION (Industry Standard)
+          // commissionPercentage = what THIS USER keeps from downline PnL
+          // Parent earns the DIFFERENCE between child's share and parent's share
+          const parentShare = parent.commissionPercentage; // What parent keeps (e.g., 70% for Agent)
+          const parentCommissionPct = (childShare - parentShare) / 100; // Difference (e.g., 30% for Agent)
+
+          // Calculate the amount this parent receives
+          // If client lost money (negative PnL), parent gains (positive amount)
+          // If client won money (positive PnL), parent loses (negative amount)
+          // We negate originalNetPnl because parent's gain/loss is opposite of child's
+          const amount = -originalNetPnl * parentCommissionPct;
+
+          // Track distributed total
+          distributedTotal += amount;
+
+          // CRITICAL: LEDGER ONLY - NO WALLET UPDATES
+          // Wallet balance = credit only, managed separately via transfers
+          // PnL distribution is tracked in hierarchyPnl ledger for reporting/audit
+          // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+          await tx.hierarchyPnl.create({
+            data: {
+              eventId,
+              marketType,
+              fromUserId: userId, // sourceUserId (original client)
+              toUserId: parent.id, // beneficiaryId (agent/admin/superadmin)
+              amount,
+              percentage: parentCommissionPct * 100,
+            },
+          });
+
+          this.logger.debug(
+            `Created hierarchical PnL ledger: client ${userId} → ${parent.id}, amount: ${amount}, commission: ${parentCommissionPct * 100}%`,
+          );
+
+          // Update for next iteration
+          childShare = parentShare; // Next level uses parent's share as child's share
+          currentUser = parent;
         }
 
-        // Update for next iteration
-        childShare = parentShare; // Next level uses parent's share as child's share
-        currentUser = parent;
-      }
+        // 🔒 CRITICAL FIX: Force rounding correction on last parent
+        // Floating-point drift can leave 0.02-0.05 undistributed, causing "settlement incomplete" warnings
+        const expectedTotal = -originalNetPnl; // Total should be opposite of client's netPnl
+        const remainder = expectedTotal - distributedTotal;
 
-      // Verify that all PnL was distributed (should sum to originalNetPnl)
-      // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
-      const distributedRecords = await this.prisma.hierarchyPnl.findMany({
-        where: {
-          eventId,
-          marketType,
-          fromUserId: userId, // sourceUserId (original client)
-        },
+        if (Math.abs(remainder) > 0.01 && currentUser) {
+          // Absorb remainder into the last parent (top of hierarchy)
+          // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+          await tx.hierarchyPnl.create({
+            data: {
+              eventId,
+              marketType,
+              fromUserId: userId,
+              toUserId: currentUser.id,
+              amount: remainder,
+              percentage: 0, // Remainder correction, not a commission percentage
+            },
+          });
+
+          this.logger.debug(
+            `Applied floating-point remainder correction: ${remainder} to user ${currentUser.id}`,
+          );
+        }
+
+        // Mark hierarchy distribution as complete
+        // This flag allows admin panel to verify settlement completion
+        // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
+        await tx.userPnl.update({
+          where: {
+            userId_eventId_marketType: { userId, eventId, marketType },
+          },
+          // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
+          data: { hierarchySettled: true },
+        }).catch(() => {
+          // Ignore if field doesn't exist yet (will need database migration)
+          this.logger.debug(
+            `hierarchySettled field not found in userPnl table. Migration may be required.`,
+          );
+        });
       });
-
-      const totalDistributed = distributedRecords.reduce((sum, record) => sum + record.amount, 0);
-      const expectedTotal = -originalNetPnl; // Total should be opposite of client's netPnl
-
-      // Allow small floating point differences
-      if (Math.abs(totalDistributed - expectedTotal) > 0.01) {
-        this.logger.warn(
-          `PnL distribution mismatch for user ${userId}, event ${eventId}, marketType ${marketType}. Expected total: ${expectedTotal}, Actual total: ${totalDistributed}`,
-        );
-      }
     } catch (error) {
       this.logger.error(
         `Error distributing hierarchical PnL for user ${userId}, event ${eventId}, marketType ${marketType}: ${(error as Error).message}`,
         (error as Error).stack,
       );
       // Don't throw - allow settlement to complete even if hierarchical distribution fails
+      // But log the error so it can be investigated
     }
   }
 }

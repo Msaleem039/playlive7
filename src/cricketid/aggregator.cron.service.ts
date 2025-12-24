@@ -3,6 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { AggregatorService } from './aggregator.service';
+import { CricketIdService } from './cricketid.service';
 
 @Injectable()
 export class AggregatorCronService {
@@ -13,6 +14,7 @@ export class AggregatorCronService {
   constructor(
     private readonly aggregatorService: AggregatorService,
     private readonly http: HttpService,
+    private readonly cricketIdService: CricketIdService, // Inject service directly instead of HTTP calls
   ) {}
 
   @Cron('*/2 * * * * *') // Every 2 seconds (within 2-3 second range)
@@ -46,26 +48,32 @@ export class AggregatorCronService {
         return;
       }
 
-      // Fetch bookmaker fancy and odds for all active matches in parallel via internal endpoints
+      // Fetch bookmaker fancy and odds for all active matches in parallel
+      // OPTIMIZED: Call service directly instead of HTTP (same endpoint, better performance)
+      // Response is filtered to only include: "Normal", "MATCH_ODDS", "Bookmaker", "TIED_MATCH"
       const fetchPromises = activeMatches.flatMap((match) => [
-        firstValueFrom(
-          this.http.get(`${this.internalBaseUrl}/cricketid/bookmaker-fancy`, {
-            params: { eventId: match.eventId },
-          }),
-        ).then(
-          (response) => ({
-            type: 'fancy' as const,
-            eventId: match.eventId,
-            success: true,
-            data: response.data,
-          }),
-          (error: any) => ({
+        // Call service directly (same as /cricketid/bookmaker-fancy endpoint)
+        this.cricketIdService.getBookmakerFancy(match.eventId)
+          .then((response) => {
+            // Response structure: { success, msg, status, data: [...] }
+            // data array contains only filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH
+            const responseData = response?.data || [];
+            const marketCount = Array.isArray(responseData) ? responseData.length : 0;
+            
+            return {
+              type: 'fancy' as const,
+              eventId: match.eventId,
+              success: true,
+              data: responseData,
+              marketCount, // Number of filtered markets returned
+            };
+          })
+          .catch((error: any) => ({
             type: 'fancy' as const,
             eventId: match.eventId,
             success: false,
-            error: error?.response?.data?.message || error?.message || String(error),
-          }),
-        ),
+            error: error?.message || String(error),
+          })),
         firstValueFrom(
           this.http.get(`${this.internalBaseUrl}/cricketid/odds`, {
             params: { marketIds: match.marketIds },
@@ -92,7 +100,10 @@ export class AggregatorCronService {
       results.forEach((result) => {
         if (result.success) {
           if (result.type === 'fancy') {
-            this.logger.debug(`Successfully fetched bookmaker fancy for eventId ${result.eventId}`);
+            const marketCount = 'marketCount' in result ? result.marketCount : 'unknown';
+            this.logger.debug(
+              `Successfully fetched bookmaker fancy for eventId ${result.eventId} (${marketCount} filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH)`,
+            );
           } else if (result.type === 'odds') {
             this.logger.debug(`Successfully fetched odds for marketIds ${result.marketIds}`);
           }
@@ -128,24 +139,30 @@ export class AggregatorCronService {
         return;
       }
 
-      // Fetch bookmaker fancy for all active matches in parallel via internal endpoint
+      // Fetch bookmaker fancy for all active matches in parallel
+      // OPTIMIZED: Call service directly instead of HTTP (same endpoint, better performance)
+      // Response is filtered to only include: "Normal", "MATCH_ODDS", "Bookmaker", "TIED_MATCH"
       const fetchPromises = activeMatches.map((match) =>
-        firstValueFrom(
-          this.http.get(`${this.internalBaseUrl}/cricketid/bookmaker-fancy`, {
-            params: { eventId: match.eventId },
-          }),
-        ).then(
-          (response) => ({
-            eventId: match.eventId,
-            success: true,
-            data: response.data,
-          }),
-          (error: any) => ({
+        // Call service directly (same as /cricketid/bookmaker-fancy endpoint)
+        this.cricketIdService.getBookmakerFancy(match.eventId)
+          .then((response) => {
+            // Response structure: { success, msg, status, data: [...] }
+            // data array contains only filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH
+            const responseData = response?.data || [];
+            const marketCount = Array.isArray(responseData) ? responseData.length : 0;
+            
+            return {
+              eventId: match.eventId,
+              success: true,
+              data: responseData,
+              marketCount, // Number of filtered markets returned
+            };
+          })
+          .catch((error: any) => ({
             eventId: match.eventId,
             success: false,
-            error: error?.response?.data?.message || error?.message || String(error),
-          }),
-        ),
+            error: error?.message || String(error),
+          })),
       );
 
       const results = await Promise.all(fetchPromises);
@@ -153,7 +170,10 @@ export class AggregatorCronService {
       // Log results
       results.forEach((result) => {
         if (result.success) {
-          this.logger.debug(`Successfully fetched bookmaker fancy for eventId ${result.eventId}`);
+          const marketCount = 'marketCount' in result ? result.marketCount : 'unknown';
+          this.logger.debug(
+            `Successfully fetched bookmaker fancy for eventId ${result.eventId} (${marketCount} filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH)`,
+          );
         } else {
           const errorMsg = 'error' in result ? result.error : 'Unknown error';
           this.logger.warn(`Failed to fetch bookmaker fancy for eventId ${result.eventId}: ${errorMsg}`);
