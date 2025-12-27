@@ -181,18 +181,20 @@ export class TransferService {
           create: { userId: initiator.id, balance: 0, liability: 0 },
         });
 
-        if (subordinateWallet.balance < balance) {
+        // ✅ Check available balance (balance already excludes locked liability)
+        // Available balance = balance (liability is already excluded from balance)
+        const availableBalance = subordinateWallet.balance;
+        
+        if (availableBalance < balance) {
           throw new BadRequestException(
-            'Subordinate has insufficient balance',
+            'Subordinate has insufficient available balance',
           );
         }
 
-        // ✅ Safety validation: Prevent withdrawal when user has active exposure
-        if (subordinateWallet.liability > 0) {
-          throw new BadRequestException(
-            'Cannot withdraw while user has active exposure (locked liability)',
-          );
-        }
+        // ✅ Allow withdrawal based on role hierarchy
+        // Withdrawal is allowed as long as there's sufficient available balance
+        // Liability represents locked exposure from pending bets, but doesn't prevent
+        // withdrawal of available balance by authorized roles (superadmin/admin/agent)
 
         // ✅ Deduct from subordinate (agent/client)
         const updatedSubordinateWallet = await tx.wallet.update({

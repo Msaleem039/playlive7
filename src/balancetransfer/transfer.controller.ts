@@ -26,6 +26,7 @@ export class BalanceTransferController {
 
   // 🔼 Top-up endpoint
   @Post('top-up/:targetUserId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
   async topUpBalance(
     @Param('targetUserId') targetUserId: string,
     @Body() dto: BalanceChangeDto,
@@ -41,6 +42,7 @@ export class BalanceTransferController {
 
   // 🔽 Top-down (withdraw) endpoint
   @Post('top-down/:targetUserId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
   async topDownBalance(
     @Param('targetUserId') targetUserId: string,
     @Body() dto: BalanceChangeDto,
