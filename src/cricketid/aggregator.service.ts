@@ -211,8 +211,18 @@ export class AggregatorService {
       }
 
       return matches;
-    } catch (error) {
-      this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
+    } catch (error: any) {
+      // Check if this is a 400 error (invalid/expired competitionId) - expected scenario
+      const status = error?.details?.status;
+      if (status === 400) {
+        // Log as debug/warn instead of error - these are expected when competitionIds are expired/invalid
+        this.logger.debug(
+          `CompetitionId ${competitionId} is invalid or expired (expected): ${error?.message || 'Invalid resource'}`,
+        );
+      } else {
+        // Log other errors (5xx, network errors, etc.) as errors
+        this.logger.error(`Error fetching matches for competitionId ${competitionId}:`, error);
+      }
       return []; // return empty array on error to continue
     }
   }
@@ -277,8 +287,18 @@ export class AggregatorService {
     try {
       const response = await this.fetch('/cricketid/markets', { eventId });
       return response;
-    } catch (error) {
-      this.logger.error(`Error fetching match detail for eventId ${eventId}:`, error);
+    } catch (error: any) {
+      // Check if this is a 400 error (invalid/expired eventId) - expected scenario
+      const status = error?.details?.status;
+      if (status === 400) {
+        // Log as debug instead of error - these are expected when eventIds are expired/invalid
+        this.logger.debug(
+          `EventId ${eventId} is invalid or expired (expected): ${error?.message || 'Invalid resource'}`,
+        );
+      } else {
+        // Log other errors (5xx, network errors, etc.) as errors
+        this.logger.error(`Error fetching match detail for eventId ${eventId}:`, error);
+      }
       throw error;
     }
   }
