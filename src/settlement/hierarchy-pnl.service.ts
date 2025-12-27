@@ -48,7 +48,9 @@ export class HierarchyPnlService {
     try {
       // Wrap entire operation in transaction for atomicity
       // CRITICAL: All hierarchy PnL writes must be atomic
-      await this.prisma.$transaction(async (tx) => {
+      // Add timeout to prevent long-running transactions from causing connection issues
+      await this.prisma.$transaction(
+        async (tx) => {
         // Get the client's net P/L record to ensure it exists
         // @ts-ignore - userPnl property exists after Prisma client regeneration
         const userPnl = await tx.userPnl.findUnique({
@@ -214,12 +216,34 @@ export class HierarchyPnlService {
             `hierarchySettled field not found in userPnl table. Migration may be required.`,
           );
         });
-      });
-    } catch (error) {
-      this.logger.error(
-        `Error distributing hierarchical PnL for user ${userId}, event ${eventId}, marketType ${marketType}: ${(error as Error).message}`,
-        (error as Error).stack,
+        },
+        {
+          maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)
+          timeout: 30000, // Maximum time the transaction can run (30 seconds)
+          isolationLevel: 'ReadCommitted', // Use ReadCommitted to reduce lock contention
+        },
       );
+    } catch (error) {
+      const errorMessage = (error as Error).message;
+      const isTransactionError = 
+        errorMessage.includes('Transaction not found') ||
+        errorMessage.includes('Transaction API error') ||
+        errorMessage.includes('transaction') ||
+        errorMessage.includes('P2034'); // Prisma transaction timeout error code
+
+      if (isTransactionError) {
+        this.logger.error(
+          `Transaction error distributing hierarchical PnL for user ${userId}, event ${eventId}, marketType ${marketType}: ${errorMessage}`,
+          (error as Error).stack,
+        );
+        // For transaction errors, we should retry once as they might be transient
+        // But for now, just log and continue - settlement can complete without hierarchical PnL
+      } else {
+        this.logger.error(
+          `Error distributing hierarchical PnL for user ${userId}, event ${eventId}, marketType ${marketType}: ${errorMessage}`,
+          (error as Error).stack,
+        );
+      }
       // Don't throw - allow settlement to complete even if hierarchical distribution fails
       // But log the error so it can be investigated
     }

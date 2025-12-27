@@ -36,6 +36,10 @@ model User {
   sentTransfers     TransferTransaction[] @relation("SentTransfers")
   receivedTransfers TransferTransaction[] @relation("ReceivedTransfers")
 
+  // Performance indexes
+  @@index([parentId])
+  @@index([role])
+  @@index([parentId, role])
   @@map("users")
 }
 
@@ -70,6 +74,9 @@ model Match {
   // Relations
   bets Bet[]
 
+  // Performance indexes
+  @@index([eventId])
+  @@index([status])
   @@map("matches")
 }
 
@@ -106,6 +113,17 @@ model Bet {
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
 
+  // Performance indexes for frequently queried columns
+  @@index([userId])
+  @@index([userId, status])
+  @@index([eventId])
+  @@index([marketId])
+  @@index([settlementId])
+  @@index([status])
+  @@index([status, eventId])
+  @@index([status, settlementId])
+  @@index([createdAt])
+  @@index([userId, status, createdAt])
   @@map("bets")
 }
 
@@ -120,6 +138,10 @@ model Transaction {
   // Relations
   wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
 
+  // Performance indexes
+  @@index([walletId])
+  @@index([walletId, createdAt])
+  @@index([type])
   @@map("transactions")
 }
 
@@ -208,6 +230,12 @@ model Settlement {
   isRollback   Boolean    @default(false)
   createdAt    DateTime   @default(now())
 
+  // Performance indexes
+  @@index([eventId])
+  @@index([marketType])
+  @@index([isRollback])
+  @@index([createdAt])
+  @@index([eventId, marketType])
   @@map("settlements")
 }
 
@@ -229,6 +257,9 @@ model UserPnl {
   updatedAt  DateTime   @updatedAt
 
   @@unique([userId, eventId, marketType])
+  @@index([userId])
+  @@index([eventId])
+  @@index([userId, eventId])
   @@map("user_pnl")
 }
 
@@ -242,6 +273,10 @@ model HierarchyPnl {
   percentage Float
   createdAt  DateTime   @default(now())
 
+  // Performance indexes
+  @@index([eventId, marketType, fromUserId])
+  @@index([toUserId])
+  @@index([fromUserId])
   @@map("hierarchy_pnl")
 }
 
@@ -253,4 +288,15 @@ model MatchVisibility {
   updatedAt DateTime @updatedAt
 
   @@map("match_visibility")
+}
+
+model SiteVideo {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  videoUrl  String   @map("video_url")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("site_videos")
 }

@@ -61,6 +61,7 @@ export class BalanceTransferController {
 
   // 📊 Dashboard summary endpoint
   @Get('dashboard-summary')
+  @Roles(UserRole.AGENT, UserRole.ADMIN, UserRole.SUPER_ADMIN)
   async getDashboardSummary(@CurrentUser() currentUser: User) {
     return this.transferService.getDashboardSummary(currentUser);
   }

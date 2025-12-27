@@ -329,49 +329,48 @@ export class TransferService {
     }
 
     // ───────────────────────────────────────
-    // 3️⃣ CLIENT TOTAL PnL (SETTLED ONLY)
+    // 3️⃣-5️⃣ OPTIMIZED: Parallel fetch PnL, hierarchy PnL, and transfers
     // ───────────────────────────────────────
-    // Uses userPnl table which aggregates bet.pnl (settlement truth)
-    // @ts-ignore - userPnl property exists after Prisma client regeneration
-    const clientPnls = await this.prisma.userPnl.findMany({
-      where: {
-        userId: { in: subordinateIds },
-      },
-      select: { netPnl: true },
-    });
+    // OPTIMIZED: Fetch all independent queries in parallel
+    const [clientPnls, hierarchyPnls, transfers] = await Promise.all([
+      // Client TOTAL PnL (SETTLED ONLY)
+      // Uses userPnl table which aggregates bet.pnl (settlement truth)
+      // @ts-ignore - userPnl property exists after Prisma client regeneration
+      subordinateIds.length > 0
+        ? this.prisma.userPnl.findMany({
+            where: {
+              userId: { in: subordinateIds },
+            },
+            select: { netPnl: true },
+          })
+        : Promise.resolve<Array<{ netPnl: number }>>([]),
+      // ADMIN / AGENT NET PROFIT (HIERARCHY)
+      // Uses hierarchyPnl table which distributes client PnL up the chain
+      // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
+      this.prisma.hierarchyPnl.findMany({
+        where: {
+          toUserId: userId,
+        },
+        select: { amount: true },
+      }),
+      // CASH FLOW (NOT PROFIT)
+      // Transfers are cash movements, not profit calculations
+      // Commission is earned ONLY when bets are settled, not during transfers
+      this.prisma.transferLog.findMany({
+        where: {
+          OR: [{ fromUserId: userId }, { toUserId: userId }],
+        },
+        select: {
+          type: true,
+          amount: true,
+          fromUserId: true,
+          toUserId: true,
+        },
+      }),
+    ]);
 
     const totalClientPnl = clientPnls.reduce((sum, p) => sum + p.netPnl, 0);
-
-    // ───────────────────────────────────────
-    // 4️⃣ ADMIN / AGENT NET PROFIT (HIERARCHY)
-    // ───────────────────────────────────────
-    // Uses hierarchyPnl table which distributes client PnL up the chain
-    // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
-    const hierarchyPnls = await this.prisma.hierarchyPnl.findMany({
-      where: {
-        toUserId: userId,
-      },
-      select: { amount: true },
-    });
-
     const adminNetPnl = hierarchyPnls.reduce((sum, p) => sum + p.amount, 0);
-
-    // ───────────────────────────────────────
-    // 5️⃣ CASH FLOW (NOT PROFIT)
-    // ───────────────────────────────────────
-    // Transfers are cash movements, not profit calculations
-    // Commission is earned ONLY when bets are settled, not during transfers
-    const transfers = await this.prisma.transferLog.findMany({
-      where: {
-        OR: [{ fromUserId: userId }, { toUserId: userId }],
-      },
-      select: {
-        type: true,
-        amount: true,
-        fromUserId: true,
-        toUserId: true,
-      },
-    });
 
     const totalDeposit = transfers
       .filter((t) => t.type === TransferLogType.TOPUP && t.fromUserId === userId)

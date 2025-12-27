@@ -103,7 +103,7 @@ All endpoints require:
 
 **Description:** Manually settle fancy bets for a specific event and selection. This allows admins to manually settle fancy bets instead of waiting for automatic settlement.
 
-**Request Body:**
+**Request Body (Settle All Bets):**
 ```json
 {
   "eventId": "34917574",
@@ -111,6 +111,18 @@ All endpoints require:
   "decisionRun": 45,
   "isCancel": false,
   "marketId": "1.250049502"
+}
+```
+
+**Request Body (Settle Specific Bets):**
+```json
+{
+  "eventId": "34917574",
+  "selectionId": "15316",
+  "decisionRun": 45,
+  "isCancel": false,
+  "marketId": "1.250049502",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
 }
 ```
 
@@ -122,7 +134,7 @@ All endpoints require:
 - `marketId` (optional): Market ID from vendor API
 - `betIds` (optional, array of strings): Specific bet IDs to settle. If not provided, settles ALL pending bets for the market. Example: `["bet_id_1", "bet_id_2"]`
 
-**Example - Settle with Decision Run:**
+**Example - Settle All Bets with Decision Run:**
 ```json
 {
   "eventId": "34917574",
@@ -133,12 +145,34 @@ All endpoints require:
 }
 ```
 
-**Example - Cancel/Refund:**
+**Example - Settle Specific Bets with Decision Run:**
+```json
+{
+  "eventId": "34917574",
+  "selectionId": "15316",
+  "decisionRun": 45,
+  "isCancel": false,
+  "marketId": "1.250049502",
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
+}
+```
+
+**Example - Cancel/Refund All:**
 ```json
 {
   "eventId": "34917574",
   "selectionId": "15316",
   "isCancel": true
+}
+```
+
+**Example - Cancel/Refund Specific Bets:**
+```json
+{
+  "eventId": "34917574",
+  "selectionId": "15316",
+  "isCancel": true,
+  "betIds": ["cmjiq4ktk001hv3x4qiefklas", "cmjirfxnd002bv3x4jawqqf45"]
 }
 ```
 

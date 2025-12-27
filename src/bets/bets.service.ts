@@ -17,9 +17,22 @@ export class BetsService {
   // Replace these with actual TypeORM / Prisma / Sequelize calls
 
   async selectOneRow(table: string, idField: string, userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-    });
+    // OPTIMIZED: Parallel fetch user and wallet
+    const [user, wallet] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          isActive: true,
+        },
+      }),
+      this.prisma.wallet.findUnique({
+        where: { userId },
+        select: {
+          balance: true,
+        },
+      }),
+    ]);
 
     if (!user) {
       throw new HttpException(
@@ -31,15 +44,12 @@ export class BetsService {
         404,
       );
     }
-    const wallet = await this.prisma.wallet.findUnique({
-      where: { userId },
-    });
 
     // Return wallet balance as available credit (not profit/loss)
     // Balance represents usable credit from top-ups, not earnings
     return {
       fs_id: userId,
-      status: 1,
+      status: user.isActive ? 1 : 3,
       sports_exp: wallet?.balance ?? 0, // Available credit for betting
     };
   }

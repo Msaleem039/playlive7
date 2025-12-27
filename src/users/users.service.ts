@@ -196,28 +196,37 @@ export class UsersService {
   }
 
   async getWalletBalanceWithLiability(userId: string) {
-    const wallet = await this.prisma.wallet.findUnique({
-      where: { userId },
-    });
+    // OPTIMIZED: Parallel fetch wallet and liability calculation
+    const [wallet, liability] = await Promise.all([
+      this.prisma.wallet.findUnique({
+        where: { userId },
+        select: {
+          balance: true,
+          liability: true,
+        },
+      }),
+      this.prisma.bet.aggregate({
+        where: {
+          userId,
+          status: BetStatus.PENDING,
+        },
+        _sum: {
+          lossAmount: true,
+        },
+      }),
+    ]);
 
     if (!wallet) {
       throw new NotFoundException('Wallet not found for user');
     }
 
-    const liability = await this.prisma.bet.aggregate({
-      where: {
-        userId,
-        status: BetStatus.PENDING,
-      },
-      _sum: {
-        lossAmount: true,
-      },
-    });
+    // Use wallet.liability as single source of truth (already calculated and maintained)
+    const lockedLiability = wallet.liability ?? 0;
 
     return {
       balance: wallet.balance,
-      liability: liability._sum.lossAmount ?? 0,
-      availableBalance: wallet.balance - (liability._sum.lossAmount ?? 0),
+      liability: lockedLiability,
+      availableBalance: wallet.balance,
     };
   }
 }

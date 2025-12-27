@@ -112,38 +112,40 @@ export class SettlementService {
         userIds.add(bet.userId);
       }
 
-      // Recalculate P/L for all affected users
-      for (const userId of userIds) {
-        try {
-          await this.pnlService.recalculateUserPnlAfterSettlement(
-            userId,
-            eventId,
-          );
-          // Distribute hierarchical P/L for FANCY market
-          // @ts-ignore - userPnl property exists after Prisma client regeneration
-          const userPnl = await this.prisma.userPnl.findUnique({
-            where: {
-              userId_eventId_marketType: {
-                userId,
-                eventId,
-                marketType: MarketType.FANCY,
-              },
-            },
-          });
-          if (userPnl) {
-            await this.hierarchyPnlService.distributePnL(
+      // Recalculate P/L for all affected users in parallel (OPTIMIZED)
+      await Promise.all(
+        Array.from(userIds).map(async (userId) => {
+          try {
+            await this.pnlService.recalculateUserPnlAfterSettlement(
               userId,
               eventId,
-              MarketType.FANCY,
-              userPnl.netPnl,
+            );
+            // Distribute hierarchical P/L for FANCY market
+            // @ts-ignore - userPnl property exists after Prisma client regeneration
+            const userPnl = await this.prisma.userPnl.findUnique({
+              where: {
+                userId_eventId_marketType: {
+                  userId,
+                  eventId,
+                  marketType: MarketType.FANCY,
+                },
+              },
+            });
+            if (userPnl) {
+              await this.hierarchyPnlService.distributePnL(
+                userId,
+                eventId,
+                MarketType.FANCY,
+                userPnl.netPnl,
+              );
+            }
+          } catch (error) {
+            this.logger.warn(
+              `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
             );
           }
-      } catch (error) {
-          this.logger.warn(
-            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
-          );
-        }
-      }
+        }),
+      );
     }
   }
 
@@ -157,20 +159,6 @@ export class SettlementService {
     betIds?: string[], // Optional: settle only specific bets
   ) {
     const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
-
-    // Check if settlement already exists (prevent double settlement)
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    const existingSettlement = await this.prisma.settlement.findUnique({
-      where: { settlementId },
-    });
-
-    if (existingSettlement && !existingSettlement.isRollback) {
-      throw new BadRequestException(
-        `Settlement ${settlementId} already exists. ` +
-        `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
-        `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
-      );
-    }
 
     // Find bets with new format first
     let bets = await this.prisma.bet.findMany({
@@ -229,16 +217,57 @@ export class SettlementService {
     }
 
     if (bets.length === 0) {
+      // Check if settlement exists and all bets are already settled
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
+
+      if (existingSettlement && !existingSettlement.isRollback) {
+        // Check if there are any settled bets for this settlement
+        const settledBets = await this.prisma.bet.findMany({
+          where: {
+            settlementId,
+            status: {
+              in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+            },
+          },
+        });
+
+        if (settledBets.length > 0) {
+          throw new BadRequestException(
+            `Settlement ${settlementId} already exists and all bets are settled. ` +
+            `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+            `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
+          );
+        }
+      }
+
       return { success: true, message: 'No pending bets to settle' };
     }
 
-    // Create settlement record FIRST
+    // Check if settlement already exists (but allow re-settlement if there are pending bets)
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const existingSettlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
+    });
+
+    if (existingSettlement && !existingSettlement.isRollback) {
+      // Allow re-settlement if there are pending bets (some bets might have been missed)
+      this.logger.warn(
+        `Settlement ${settlementId} already exists, but ${bets.length} pending bets found. ` +
+        `Proceeding with re-settlement. Original settlement by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}`,
+      );
+    }
+
+    // Create settlement record FIRST (or update if exists)
     // @ts-ignore - settlement property exists after Prisma client regeneration
     await this.prisma.settlement.upsert({
       where: { settlementId },
       update: {
         isRollback: false,
         settledBy: adminId,
+        winnerId: isCancel ? null : (decisionRun?.toString() || null), // Update winner in case it changed
       },
       create: {
         settlementId,
@@ -287,38 +316,40 @@ export class SettlementService {
       userIds.add(bet.userId);
     }
 
-    // Recalculate P/L for all affected users
-    for (const userId of userIds) {
-      try {
-        await this.pnlService.recalculateUserPnlAfterSettlement(
-          userId,
-          eventId,
-        );
-        // Distribute hierarchical P/L for FANCY market
-        // @ts-ignore - userPnl property exists after Prisma client regeneration
-        const userPnl = await this.prisma.userPnl.findUnique({
-          where: {
-            userId_eventId_marketType: {
-              userId,
-              eventId,
-              marketType: MarketType.FANCY,
-            },
-          },
-        });
-        if (userPnl) {
-          await this.hierarchyPnlService.distributePnL(
+    // Recalculate P/L for all affected users in parallel (OPTIMIZED)
+    await Promise.all(
+      Array.from(userIds).map(async (userId) => {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
             userId,
             eventId,
-            MarketType.FANCY,
-            userPnl.netPnl,
+          );
+          // Distribute hierarchical P/L for FANCY market
+          // @ts-ignore - userPnl property exists after Prisma client regeneration
+          const userPnl = await this.prisma.userPnl.findUnique({
+            where: {
+              userId_eventId_marketType: {
+                userId,
+                eventId,
+                marketType: MarketType.FANCY,
+              },
+            },
+          });
+          if (userPnl) {
+            await this.hierarchyPnlService.distributePnL(
+              userId,
+              eventId,
+              MarketType.FANCY,
+              userPnl.netPnl,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
           );
         }
-      } catch (error) {
-        this.logger.warn(
-          `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
-        );
-      }
-    }
+      }),
+    );
 
     return { success: true, message: 'Fancy bets settled successfully' };
   }
@@ -331,20 +362,6 @@ export class SettlementService {
     betIds?: string[], // Optional: settle only specific bets
   ) {
     const settlementId = `CRICKET:BOOKMAKER:${eventId}:${marketId}`;
-
-    // Check if settlement already exists (prevent double settlement)
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    const existingSettlement = await this.prisma.settlement.findUnique({
-      where: { settlementId },
-    });
-
-    if (existingSettlement && !existingSettlement.isRollback) {
-      throw new BadRequestException(
-        `Settlement ${settlementId} already exists. ` +
-        `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
-        `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
-      );
-    }
 
     // Find bets with new format first
     let bets = await this.prisma.bet.findMany({
@@ -405,16 +422,57 @@ export class SettlementService {
     }
 
     if (bets.length === 0) {
+      // Check if settlement exists and all bets are already settled
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
+
+      if (existingSettlement && !existingSettlement.isRollback) {
+        // Check if there are any settled bets for this settlement
+        const settledBets = await this.prisma.bet.findMany({
+          where: {
+            settlementId,
+            status: {
+              in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+            },
+          },
+        });
+
+        if (settledBets.length > 0) {
+          throw new BadRequestException(
+            `Settlement ${settlementId} already exists and all bets are settled. ` +
+            `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+            `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
+          );
+        }
+      }
+
       return { success: true, message: 'No pending bets to settle' };
     }
 
-    // Create settlement record FIRST
+    // Check if settlement already exists (but allow re-settlement if there are pending bets)
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const existingSettlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
+    });
+
+    if (existingSettlement && !existingSettlement.isRollback) {
+      // Allow re-settlement if there are pending bets (some bets might have been missed)
+      this.logger.warn(
+        `Settlement ${settlementId} already exists, but ${bets.length} pending bets found. ` +
+        `Proceeding with re-settlement. Original settlement by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}`,
+      );
+    }
+
+    // Create settlement record FIRST (or update if exists)
     // @ts-ignore - settlement property exists after Prisma client regeneration
     await this.prisma.settlement.upsert({
       where: { settlementId },
       update: {
         isRollback: false,
         settledBy: adminId,
+        winnerId: winnerSelectionId, // Update winner in case it changed
       },
       create: {
         settlementId,
@@ -449,38 +507,40 @@ export class SettlementService {
       userIds.add(bet.userId);
     }
 
-    // Recalculate P/L for all affected users
-    for (const userId of userIds) {
-      try {
-        await this.pnlService.recalculateUserPnlAfterSettlement(
-          userId,
-          eventId,
-        );
-        // Distribute hierarchical P/L for BOOKMAKER market
-        // @ts-ignore - userPnl property exists after Prisma client regeneration
-        const userPnl = await this.prisma.userPnl.findUnique({
-          where: {
-            userId_eventId_marketType: {
-              userId,
-              eventId,
-              marketType: MarketType.BOOKMAKER,
-            },
-          },
-        });
-        if (userPnl) {
-          await this.hierarchyPnlService.distributePnL(
+    // Recalculate P/L for all affected users in parallel (OPTIMIZED)
+    await Promise.all(
+      Array.from(userIds).map(async (userId) => {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
             userId,
             eventId,
-            MarketType.BOOKMAKER,
-            userPnl.netPnl,
           );
-        }
+          // Distribute hierarchical P/L for BOOKMAKER market
+          // @ts-ignore - userPnl property exists after Prisma client regeneration
+          const userPnl = await this.prisma.userPnl.findUnique({
+            where: {
+              userId_eventId_marketType: {
+                userId,
+                eventId,
+                marketType: MarketType.BOOKMAKER,
+              },
+            },
+          });
+          if (userPnl) {
+            await this.hierarchyPnlService.distributePnL(
+              userId,
+              eventId,
+              MarketType.BOOKMAKER,
+              userPnl.netPnl,
+            );
+          }
         } catch (error) {
           this.logger.warn(
-          `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
-        );
-      }
-    }
+            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
+          );
+        }
+      }),
+    );
 
     return { success: true, message: 'Bookmaker bets settled successfully' };
   }
@@ -508,20 +568,6 @@ export class SettlementService {
       }
 
       const settlementId = `CRICKET:MATCHODDS:${eventId}:${marketId}`;
-
-      // Check if settlement already exists (prevent double settlement)
-      // @ts-ignore - settlement property exists after Prisma client regeneration
-      const existingSettlement = await this.prisma.settlement.findUnique({
-        where: { settlementId },
-      });
-
-      if (existingSettlement && !existingSettlement.isRollback) {
-        throw new BadRequestException(
-          `Settlement ${settlementId} already exists. ` +
-          `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
-          `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
-        );
-      }
 
       // Find bets with new format first
       let bets = await this.prisma.bet.findMany({
@@ -610,16 +656,57 @@ export class SettlementService {
     }
 
     if (bets.length === 0) {
+      // Check if settlement exists and all bets are already settled
+      // @ts-ignore - settlement property exists after Prisma client regeneration
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
+
+      if (existingSettlement && !existingSettlement.isRollback) {
+        // Check if there are any settled bets for this settlement
+        const settledBets = await this.prisma.bet.findMany({
+          where: {
+            settlementId,
+            status: {
+              in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+            },
+          },
+        });
+
+        if (settledBets.length > 0) {
+          throw new BadRequestException(
+            `Settlement ${settlementId} already exists and all bets are settled. ` +
+            `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+            `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
+          );
+        }
+      }
+
       return { success: true, message: 'No pending bets to settle' };
     }
 
-    // Create settlement record FIRST
+    // Check if settlement already exists (but allow re-settlement if there are pending bets)
+    // @ts-ignore - settlement property exists after Prisma client regeneration
+    const existingSettlement = await this.prisma.settlement.findUnique({
+      where: { settlementId },
+    });
+
+    if (existingSettlement && !existingSettlement.isRollback) {
+      // Allow re-settlement if there are pending bets (some bets might have been missed)
+      this.logger.warn(
+        `Settlement ${settlementId} already exists, but ${bets.length} pending bets found. ` +
+        `Proceeding with re-settlement. Original settlement by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}`,
+      );
+    }
+
+    // Create settlement record FIRST (or update if exists)
     // @ts-ignore - settlement property exists after Prisma client regeneration
     await this.prisma.settlement.upsert({
       where: { settlementId },
       update: {
         isRollback: false,
         settledBy: adminId,
+        winnerId: winnerSelectionId, // Update winner in case it changed
       },
       create: {
         settlementId,
@@ -654,38 +741,40 @@ export class SettlementService {
       userIds.add(bet.userId);
     }
 
-    // Recalculate P/L for all affected users
-    for (const userId of userIds) {
-      try {
-        await this.pnlService.recalculateUserPnlAfterSettlement(
-          userId,
-          eventId,
-        );
-        // Distribute hierarchical P/L for MATCH_ODDS market
-        // @ts-ignore - userPnl property exists after Prisma client regeneration
-        const userPnl = await this.prisma.userPnl.findUnique({
-          where: {
-            userId_eventId_marketType: {
-              userId,
-              eventId,
-              marketType: MarketType.MATCH_ODDS,
-            },
-          },
-        });
-        if (userPnl) {
-          await this.hierarchyPnlService.distributePnL(
+    // Recalculate P/L for all affected users in parallel (OPTIMIZED)
+    await Promise.all(
+      Array.from(userIds).map(async (userId) => {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
             userId,
             eventId,
-            MarketType.MATCH_ODDS,
-            userPnl.netPnl,
+          );
+          // Distribute hierarchical P/L for MATCH_ODDS market
+          // @ts-ignore - userPnl property exists after Prisma client regeneration
+          const userPnl = await this.prisma.userPnl.findUnique({
+            where: {
+              userId_eventId_marketType: {
+                userId,
+                eventId,
+                marketType: MarketType.MATCH_ODDS,
+              },
+            },
+          });
+          if (userPnl) {
+            await this.hierarchyPnlService.distributePnL(
+              userId,
+              eventId,
+              MarketType.MATCH_ODDS,
+              userPnl.netPnl,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
           );
         }
-      } catch (error) {
-        this.logger.warn(
-          `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
-        );
-      }
-    }
+      }),
+    );
 
     return { success: true, message: 'Match odds bets settled successfully' };
     } catch (error) {
@@ -707,16 +796,22 @@ export class SettlementService {
   }
 
   /**
-   * Apply settlement outcome to a bet (Betfair-standard)
+   * Apply settlement outcome to a bet
    * 
-   * BETFAIR GOLDEN RULE: Balance is temporary. Liability is truth.
+   * BUSINESS RULE:
+   * - Bet Placement: balance -= stake, liability += stake
+   * - Settlement:
+   *   - WIN: balance += stake (return stake), liability -= stake
+   *   - LOSS: balance += 0 (already deducted), liability -= stake
+   *   - CANCEL: balance += stake (return stake), liability -= stake
    * 
-   * EVERY bet MUST release liability exactly once.
+   * IMPORTANT: PnL is for reporting only, NOT for wallet movement.
+   * Wallet balance is updated based on STATUS, not pnl value.
    * 
    * On settlement (ALL cases: WIN / LOSS / CANCELLED):
    * 1. Release liability (ALWAYS decrement) - MOST IMPORTANT
-   * 2. Apply PnL to balance
-   * 3. Update bet status
+   * 2. Return stake to balance (WIN/CANCEL only, LOSS already deducted)
+   * 3. Update bet status and pnl (for reporting)
    * 
    * Liability must be released even if pnl = 0
    */
@@ -737,12 +832,15 @@ export class SettlementService {
         },
       });
 
-      // 2️⃣ APPLY PnL
-      if (outcome.pnl !== 0) {
+      // 2️⃣ APPLY WALLET BALANCE (NOT pnl)
+      // Return stake only on WIN or CANCEL
+      // LOSS: do nothing (stake already deducted at placement)
+      if (outcome.status === BetStatus.WON || outcome.status === BetStatus.CANCELLED) {
+        // RETURN STAKE ONLY
         await tx.wallet.update({
           where: { userId: bet.userId },
           data: {
-            balance: { increment: outcome.pnl },
+            balance: { increment: bet.lossAmount ?? 0 },
           },
         });
       }
@@ -898,19 +996,21 @@ export class SettlementService {
       }
     }
 
-      // Recalculate P/L for all affected users after rollback
-      for (const userId of userIds) {
-        try {
-          await this.pnlService.recalculateUserPnlAfterSettlement(
-            userId,
-            settlement.eventId,
-          );
-        } catch (error) {
-          this.logger.warn(
-            `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
-          );
-        }
-      }
+      // Recalculate P/L for all affected users after rollback in parallel (OPTIMIZED)
+      await Promise.all(
+        Array.from(userIds).map(async (userId) => {
+          try {
+            await this.pnlService.recalculateUserPnlAfterSettlement(
+              userId,
+              settlement.eventId,
+            );
+          } catch (error) {
+            this.logger.warn(
+              `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
+            );
+          }
+        }),
+      );
 
       this.logger.log(
         `Settlement ${settlementId} rolled back successfully. ${bets.length} bets reset to PENDING.`,
@@ -1064,13 +1164,34 @@ export class SettlementService {
    * Get pending bets for a user
    */
   async getUserPendingBets(userId: string) {
+    // OPTIMIZED: Use select instead of include
     const bets = await this.prisma.bet.findMany({
       where: {
         userId,
         status: BetStatus.PENDING,
       },
-      include: {
-        match: true,
+      select: {
+        id: true,
+        matchId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        settlementId: true,
+        createdAt: true,
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+            status: true,
+          },
+        },
       },
       orderBy: {
         createdAt: 'desc',
@@ -1095,6 +1216,7 @@ export class SettlementService {
       ? ([status] as BetStatus[])
       : [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED];
 
+    // OPTIMIZED: Use select instead of include
     const bets = await this.prisma.bet.findMany({
       where: {
         userId,
@@ -1102,8 +1224,30 @@ export class SettlementService {
           in: statusFilter,
         },
       },
-      include: {
-        match: true,
+      select: {
+        id: true,
+        matchId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        status: true,
+        pnl: true,
+        settledAt: true,
+        createdAt: true,
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+            status: true,
+          },
+        },
       },
       orderBy: {
         settledAt: 'desc',
@@ -1121,13 +1265,36 @@ export class SettlementService {
    * Get all bets for a user with optional status filter
    */
   async getUserBets(userId: string, status?: BetStatus) {
+    // OPTIMIZED: Use select instead of include
     const bets = await this.prisma.bet.findMany({
       where: {
         userId,
         ...(status && { status }),
       },
-      include: {
-        match: true,
+      select: {
+        id: true,
+        matchId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        status: true,
+        pnl: true,
+        settledAt: true,
+        createdAt: true,
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+            status: true,
+          },
+        },
       },
       orderBy: {
         createdAt: 'desc',
@@ -1243,13 +1410,34 @@ export class SettlementService {
   }
 
   async getPendingBetsByMatch() {
-    // Get all pending bets (don't filter by eventId - we'll handle nulls)
+    // OPTIMIZED: Use select instead of include to fetch only needed fields
     const pendingBets = await this.prisma.bet.findMany({
       where: {
         status: BetStatus.PENDING,
       },
-      include: {
-        match: true,
+      select: {
+        id: true,
+        matchId: true,
+        eventId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        gtype: true,
+        settlementId: true,
+        createdAt: true,
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+          },
+        },
       },
       orderBy: {
         createdAt: 'desc',
@@ -1503,15 +1691,26 @@ export class SettlementService {
       skip: filters?.offset || 0,
     });
 
-    // Get detailed information for each settlement
-    const settlementsWithDetails = await Promise.all(
-      settlements.map(async (settlement) => {
-        // Get all bets for this settlement
-        const bets = await this.prisma.bet.findMany({
+    // OPTIMIZED: Batch fetch all bets for all settlements in a single query
+    const settlementIds = settlements.map((s) => s.settlementId);
+    const allBets = settlementIds.length > 0
+      ? await this.prisma.bet.findMany({
           where: {
-            settlementId: settlement.settlementId,
+            settlementId: { in: settlementIds },
           },
-          include: {
+          select: {
+            id: true,
+            userId: true,
+            settlementId: true,
+            amount: true,
+            odds: true,
+            betType: true,
+            betName: true,
+            status: true,
+            pnl: true,
+            settledAt: true,
+            rollbackAt: true,
+            createdAt: true,
             user: {
               select: {
                 id: true,
@@ -1529,7 +1728,24 @@ export class SettlementService {
               },
             },
           },
-        });
+        })
+      : [];
+
+    // Group bets by settlementId for O(1) lookup
+    const betsBySettlementId = new Map<string, typeof allBets>();
+    for (const bet of allBets) {
+      if (bet.settlementId) {
+        if (!betsBySettlementId.has(bet.settlementId)) {
+          betsBySettlementId.set(bet.settlementId, []);
+        }
+        betsBySettlementId.get(bet.settlementId)!.push(bet);
+      }
+    }
+
+    // Get detailed information for each settlement (now using pre-fetched bets)
+    const settlementsWithDetails = settlements.map((settlement) => {
+        // Get all bets for this settlement from pre-fetched map
+        const bets = betsBySettlementId.get(settlement.settlementId) || [];
 
         // Calculate statistics
         const totalBets = bets.length;
@@ -1595,11 +1811,10 @@ export class SettlementService {
             pnl: bet.pnl,
             settledAt: bet.settledAt,
             rollbackAt: bet.rollbackAt,
-            createdAt: bet.createdAt,
-          })),
-        };
-      }),
-    );
+          createdAt: bet.createdAt,
+        })),
+      };
+    });
 
     // Get total count for pagination
     const totalCount = await this.prisma.settlement.count({ where });
@@ -1629,12 +1844,23 @@ export class SettlementService {
       throw new BadRequestException(`Settlement not found: ${settlementId}`);
     }
 
-    // Get all bets for this settlement
+    // OPTIMIZED: Use select instead of include (already optimized)
     const bets = await this.prisma.bet.findMany({
       where: {
         settlementId: settlement.settlementId,
       },
-      include: {
+      select: {
+        id: true,
+        userId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        status: true,
+        pnl: true,
+        settledAt: true,
+        rollbackAt: true,
+        createdAt: true,
         user: {
           select: {
             id: true,
@@ -1736,6 +1962,7 @@ export class SettlementService {
           ? 'CRICKET:MATCHODDS:'
           : 'CRICKET:BOOKMAKER:';
 
+    // OPTIMIZED: Use select instead of include
     const pendingBets = await this.prisma.bet.findMany({
       where: {
         status: BetStatus.PENDING,
@@ -1746,8 +1973,26 @@ export class SettlementService {
           not: null,
         },
       },
-      include: {
-        match: true,
+      select: {
+        id: true,
+        matchId: true,
+        eventId: true,
+        amount: true,
+        odds: true,
+        betType: true,
+        betName: true,
+        settlementId: true,
+        createdAt: true,
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+          },
+        },
       },
       orderBy: {
         createdAt: 'desc',

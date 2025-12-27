@@ -15,6 +15,7 @@ import { BalanceTransferModule } from './balancetransfer/balancetransfer.module'
 import { BetsModule } from './bets/bets.module';
 import { ResultsModule } from './results/results.module';
 import { SettlementModule } from './settlement/settlement.module';
+import { SiteVideoModule } from './site-video/site-video.module';
 import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
@@ -35,6 +36,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     BetsModule,
     ResultsModule,
     SettlementModule,
+    SiteVideoModule,
   ],
   controllers: [AppController, BetfairController],
   providers: [AppService, BettingGateway],
