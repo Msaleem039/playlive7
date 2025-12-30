@@ -30,6 +30,7 @@ model User {
 
   // Relations
   bets              Bet[]
+  positions         Position[]
   wallet            Wallet?
   parent            User?                 @relation("UserHierarchy", fields: [parentId], references: [id])
   children          User[]                @relation("UserHierarchy")
@@ -278,6 +279,36 @@ model HierarchyPnl {
   @@index([toUserId])
   @@index([fromUserId])
   @@map("hierarchy_pnl")
+}
+
+model Position {
+  id          String   @id @default(cuid())
+  userId      String
+  matchId     String
+  marketType  String   // MATCH_ODDS | FANCY | BOOKMAKER
+  selectionId Int
+  runnerName  String?
+
+  backStake   Float    @default(0)
+  backOdds    Float    @default(0)
+  layStake    Float    @default(0)
+  layOdds     Float    @default(0)
+
+  pnlIfWin    Float    @default(0)
+  pnlIfLose   Float    @default(0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Relations
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Unique constraint: one position per user/match/market/selection
+  @@unique([userId, matchId, marketType, selectionId])
+  @@index([userId])
+  @@index([userId, matchId])
+  @@index([matchId, marketType, selectionId])
+  @@map("positions")
 }
 
 model MatchVisibility {

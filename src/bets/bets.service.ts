@@ -3,6 +3,7 @@ import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { BetStatus, MatchStatus, Prisma, TransactionType } from '@prisma/client';
 import { CricketIdService } from '../cricketid/cricketid.service';
+import { PositionService } from '../positions/position.service';
 
 @Injectable()
 export class BetsService {
@@ -11,6 +12,7 @@ export class BetsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cricketIdService: CricketIdService,
+    private readonly positionService: PositionService,
   ) {}
 
   // ---------------------------- MOCK DATABASE FUNCTIONS ---------------------------- //
@@ -249,13 +251,35 @@ export class BetsService {
     debug.locked_exposure = locked_exposure;
     debug.remaining_credit = remaining_credit;
 
-    // 3. REQUIRED AMOUNT CALCULATION
+    // 3. REQUIRED AMOUNT CALCULATION WITH BACK/LAY NETTING
     // BETFAIR STANDARD:
-    // Every BACK bet locks full stake as liability
-    // No netting unless opposite selections (not implemented yet)
-    const required_amount = normalizedLossAmount;
+    // If user has opposite bets (BACK + LAY) on same selection, net the exposure
+    // Example: BACK 1000 + LAY 1000 = 0 exposure (perfect hedge)
+    const oppositeBetType = bet_type?.toUpperCase() === 'BACK' ? 'LAY' : 'BACK';
+    
+    // Find opposite exposure on the same selection
+    const oppositeExposure = await this.prisma.bet.aggregate({
+      where: {
+        userId,
+        matchId: String(match_id),
+        selectionId: normalizedSelectionId,
+        betType: oppositeBetType,
+        status: BetStatus.PENDING,
+      },
+      _sum: { lossAmount: true },
+    });
+
+    const oppositeLossAmount = oppositeExposure._sum.lossAmount ?? 0;
+    
+    // Net the exposure: if opposite bets exist, reduce required amount
+    // Example: BACK 1000, existing LAY 500 → net exposure = 500
+    // Example: BACK 1000, existing LAY 1000 → net exposure = 0 (perfect hedge)
+    const netLoss = Math.max(0, normalizedLossAmount - oppositeLossAmount);
+    const required_amount = netLoss;
 
     debug.required_amount_to_place_bet = required_amount;
+    debug.opposite_exposure = oppositeLossAmount;
+    debug.net_exposure = netLoss;
 
     // ✅ Validate remaining credit is sufficient for the bet
     // Use wallet.liability as single source of truth (not recalculating from bets)
@@ -306,61 +330,33 @@ export class BetsService {
             },
           });
 
-          // Step 2: Deduct balance and lock liability (if required)
-          // CREDIT FLOW ONLY: This is pure accounting - no profit/loss calculation
-          // Balance = free credit, Liability = locked exposure
-          // Total Credit = Balance + Liability
-          // Profit/Loss distribution happens ONLY during settlement (via HierarchyPnlService)
-          if (required_amount > 0) {
-            // Get current wallet state within transaction (ensure it exists)
-            const currentWallet = await tx.wallet.upsert({
-              where: { userId },
-              update: {},
-              create: {
-                userId,
-                balance: 0,
-                liability: 0,
-              },
-            });
+          // Step 2: Get current wallet state within transaction (ensure it exists)
+          const currentWallet = await tx.wallet.upsert({
+            where: { userId },
+            update: {},
+            create: {
+              userId,
+              balance: 0,
+              liability: 0,
+            },
+          });
 
-            // ✅ Check remaining credit (balance) is sufficient
-            // Remaining credit = total_credit - liability = balance
-            const current_remaining = currentWallet.balance;
-            
-            if (current_remaining < required_amount) {
-              // CRITICAL FIX: Use Error instead of HttpException inside transaction
-              // HttpException can cause transaction issues with pooled connections
-              throw new Error(
-                `Insufficient available balance to lock liability. ` +
-                `Balance: ${currentWallet.balance}, Liability: ${currentWallet.liability}, ` +
-                `Required: ${required_amount}, Remaining: ${current_remaining}`,
-              );
-            }
-
-            // Lock liability: move credit from balance to liability
-            // This is NOT profit/loss - it's just locking credit for potential exposure
-            await tx.wallet.update({
-              where: { userId },
-              data: {
-                balance: { decrement: required_amount },
-                liability: { increment: required_amount },
-              },
-            });
-
-            // Create transaction record
-            await tx.transaction.create({
-              data: {
-                walletId: currentWallet.id,
-                amount: required_amount,
-                type: TransactionType.BET_PLACED,
-                description: `Liability locked for ${bet_name}`,
-              },
-            });
-
-            debug.wallet_debited = required_amount;
+          // Step 3: Validate sufficient balance before creating bet
+          // We'll update wallet AFTER creating the bet to ensure accurate total exposure calculation
+          const currentBalance = Number(currentWallet.balance) || 0;
+          const currentLiability = Number(currentWallet.liability) || 0;
+          
+          // Validate that we have enough balance to cover the required amount
+          // required_amount is the net exposure this bet adds (already accounts for netting)
+          if (required_amount > currentBalance) {
+            throw new Error(
+              `Insufficient available balance to place bet. ` +
+              `Balance: ${currentBalance}, Liability: ${currentLiability}, ` +
+              `Required: ${required_amount}, Remaining: ${currentBalance}`,
+            );
           }
 
-          // Step 3: Create the bet
+          // Step 4: Create the bet FIRST
           // Build bet data object with conditional selId to handle Prisma client type issues
           const betData: any = {
             userId: userId,
@@ -375,7 +371,7 @@ export class BetsService {
             betValue: normalizedBetValue,
             betRate: normalizedBetRate,
             winAmount: normalizedWinAmount,
-            lossAmount: required_amount,
+            lossAmount: normalizedLossAmount, // Store actual loss amount, not netted value
             gtype,
             settlementId: settlement_id,
             toReturn: to_return,
@@ -394,6 +390,167 @@ export class BetsService {
             data: betData,
           });
 
+          // Step 5: Recalculate total NET exposure from ALL pending bets (including the new one)
+          // This ensures wallet.liability accurately reflects the net exposure after BACK/LAY netting
+          // We need to calculate net exposure per selection, then sum across all selections
+          const allPendingBets = await tx.bet.findMany({
+            where: {
+              userId,
+              status: BetStatus.PENDING,
+            },
+            select: {
+              matchId: true,
+              selectionId: true,
+              betType: true,
+              lossAmount: true,
+            },
+          });
+
+          // Calculate net exposure per selection (BACK - LAY, then take max with 0)
+          const exposureBySelection = new Map<string, { back: number; lay: number }>();
+          
+          for (const bet of allPendingBets) {
+            const key = `${bet.matchId}_${bet.selectionId}`;
+            if (!exposureBySelection.has(key)) {
+              exposureBySelection.set(key, { back: 0, lay: 0 });
+            }
+            const exposure = exposureBySelection.get(key)!;
+            
+            if (bet.betType?.toUpperCase() === 'BACK') {
+              exposure.back += bet.lossAmount ?? 0;
+            } else if (bet.betType?.toUpperCase() === 'LAY') {
+              exposure.lay += bet.lossAmount ?? 0;
+            }
+          }
+
+          // Calculate total net exposure: sum of max(0, back - lay) for each selection
+          let actualTotalExposure = 0;
+          for (const [key, exposure] of exposureBySelection.entries()) {
+            const netExposure = Math.max(0, exposure.back - exposure.lay);
+            actualTotalExposure += netExposure;
+          }
+          
+          // Calculate the difference between actual exposure and current liability
+          const exposureDiff = actualTotalExposure - currentLiability;
+
+          debug.current_liability = currentLiability;
+          debug.actual_total_exposure = actualTotalExposure;
+          debug.exposure_diff = exposureDiff;
+
+          // ✅ Update wallet based on actual total exposure
+          if (exposureDiff > 0) {
+            // 🔒 Need to lock MORE liability (total exposure increased)
+            if (currentBalance < exposureDiff) {
+              throw new Error(
+                `Insufficient available balance to lock liability. ` +
+                `Balance: ${currentBalance}, Required: ${exposureDiff}`,
+              );
+            }
+
+            const newBalance = currentBalance - exposureDiff;
+            const newLiability = actualTotalExposure;
+
+            const updatedWallet = await tx.wallet.update({
+              where: { userId },
+              data: {
+                balance: newBalance,
+                liability: newLiability,
+              },
+              select: {
+                id: true,
+                balance: true,
+                liability: true,
+              },
+            });
+
+            if (!updatedWallet || updatedWallet.balance === undefined || updatedWallet.liability === undefined) {
+              throw new Error('Wallet update failed - values not persisted');
+            }
+
+            await tx.transaction.create({
+              data: {
+                walletId: currentWallet.id,
+                amount: exposureDiff,
+                type: TransactionType.BET_PLACED,
+                description: `Liability increased for ${bet_name} (${bet_type})`,
+              },
+            });
+
+            debug.wallet_debited = exposureDiff;
+            debug.old_balance = currentBalance;
+            debug.new_balance = updatedWallet.balance;
+            debug.old_liability = currentLiability;
+            debug.new_liability = updatedWallet.liability;
+          } else if (exposureDiff < 0) {
+            // 🔓 RELEASE liability (total exposure decreased - hedge detected)
+            // This happens when LAY bet offsets BACK bet (or vice versa)
+            // For LAY bets: Credit the bet value (stake) to wallet, not just the exposure difference
+            // Example: BACK 100 exists (liability = 100), place LAY 100 → credit bet value (100) to wallet
+            const isLayBet = bet_type?.toUpperCase() === 'LAY';
+            
+            // For LAY bets, credit the bet value (stake); for BACK bets, credit the exposure difference
+            const releaseAmount = isLayBet ? normalizedBetValue : Math.abs(exposureDiff);
+
+            const newBalance = currentBalance + releaseAmount;
+            const newLiability = actualTotalExposure;
+
+            const updatedWallet = await tx.wallet.update({
+              where: { userId },
+              data: {
+                balance: newBalance,
+                liability: newLiability,
+              },
+              select: {
+                id: true,
+                balance: true,
+                liability: true,
+              },
+            });
+
+            if (!updatedWallet || updatedWallet.balance === undefined || updatedWallet.liability === undefined) {
+              throw new Error('Wallet update failed - values not persisted');
+            }
+
+            await tx.transaction.create({
+              data: {
+                walletId: currentWallet.id,
+                amount: releaseAmount,
+                type: TransactionType.REFUND,
+                description: `Liability released due to hedge (${bet_type} bet offsets existing exposure) - ${isLayBet ? 'bet value credited' : 'exposure difference credited'}`,
+              },
+            });
+
+            debug.liability_released = releaseAmount;
+            debug.bet_value_credited = isLayBet ? normalizedBetValue : undefined;
+            debug.exposure_diff_credited = isLayBet ? undefined : Math.abs(exposureDiff);
+            debug.old_balance = currentBalance;
+            debug.new_balance = updatedWallet.balance;
+            debug.old_liability = currentLiability;
+            debug.new_liability = updatedWallet.liability;
+          } else {
+            // exposureDiff === 0: No wallet change needed (perfect match)
+            debug.exposure_diff_zero = true;
+            debug.current_balance = currentBalance;
+            debug.current_liability = currentLiability;
+            debug.actual_total_exposure = actualTotalExposure;
+          }
+
+          // ✅ Update position (handles BACK/LAY netting automatically)
+          // This is CRITICAL for correct P/L calculation and hedge detection
+          await this.positionService.updatePositionFromBet(
+            {
+              userId,
+              matchId: String(match_id),
+              marketType: market_type || 'MATCH_ODDS', // Default to MATCH_ODDS if not provided
+              selectionId: normalizedSelectionId,
+              betType: (bet_type?.toUpperCase() || 'BACK') as 'BACK' | 'LAY',
+              stake: normalizedBetValue,
+              odds: normalizedBetRate,
+              runnerName: bet_name,
+            },
+            tx, // Pass transaction client for atomicity
+          );
+
           return { betId: bet.id };
         },
         {
@@ -404,44 +561,10 @@ export class BetsService {
 
       debug.bet_id = result.betId;
 
-      // 5. Exposure is already tracked via wallet.liability (single source of truth)
-      // No need to recalculate from bets - that would cause double counting
-
-      // 6. PLACE BET WITH VENDOR API (non-critical, can fail without affecting bet)
-      // Only place bet with vendor if marketId and eventId are provided
-      if (marketId && eventId) {
-        try {
-          const vendorBetData = {
-            marketId,
-            selectionId: normalizedSelectionId,
-            side: (bet_type.toUpperCase() === 'BACK' ? 'BACK' : 'LAY') as 'BACK' | 'LAY',
-            size: normalizedBetValue,
-            price: normalizedBetRate,
-            eventId,
-          };
-
-          const vendorResponse = await this.cricketIdService.placeBet(vendorBetData);
-          debug.vendor_api_response = vendorResponse;
-          this.logger.log(`Bet placed with vendor API for bet ${result.betId}`);
-        } catch (error) {
-          // Log but don't fail the bet placement
-          debug.vendor_api_error =
-            error instanceof Error
-              ? {
-                  message: error.message,
-                  stack: error.stack,
-                }
-              : { message: String(error) };
-          this.logger.warn(
-            `Failed to place bet with vendor API (bet ${result.betId} still created): ${error instanceof Error ? error.message : String(error)}`,
-          );
-        }
-      } else {
-        debug.vendor_api_response = 'Skipped – marketId or eventId not provided';
-        this.logger.warn(
-          `Bet placed without vendor API call (missing marketId or eventId) for bet ${result.betId}`,
-        );
-      }
+      // 5. VENDOR API CALL REMOVED
+      // The vendor API endpoint /v3/placeBet returns 404 and is not available
+      // Internal bet placement works correctly without vendor API
+      // If vendor API integration is needed in the future, it can be re-enabled here
 
       this.logger.log(`Bet placed successfully: ${result.betId} for user ${userId}`);
       return { success: true, debug, remaining_credit };

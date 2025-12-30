@@ -90,18 +90,25 @@ export class SettlementService {
           // Handle declared fancy with BACK/LAY logic
           if (bet.betType === 'BACK') {
             const betValue = bet.betValue ?? 0;
-            const lossAmount = bet.lossAmount ?? 0;
-            result =
-              fancy.decisionRun > betValue
-                ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
-                : { status: BetStatus.LOST, pnl: -lossAmount };
+            const won = fancy.decisionRun > betValue;
+            const pnl = won 
+              ? this.calculateBetPnl(bet, BetStatus.WON)
+              : this.calculateBetPnl(bet, BetStatus.LOST);
+            result = { 
+              status: won ? BetStatus.WON : BetStatus.LOST, 
+              pnl 
+            };
           } else {
+            // LAY bet
             const betValue = bet.betValue ?? 0;
-            const lossAmount = bet.lossAmount ?? 0;
-            result =
-              fancy.decisionRun <= betValue
-                ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
-                : { status: BetStatus.LOST, pnl: -lossAmount };
+            const won = fancy.decisionRun <= betValue;
+            const pnl = won 
+              ? this.calculateBetPnl(bet, BetStatus.WON)
+              : this.calculateBetPnl(bet, BetStatus.LOST);
+            result = { 
+              status: won ? BetStatus.WON : BetStatus.LOST, 
+              pnl 
+            };
           }
         } else {
           // Skip if neither declared nor cancelled
@@ -723,18 +730,31 @@ export class SettlementService {
 
     for (const bet of bets) {
       let result: { status: BetStatus; pnl: number };
-      const lossAmount = bet.lossAmount ?? 0;
 
-      if (bet.selectionId === winnerSelectionIdNum) {
-        result =
-          bet.betType === 'BACK'
-            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
-            : { status: BetStatus.LOST, pnl: -lossAmount };
+      // Determine if bet won or lost
+      const isWinner = bet.selectionId === winnerSelectionIdNum;
+      
+      if (bet.betType === 'BACK') {
+        if (isWinner) {
+          // BACK bet on winner: WON
+          const pnl = this.calculateBetPnl(bet, BetStatus.WON);
+          result = { status: BetStatus.WON, pnl };
         } else {
-        result =
-          bet.betType === 'LAY'
-            ? { status: BetStatus.WON, pnl: bet.winAmount ?? 0 }
-            : { status: BetStatus.LOST, pnl: -lossAmount };
+          // BACK bet on loser: LOST
+          const pnl = this.calculateBetPnl(bet, BetStatus.LOST);
+          result = { status: BetStatus.LOST, pnl };
+        }
+      } else {
+        // LAY bet
+        if (isWinner) {
+          // LAY bet on winner: LOST (we pay out)
+          const pnl = this.calculateBetPnl(bet, BetStatus.LOST);
+          result = { status: BetStatus.LOST, pnl };
+        } else {
+          // LAY bet on loser: WON (we keep stake)
+          const pnl = this.calculateBetPnl(bet, BetStatus.WON);
+          result = { status: BetStatus.WON, pnl };
+        }
       }
 
       await this.applyOutcome(bet, result);
@@ -796,24 +816,64 @@ export class SettlementService {
   }
 
   /**
+   * Calculate NET P/L for a bet based on bet type and outcome
+   * 
+   * EXCHANGE RULES:
+   * BACK bet:
+   *   - WIN: Profit = stake × (odds - 1)
+   *   - LOSS: Loss = -stake
+   * 
+   * LAY bet:
+   *   - WIN: Profit = stake (opponent loses)
+   *   - LOSS: Loss = -stake × (odds - 1) (pay out opponent)
+   * 
+   * CANCEL: Refund = stake (lossAmount)
+   */
+  private calculateBetPnl(bet: any, status: BetStatus): number {
+    const stake = bet.amount ?? 0;
+    const odds = bet.odds ?? 0;
+    const lossAmount = bet.lossAmount ?? 0;
+
+    if (status === BetStatus.CANCELLED) {
+      // Refund the locked liability
+      return lossAmount;
+    }
+
+    if (bet.betType === 'BACK') {
+      if (status === BetStatus.WON) {
+        // Profit = stake × (odds - 1)
+        return stake * (odds - 1);
+      } else {
+        // Loss = -stake (stake was already deducted at placement)
+        return -stake;
+      }
+    }
+
+    if (bet.betType === 'LAY') {
+      if (status === BetStatus.WON) {
+        // Profit = stake (opponent lost, we keep the stake)
+        return stake;
+      } else {
+        // Loss = -stake × (odds - 1) (we pay out opponent)
+        return -stake * (odds - 1);
+      }
+    }
+
+    // Default: return 0 for unknown bet types
+    return 0;
+  }
+
+  /**
    * Apply settlement outcome to a bet
    * 
-   * BUSINESS RULE:
-   * - Bet Placement: balance -= stake, liability += stake
-   * - Settlement:
-   *   - WIN: balance += stake (return stake), liability -= stake
-   *   - LOSS: balance += 0 (already deducted), liability -= stake
-   *   - CANCEL: balance += stake (return stake), liability -= stake
+   * CORRECT SETTLEMENT FLOW:
+   * 1. Release liability (ALWAYS decrement by lossAmount)
+   * 2. Apply NET P/L only (not stake, not winAmount)
+   * 3. Update bet status and pnl
    * 
-   * IMPORTANT: PnL is for reporting only, NOT for wallet movement.
-   * Wallet balance is updated based on STATUS, not pnl value.
-   * 
-   * On settlement (ALL cases: WIN / LOSS / CANCELLED):
-   * 1. Release liability (ALWAYS decrement) - MOST IMPORTANT
-   * 2. Return stake to balance (WIN/CANCEL only, LOSS already deducted)
-   * 3. Update bet status and pnl (for reporting)
-   * 
-   * Liability must be released even if pnl = 0
+   * CRITICAL: Never add stake again - it was already deducted at placement
+   * CRITICAL: Never add winAmount - that includes stake + profit
+   * CRITICAL: Only apply NET profit/loss
    */
   private async applyOutcome(
     bet: any,
@@ -821,29 +881,22 @@ export class SettlementService {
   ) {
     await this.prisma.$transaction(async (tx) => {
       const liability = bet.lossAmount ?? 0;
+      
+      // Calculate NET P/L (this is the correct value to apply)
+      // Use the provided pnl if it's correct, otherwise recalculate
+      const netPnl = outcome.pnl !== undefined ? outcome.pnl : this.calculateBetPnl(bet, outcome.status);
 
-      // 1️⃣ RELEASE LIABILITY (MOST IMPORTANT)
-      // This is CRITICAL - without this, liability stays locked forever
-      // Liability must be released even if pnl = 0
+      // 1️⃣ RELEASE LIABILITY (ALWAYS)
+      // This unlocks the exposure that was locked at bet placement
+      // 2️⃣ APPLY NET P/L ONLY
+      // This is the actual profit/loss, NOT stake + profit
       await tx.wallet.update({
         where: { userId: bet.userId },
         data: {
-          liability: { decrement: liability },
+          liability: { decrement: liability }, // Release locked exposure
+          balance: { increment: netPnl },      // Apply NET profit/loss only
         },
       });
-
-      // 2️⃣ APPLY WALLET BALANCE (NOT pnl)
-      // Return stake only on WIN or CANCEL
-      // LOSS: do nothing (stake already deducted at placement)
-      if (outcome.status === BetStatus.WON || outcome.status === BetStatus.CANCELLED) {
-        // RETURN STAKE ONLY
-        await tx.wallet.update({
-          where: { userId: bet.userId },
-          data: {
-            balance: { increment: bet.lossAmount ?? 0 },
-          },
-        });
-      }
 
       // 3️⃣ UPDATE BET
       await tx.bet.update({
@@ -851,7 +904,7 @@ export class SettlementService {
         data: {
           status: outcome.status,
           // @ts-ignore - pnl field exists after database migration
-          pnl: outcome.pnl,
+          pnl: netPnl, // Store NET P/L for reporting
           settledAt: new Date(),
           updatedAt: new Date(),
         },
