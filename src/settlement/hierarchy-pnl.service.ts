@@ -86,17 +86,8 @@ export class HierarchyPnlService {
           this.logger.debug(
             `Net PnL is zero for user ${userId}, event ${eventId}, marketType ${marketType}. Skipping hierarchical distribution.`,
           );
-          // Still mark as settled even if zero
-          // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
-          await tx.userPnl.update({
-            where: {
-              userId_eventId_marketType: { userId, eventId, marketType },
-            },
-            // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
-            data: { hierarchySettled: true },
-          }).catch(() => {
-            // Ignore if field doesn't exist yet
-          });
+          // NOTE: hierarchySettled field doesn't exist in schema, so we skip this update
+          // The hierarchy distribution is tracked via HierarchyPnl records
           return;
         }
 
@@ -202,20 +193,11 @@ export class HierarchyPnlService {
         }
 
         // Mark hierarchy distribution as complete
-        // This flag allows admin panel to verify settlement completion
-        // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
-        await tx.userPnl.update({
-          where: {
-            userId_eventId_marketType: { userId, eventId, marketType },
-          },
-          // @ts-ignore - hierarchySettled field may not exist yet (requires migration)
-          data: { hierarchySettled: true },
-        }).catch(() => {
-          // Ignore if field doesn't exist yet (will need database migration)
-          this.logger.debug(
-            `hierarchySettled field not found in userPnl table. Migration may be required.`,
-          );
-        });
+        // NOTE: hierarchySettled field doesn't exist in schema, so we skip this update
+        // The hierarchy distribution is tracked via HierarchyPnl records
+        this.logger.debug(
+          `Hierarchy P/L distribution completed for user ${userId}, event ${eventId}, market ${marketType}`,
+        );
         },
         {
           maxWait: 10000, // Maximum time to wait for a transaction slot (10 seconds)

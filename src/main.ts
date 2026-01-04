@@ -8,6 +8,7 @@ import {
 } from '@nestjs/platform-fastify';
 import compression from '@fastify/compress';
 import multipart from '@fastify/multipart';
+import cors from '@fastify/cors';
 dotenv.config();
 
 async function bootstrap() {
@@ -31,29 +32,36 @@ async function bootstrap() {
     },
   });
   
+  // CORS configuration - environment aware
+  // ✅ Use Fastify CORS plugin for better compatibility with Fastify
+  const allowedOrigins = process.env.CORS_ORIGINS 
+    ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+    : ['*'];
+  
+  await app.register(cors, {
+    origin: allowedOrigins.includes('*') ? true : allowedOrigins,
+    credentials: allowedOrigins.includes('*') ? false : true, // Can't use credentials with wildcard
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type', 
+      'Authorization', 
+      'Accept', 
+      'X-Requested-With',
+      'Origin',
+      'Access-Control-Request-Method',
+      'Access-Control-Request-Headers',
+    ],
+    exposedHeaders: ['Content-Type', 'Authorization'],
+    preflight: true,
+    strictPreflight: false,
+  });
+  
   // Enable validation pipes globally
   app.useGlobalPipes(new ValidationPipe({
     whitelist: true,
     forbidNonWhitelisted: false,
     transform: true,
   }));
-
-  // CORS configuration - environment aware
-  const allowedOrigins = process.env.CORS_ORIGINS 
-    ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
-    : ['*'];
-  
-  const corsOptions = {
-    origin: allowedOrigins.includes('*') ? true : allowedOrigins,
-    credentials: allowedOrigins.includes('*') ? false : true, // Can't use credentials with wildcard
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
-    exposedHeaders: ['Content-Type', 'Authorization'],
-    preflightContinue: false,
-    optionsSuccessStatus: 204,
-  };
-
-  app.enableCors(corsOptions);
 
   // Set security headers using Fastify hooks
   app.getHttpAdapter().getInstance().addHook('onSend', async (request, reply) => {

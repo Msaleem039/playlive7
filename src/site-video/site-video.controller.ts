@@ -4,16 +4,23 @@ import {
   Post,
   Req,
   BadRequestException,
+  UseGuards,
 } from '@nestjs/common';
 import type { FastifyRequest } from 'fastify';
 import { SiteVideoService } from './site-video.service';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { UserRole } from '@prisma/client';
 
 @Controller('site-video')
 export class SiteVideoController {
   constructor(private readonly service: SiteVideoService) {}
 
   // 🔁 Create / Update / Replace - Accepts file upload OR videoUrl
-  @Post()
+  @Post('upload')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
   async updateIntro(@Req() request: FastifyRequest) {
     // Check if request is multipart
     if (!request.isMultipart()) {

@@ -12,19 +12,30 @@ export class PnlService {
 
   /**
    * Map bet marketType string to MarketType enum
+   * 
+   * CRITICAL: Handles various market type formats from bet placement:
+   * - 'in_play' → MATCH_ODDS (common format for Match Odds bets)
+   * - 'MATCH_ODDS' → MATCH_ODDS
+   * - 'FANCY' → FANCY
+   * - 'BOOKMAKER' → BOOKMAKER
    */
   private mapMarketType(marketType: string | null | undefined): MarketType | null {
     if (!marketType) return null;
 
     const upper = marketType.toUpperCase();
-    if (upper.includes('FANCY')) return MarketType.FANCY;
-    if (upper.includes('BOOKMAKER')) return MarketType.BOOKMAKER;
-    if (upper.includes('MATCH') && upper.includes('ODD')) return MarketType.MATCH_ODDS;
     
-    // Default mapping based on common patterns
+    // FANCY markets
+    if (upper.includes('FANCY')) return MarketType.FANCY;
     if (upper === 'FANCY' || upper === 'FANCY1') return MarketType.FANCY;
+    
+    // BOOKMAKER markets
+    if (upper.includes('BOOKMAKER')) return MarketType.BOOKMAKER;
     if (upper === 'BOOKMAKER' || upper === 'BOOK') return MarketType.BOOKMAKER;
+    
+    // MATCH_ODDS markets (including 'in_play' which is commonly used)
+    if (upper.includes('MATCH') && upper.includes('ODD')) return MarketType.MATCH_ODDS;
     if (upper === 'MATCH_ODDS' || upper === 'MATCHODDS') return MarketType.MATCH_ODDS;
+    if (upper === 'IN_PLAY' || upper === 'INPLAY') return MarketType.MATCH_ODDS;
 
     return null;
   }

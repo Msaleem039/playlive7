@@ -7,9 +7,6 @@ import {
   Query,
   UseGuards,
   BadRequestException,
-  ParseBoolPipe,
-  ParseIntPipe,
-  Optional,
   Delete,
 } from '@nestjs/common';
 import { IsNotEmpty, IsString, IsOptional, IsBoolean, IsNumber, IsArray } from 'class-validator';
@@ -48,7 +45,7 @@ class SettleFancyDto {
   betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
 }
 
-class SettleMatchOddsDto {
+class SettleMarketDto {
   @IsNotEmpty()
   @IsString()
   eventId: string;
@@ -61,40 +58,14 @@ class SettleMatchOddsDto {
   @IsString()
   winnerSelectionId: string;
 
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
-}
-
-class SettleBookmakerDto {
   @IsNotEmpty()
   @IsString()
-  eventId: string;
-
-  @IsNotEmpty()
-  @IsString()
-  marketId: string;
-
-  @IsNotEmpty()
-  @IsString()
-  winnerSelectionId: string;
+  marketType: 'MATCH_ODDS' | 'BOOKMAKER'; // Market type: MATCH_ODDS or BOOKMAKER
 
   @IsOptional()
   @IsArray()
   @IsString({ each: true })
   betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
-}
-
-class RollbackSettlementDto {
-  @IsString()
-  @IsNotEmpty()
-  settlementId: string;
-
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  betIds?: string[]; // Optional: rollback only specific bets. If not provided, rolls back all bets for the settlement
 }
 
 @Controller('admin/settlement')
@@ -127,35 +98,76 @@ export class SettlementAdminController {
   }
 
   /**
-   * Settle match odds bets (Admin only)
+   * Settle market bets (Match Odds or Bookmaker) - Unified endpoint
+   * POST /admin/settlement/market
    */
-  @Post('match-odds')
-  async settleMatchOdds(
-    @Body() dto: SettleMatchOddsDto,
+  @Post('market')
+  async settleMarket(
+    @Body() dto: SettleMarketDto,
     @CurrentUser() user: User,
   ) {
-    // Validate DTO is properly parsed
-    if (!dto.eventId || !dto.marketId || !dto.winnerSelectionId) {
+    // Validate DTO
+    if (!dto.eventId || !dto.marketId || !dto.winnerSelectionId || !dto.marketType) {
       throw new BadRequestException(
-        `Missing required fields. Received: eventId=${dto?.eventId}, marketId=${dto?.marketId}, winnerSelectionId=${dto?.winnerSelectionId}`,
+        `Missing required fields. Received: eventId=${dto?.eventId}, marketId=${dto?.marketId}, winnerSelectionId=${dto?.winnerSelectionId}, marketType=${dto?.marketType}`,
       );
     }
 
-    return this.settlementService.settleMatchOddsManual(
+    // Validate marketType
+    if (dto.marketType !== 'MATCH_ODDS' && dto.marketType !== 'BOOKMAKER') {
+      throw new BadRequestException(
+        `Invalid marketType: ${dto.marketType}. Must be either 'MATCH_ODDS' or 'BOOKMAKER'`,
+      );
+    }
+
+    // Route to appropriate settlement function
+    if (dto.marketType === 'BOOKMAKER') {
+      return this.settlementService.settleBookmakerManual(
+        dto.eventId,
+        dto.marketId,
+        dto.winnerSelectionId,
+        user.id,
+        dto.betIds,
+      );
+    }
+
+    // MATCH_ODDS
+    return this.settlementService.settleMarketManual(
       dto.eventId,
       dto.marketId,
       dto.winnerSelectionId,
+      MarketType.MATCH_ODDS,
       user.id,
-      dto.betIds, // Pass optional betIds array
+      dto.betIds,
     );
   }
 
   /**
+   * @deprecated Use POST /admin/settlement/market instead
+   * Settle match odds bets (Admin only)
+   */
+  @Post('match-odds')
+  async settleMatchOdds(
+    @Body() dto: Omit<SettleMarketDto, 'marketType'>,
+    @CurrentUser() user: User,
+  ) {
+    return this.settlementService.settleMarketManual(
+      dto.eventId,
+      dto.marketId,
+      dto.winnerSelectionId,
+      MarketType.MATCH_ODDS,
+      user.id,
+      dto.betIds,
+    );
+  }
+
+  /**
+   * @deprecated Use POST /admin/settlement/market instead
    * Settle bookmaker bets (Admin only)
    */
   @Post('bookmaker')
   async settleBookmaker(
-    @Body() dto: SettleBookmakerDto,
+    @Body() dto: Omit<SettleMarketDto, 'marketType'>,
     @CurrentUser() user: User,
   ) {
     return this.settlementService.settleBookmakerManual(
@@ -163,22 +175,7 @@ export class SettlementAdminController {
       dto.marketId,
       dto.winnerSelectionId,
       user.id,
-      dto.betIds, // Pass optional betIds array
-    );
-  }
-
-  /**
-   * Rollback a settlement (Admin only)
-   */
-  @Post('rollback')
-  async rollback(
-    @Body() dto: RollbackSettlementDto,
-    @CurrentUser() user: User,
-  ) {
-    return this.settlementService.rollbackSettlement(
-      dto.settlementId,
-      user.id,
-      dto.betIds, // Pass optional betIds array
+      dto.betIds,
     );
   }
 
@@ -190,6 +187,33 @@ export class SettlementAdminController {
   @Get('pending')
   async getPendingBetsByMatch() {
     return this.settlementService.getPendingBetsByMatch();
+  }
+
+  /**
+   * Get pending fancy markets only (all users)
+   * GET /admin/settlement/pending/fancy-markets
+   */
+  @Get('pending/fancy-markets')
+  async getPendingFancyMarkets() {
+    return this.settlementService.getPendingFancyMarkets();
+  }
+
+  /**
+   * Get pending bookmaker markets only (all users)
+   * GET /admin/settlement/pending/bookmaker-markets
+   */
+  @Get('pending/bookmaker-markets')
+  async getPendingBookmakerMarkets() {
+    return this.settlementService.getPendingBookmakerMarkets();
+  }
+
+  /**
+   * Get pending bookmaker and match odds markets combined (all users)
+   * GET /admin/settlement/pending/markets
+   */
+  @Get('pending/markets')
+  async getPendingMarketOddsAndBookmaker() {
+    return this.settlementService.getPendingMarketOddsAndBookmaker();
   }
 
   /**
