@@ -323,6 +323,72 @@ export class SettlementAdminController {
   }
 
   /**
+   * Get bet history for a specific user (Admin only)
+   * GET /admin/settlement/bets/user/:userId
+   * 
+   * Query Parameters:
+   * - status (optional): Filter by bet status (PENDING, WON, LOST, CANCELLED)
+   * - limit (optional): Number of results per page (default: 100)
+   * - offset (optional): Pagination offset (default: 0)
+   * - startDate (optional): Filter from date (ISO string)
+   * - endDate (optional): Filter to date (ISO string)
+   * 
+   * Examples:
+   * - GET /admin/settlement/bets/user/user123
+   * - GET /admin/settlement/bets/user/user123?status=PENDING
+   * - GET /admin/settlement/bets/user/user123?status=WON&limit=50
+   * - GET /admin/settlement/bets/user/user123?startDate=2024-01-01T00:00:00.000Z&endDate=2024-01-31T23:59:59.999Z
+   */
+  @Get('bets/user/:userId')
+  async getUserBetHistory(
+    @Param('userId') userId: string,
+    @Query('status') status?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    // Validate status if provided
+    if (status) {
+      const validStatuses = ['PENDING', 'WON', 'LOST', 'CANCELLED'];
+      if (!validStatuses.includes(status.toUpperCase())) {
+        throw new BadRequestException(
+          `Invalid status: ${status}. Must be one of: ${validStatuses.join(', ')}`,
+        );
+      }
+    }
+
+    const filters: any = {
+      userId,
+      ...(status && { status: status.toUpperCase() }),
+    };
+
+    if (limit) {
+      filters.limit = parseInt(limit, 10);
+      if (isNaN(filters.limit) || filters.limit < 1) {
+        throw new BadRequestException('limit must be a positive number');
+      }
+    }
+
+    if (offset) {
+      filters.offset = parseInt(offset, 10);
+      if (isNaN(filters.offset) || filters.offset < 0) {
+        throw new BadRequestException('offset must be a non-negative number');
+      }
+    }
+
+    if (startDate) {
+      filters.startDate = new Date(startDate);
+    }
+
+    if (endDate) {
+      filters.endDate = new Date(endDate);
+    }
+
+    return this.settlementService.getUserBetHistory(filters);
+  }
+
+  /**
    * Delete a bet for a specific user (Admin only)
    * DELETE /admin/settlement/bet/:betIdOrSettlementId
    * 

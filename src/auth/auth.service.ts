@@ -61,33 +61,34 @@ export class AuthService {
     };
   }
 
-  async changePassword(currentUser: User, changePasswordDto: ChangePasswordDto): Promise<{ message: string }> {
-    const { currentPassword, newPassword } = changePasswordDto;
-
-    // Fetch the current user with password from database
+  async changePassword(
+    currentUser: User,
+    changePasswordDto: ChangePasswordDto
+  ): Promise<{ message: string }> {
+    const { password, confirmPassword } = changePasswordDto;
+  
+    // 1️⃣ Check password match
+    if (password !== confirmPassword) {
+      throw new BadRequestException('Password and confirm password do not match');
+    }
+  
+    // 2️⃣ Fetch logged-in user from token
     const user = await this.usersService.findById(currentUser.id);
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
-
-    // Verify the user's current password
-    if (!user.password) {
-      throw new UnauthorizedException('User password not found');
-    }
-
-    const isCurrentPasswordValid = await bcrypt.compare(currentPassword, user.password);
-    if (!isCurrentPasswordValid) {
-      throw new UnauthorizedException('Current password is incorrect');
-    }
-
-    // Update user's own password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
+  
+    // 3️⃣ Hash new password
+    const hashedPassword = await bcrypt.hash(password, 10);
+  
+    // 4️⃣ Update password
     await this.usersService.updatePassword(user.id, hashedPassword);
-
-    return { 
-      message: 'Password updated successfully' 
+  
+    return {
+      message: 'Password updated successfully',
     };
   }
+  
 
 
   // Role hierarchy validation

@@ -2489,6 +2489,114 @@ export class SettlementService {
   }
 
   /**
+   * Get bet history for a specific user (Admin only)
+   * Supports filtering by status, date range, and pagination
+   */
+  async getUserBetHistory(filters: {
+    userId: string;
+    status?: string;
+    limit?: number;
+    offset?: number;
+    startDate?: Date;
+    endDate?: Date;
+  }) {
+    const {
+      userId,
+      status,
+      limit = 100,
+      offset = 0,
+      startDate,
+      endDate,
+    } = filters;
+
+    // Build where clause
+    const where: any = {
+      userId,
+    };
+
+    if (status) {
+      where.status = status as BetStatus;
+    }
+
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) {
+        where.createdAt.gte = startDate;
+      }
+      if (endDate) {
+        where.createdAt.lte = endDate;
+      }
+    }
+
+    // Get total count for pagination
+    const totalCount = await this.prisma.bet.count({ where });
+
+    // Get bets with pagination
+    const bets = await this.prisma.bet.findMany({
+      where,
+      select: {
+        id: true,
+        userId: true,
+        matchId: true,
+        amount: true,
+        betValue: true,
+        odds: true,
+        betRate: true,
+        betType: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        gtype: true,
+        marketId: true,
+        eventId: true,
+        selectionId: true,
+        status: true,
+        pnl: true,
+        winAmount: true,
+        lossAmount: true,
+        settlementId: true,
+        settledAt: true,
+        createdAt: true,
+        updatedAt: true,
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            email: true,
+          },
+        },
+        match: {
+          select: {
+            id: true,
+            homeTeam: true,
+            awayTeam: true,
+            eventName: true,
+            eventId: true,
+            startTime: true,
+            status: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      take: limit,
+      skip: offset,
+    });
+
+    return {
+      success: true,
+      data: bets,
+      count: bets.length,
+      total: totalCount,
+      limit,
+      offset,
+      hasMore: offset + bets.length < totalCount,
+    };
+  }
+
+  /**
    * Get pending fancy markets only (all users)
    * Returns matches with pending fancy bets grouped by match
    */
