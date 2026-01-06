@@ -2,105 +2,222 @@ import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import { AxiosError } from 'axios';
+import * as https from 'https';
+import * as http from 'http';
 
 @Injectable()
 export class CricketIdService {
   private readonly logger = new Logger(CricketIdService.name);
   private readonly baseUrl = 'https://vendorapi.tresting.com';
+  private readonly maxRetries = 3;
+  private readonly retryDelay = 1000; // Initial delay in ms
+  private readonly timeout = 30000; // 30 seconds timeout
 
   constructor(private readonly http: HttpService) {}
+
+  /**
+   * Check if error is a transient network error that should be retried
+   */
+  private isRetryableError(error: any): boolean {
+    if (!(error instanceof AxiosError)) {
+      return false;
+    }
+
+    const code = error.code;
+    const message = error.message?.toLowerCase() || '';
+
+    // Network errors that should be retried
+    const retryableCodes = [
+      'ECONNRESET',
+      'ETIMEDOUT',
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'EAI_AGAIN',
+      'ECONNABORTED',
+      'ENETUNREACH',
+      'EHOSTUNREACH',
+    ];
+
+    // Check error code
+    if (code && retryableCodes.includes(code)) {
+      return true;
+    }
+
+    // Check error message for network-related errors
+    if (
+      message.includes('econnreset') ||
+      message.includes('etimedout') ||
+      message.includes('network') ||
+      message.includes('timeout') ||
+      message.includes('connection')
+    ) {
+      return true;
+    }
+
+    // Retry on 5xx server errors (but not 4xx client errors)
+    if (error.response?.status && error.response.status >= 500) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Sleep for specified milliseconds
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
 
   private async fetch<T>(path: string, params: Record<string, any> = {}): Promise<T> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = `${this.baseUrl}${normalizedPath}`;
 
-    try {
-      const { data } = await firstValueFrom(
-        this.http.get<T>(url, {
-          params,
-        }),
-      );
-      return data;
-    } catch (error) {
-      // Log detailed error information for debugging
-      if (error instanceof AxiosError) {
-        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
-        const responseData = error.response?.data;
-        const requestParams = JSON.stringify(params);
-        
-        // For 400 errors (invalid/expired IDs), log as debug instead of warning
-        // This is expected behavior when competitionId/eventId is invalid or expired
-        // Only log in debug mode to reduce log noise
-        if (status === 400) {
-          // Only log in debug mode - these are expected errors
-          if (process.env.NODE_ENV === 'development') {
-            this.logger.debug(
-              `Vendor API returned 400 for ${url} - Invalid or expired resource`,
-              { params, eventId: params.eventId || params.competitionId },
+    let lastError: any;
+    
+    // Retry loop
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        const { data } = await firstValueFrom(
+          this.http.get<T>(url, {
+            params,
+            timeout: this.timeout,
+            // Add connection keep-alive and retry settings
+            httpAgent: new http.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+            httpsAgent: new https.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+          }),
+        );
+        return data;
+      } catch (error) {
+        lastError = error;
+
+        // Check if error is retryable and we haven't exceeded max retries
+        if (attempt < this.maxRetries && this.isRetryableError(error)) {
+          const delay = this.retryDelay * Math.pow(2, attempt); // Exponential backoff
+          const errorCode = error instanceof AxiosError ? error.code : 'UNKNOWN';
+          
+          this.logger.warn(
+            `Vendor API request failed (attempt ${attempt + 1}/${this.maxRetries + 1}) for ${url}: ${errorCode}. Retrying in ${delay}ms...`,
+            {
+              url,
+              params,
+              errorCode,
+              attempt: attempt + 1,
+              maxRetries: this.maxRetries,
+            },
+          );
+
+          await this.sleep(delay);
+          continue; // Retry the request
+        }
+
+        // If not retryable or max retries exceeded, handle the error
+        if (error instanceof AxiosError) {
+          const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
+          const responseData = error.response?.data;
+          const requestParams = JSON.stringify(params);
+          
+          // For 400 errors (invalid/expired IDs), log as debug instead of warning
+          // This is expected behavior when competitionId/eventId is invalid or expired
+          // Only log in debug mode to reduce log noise
+          if (status === 400) {
+            // Only log in debug mode - these are expected errors
+            if (process.env.NODE_ENV === 'development') {
+              this.logger.debug(
+                `Vendor API returned 400 for ${url} - Invalid or expired resource`,
+                { params, eventId: params.eventId || params.competitionId },
+              );
+            }
+            
+            const errorMessage = 
+              responseData?.message || 
+              responseData?.error || 
+              `Invalid request parameters. Check if competitionId/eventId is valid and not expired.`;
+            
+            throw new HttpException(
+              {
+                statusCode: status,
+                message: errorMessage,
+                error: 'Vendor API Error',
+                details: {
+                  ...responseData,
+                  params,
+                  suggestion: 'The requested resource may be invalid, expired, or no longer available from the vendor API.',
+                },
+              },
+              status,
             );
           }
           
-          const errorMessage = 
-            responseData?.message || 
-            responseData?.error || 
-            `Invalid request parameters. Check if competitionId/eventId is valid and not expired.`;
+          // For network errors after retries, provide more context
+          const isNetworkError = this.isRetryableError(error);
+          const logLevel = isNetworkError ? 'error' : 'error';
+          
+          this.logger[logLevel](
+            `Vendor API Error [${status}] for ${url} with params: ${requestParams}${isNetworkError ? ` (after ${this.maxRetries + 1} attempts)` : ''}`,
+            {
+              url,
+              params,
+              status,
+              statusText: error.response?.statusText,
+              responseData,
+              message: error.message,
+              code: error.code,
+              attempts: attempt + 1,
+            },
+          );
+          
+          const message = isNetworkError
+            ? `Network error: ${error.message || 'Connection failed'} (after ${this.maxRetries + 1} attempts)`
+            : responseData?.message || error.message || 'Failed to fetch data from vendor API';
           
           throw new HttpException(
             {
               statusCode: status,
-              message: errorMessage,
+              message,
               error: 'Vendor API Error',
               details: {
-                ...responseData,
-                params,
-                suggestion: 'The requested resource may be invalid, expired, or no longer available from the vendor API.',
+                ...(responseData || {}),
+                code: error.code,
+                attempts: attempt + 1,
+                retryable: isNetworkError,
               },
             },
             status,
           );
         }
         
-        // For other errors (5xx, network errors, etc.), log as error
+        // Non-Axios errors
         this.logger.error(
-          `Vendor API Error [${status}] for ${url} with params: ${requestParams}`,
-          {
-            url,
-            params,
-            status,
-            statusText: error.response?.statusText,
-            responseData,
-            message: error.message,
-          },
+          `Unexpected error fetching ${url} with params: ${JSON.stringify(params)}:`,
+          error instanceof Error ? error.stack : String(error),
         );
-        
-        const message = responseData?.message || error.message || 'Failed to fetch data from vendor API';
         
         throw new HttpException(
           {
-            statusCode: status,
-            message,
-            error: 'Vendor API Error',
-            details: responseData || undefined,
+            statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+            message: error instanceof Error ? error.message : 'Internal server error',
+            error: 'Internal Server Error',
           },
-          status,
+          HttpStatus.INTERNAL_SERVER_ERROR,
         );
       }
-      
-      // Non-Axios errors
-      this.logger.error(
-        `Unexpected error fetching ${url} with params: ${JSON.stringify(params)}:`,
-        error instanceof Error ? error.stack : String(error),
-      );
-      
-      throw new HttpException(
-        {
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: error instanceof Error ? error.message : 'Internal server error',
-          error: 'Internal Server Error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
     }
+
+    // If we get here, all retries failed
+    throw lastError;
   }
 
   /**
@@ -327,42 +444,98 @@ export class CricketIdService {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = `${this.baseUrl}${normalizedPath}`;
 
-    try {
-      const { data } = await firstValueFrom(
-        this.http.post<T>(url, body, {
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }),
-      );
-      return data;
-    } catch (error) {
-      this.logger.error(`Error posting to ${url}:`, error instanceof Error ? error.message : String(error));
-      
-      if (error instanceof AxiosError) {
-        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
-        const message = error.response?.data?.message || error.message || 'Failed to post data to vendor API';
+    let lastError: any;
+    
+    // Retry loop
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        const { data } = await firstValueFrom(
+          this.http.post<T>(url, body, {
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            timeout: this.timeout,
+            httpAgent: new http.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+            httpsAgent: new https.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+          }),
+        );
+        return data;
+      } catch (error) {
+        lastError = error;
+
+        // Check if error is retryable and we haven't exceeded max retries
+        if (attempt < this.maxRetries && this.isRetryableError(error)) {
+          const delay = this.retryDelay * Math.pow(2, attempt); // Exponential backoff
+          const errorCode = error instanceof AxiosError ? error.code : 'UNKNOWN';
+          
+          this.logger.warn(
+            `Vendor API POST request failed (attempt ${attempt + 1}/${this.maxRetries + 1}) for ${url}: ${errorCode}. Retrying in ${delay}ms...`,
+            {
+              url,
+              errorCode,
+              attempt: attempt + 1,
+              maxRetries: this.maxRetries,
+            },
+          );
+
+          await this.sleep(delay);
+          continue; // Retry the request
+        }
+
+        // If not retryable or max retries exceeded, handle the error
+        this.logger.error(
+          `Error posting to ${url}${attempt > 0 ? ` (after ${attempt + 1} attempts)` : ''}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+        
+        if (error instanceof AxiosError) {
+          const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
+          const isNetworkError = this.isRetryableError(error);
+          const message = isNetworkError
+            ? `Network error: ${error.message || 'Connection failed'} (after ${attempt + 1} attempts)`
+            : error.response?.data?.message || error.message || 'Failed to post data to vendor API';
+          
+          throw new HttpException(
+            {
+              statusCode: status,
+              message,
+              error: 'Vendor API Error',
+              details: {
+                ...(error.response?.data || {}),
+                code: error.code,
+                attempts: attempt + 1,
+                retryable: isNetworkError,
+              },
+            },
+            status,
+          );
+        }
         
         throw new HttpException(
           {
-            statusCode: status,
-            message,
-            error: 'Vendor API Error',
-            details: error.response?.data || undefined,
+            statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+            message: error instanceof Error ? error.message : 'Internal server error',
+            error: 'Internal Server Error',
           },
-          status,
+          HttpStatus.INTERNAL_SERVER_ERROR,
         );
       }
-      
-      throw new HttpException(
-        {
-          statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-          message: error instanceof Error ? error.message : 'Internal server error',
-          error: 'Internal Server Error',
-        },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
     }
+
+    // If we get here, all retries failed
+    throw lastError;
   }
 
   /**
