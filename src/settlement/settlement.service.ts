@@ -60,6 +60,115 @@ export class SettlementService {
     return Math.round(liability * 100) / 100;
   }
 
+  /**
+   * ✅ DOUBLE / GOLA FANCY GROUP EVALUATOR
+   * 
+   * Evaluates fancy bets individually or as groups (Double/Gola Fancy)
+   * 
+   * @param bets - Array of bets to evaluate
+   * @param actualRuns - Actual runs scored
+   * @returns Map of betId -> isWin (true if bet wins, false if loses)
+   */
+  private evaluateFancyGroup(
+    bets: Array<{
+      id: string;
+      betType: string | null;
+      betRate: number | null;
+      odds: number | null;
+      metadata: any;
+    }>,
+    actualRuns: number,
+  ): Map<string, boolean> {
+    const result = new Map<string, boolean>();
+
+    // Group bets by fancyGroupId (or bet.id for single fancy)
+    const groupMap = new Map<
+      string,
+      Array<{
+        id: string;
+        betType: string | null;
+        betRate: number | null;
+        odds: number | null;
+      }>
+    >();
+
+    for (const bet of bets) {
+      const metadata = bet.metadata as any;
+      const fancyGroupId = metadata?.fancyGroupId;
+      const fancyGroupType = metadata?.fancyGroupType;
+
+      // If no group metadata, treat as single fancy (use bet.id as group key)
+      const groupKey = fancyGroupId && (fancyGroupType === 'DOUBLE' || fancyGroupType === 'GOLA')
+        ? fancyGroupId
+        : bet.id;
+
+      if (!groupMap.has(groupKey)) {
+        groupMap.set(groupKey, []);
+      }
+      groupMap.get(groupKey)!.push({
+        id: bet.id,
+        betType: bet.betType,
+        betRate: bet.betRate,
+        odds: bet.odds,
+      });
+    }
+
+    // Evaluate each group
+    for (const [groupKey, groupBets] of groupMap.entries()) {
+      const isGroup = groupKey !== groupBets[0]?.id; // If groupKey is not a bet.id, it's a group
+
+      if (!isGroup) {
+        // ✅ SINGLE FANCY: Evaluate individually (existing logic)
+        const bet = groupBets[0];
+        const line = bet.betRate ?? bet.odds ?? 0;
+        const betType = bet.betType?.toUpperCase();
+        const isYes = betType === 'YES' || betType === 'BACK';
+        const isNo = betType === 'NO' || betType === 'LAY';
+
+        let isWin = false;
+        if (isNo && actualRuns < line) {
+          isWin = true;
+        }
+        if (isYes && actualRuns >= line) {
+          isWin = true;
+        }
+
+        result.set(bet.id, isWin);
+      } else {
+        // ✅ DOUBLE / GOLA FANCY: Evaluate ALL legs together
+        // Group wins ONLY if ALL legs satisfy their condition
+        let allLegsWin = true;
+
+        for (const bet of groupBets) {
+          const line = bet.betRate ?? bet.odds ?? 0;
+          const betType = bet.betType?.toUpperCase();
+          const isYes = betType === 'YES' || betType === 'BACK';
+          const isNo = betType === 'NO' || betType === 'LAY';
+
+          let legWins = false;
+          if (isNo && actualRuns < line) {
+            legWins = true;
+          }
+          if (isYes && actualRuns >= line) {
+            legWins = true;
+          }
+
+          if (!legWins) {
+            allLegsWin = false;
+            break; // Early exit: if any leg loses, group loses
+          }
+        }
+
+        // Apply group result to ALL bets in the group
+        for (const bet of groupBets) {
+          result.set(bet.id, allLegsWin);
+        }
+      }
+    }
+
+    return result;
+  }
+
   async settleFancyManual(
     eventId: string,
     selectionId: string,
@@ -225,6 +334,11 @@ export class SettlementService {
           let balanceDelta = 0;
           let liabilityDelta = 0;
 
+          // ✅ Evaluate fancy groups (single or double/gola) BEFORE processing bets
+          const winResultMap = isCancel
+            ? new Map<string, boolean>() // Cancel doesn't need evaluation
+            : this.evaluateFancyGroup(userBets, actualRuns);
+
           // 3️⃣ Process each bet
           for (const bet of userBets) {
             // ✅ CORRECT FANCY FIELD MAPPING
@@ -255,19 +369,9 @@ export class SettlementService {
               continue;
             }
 
-            // ✅ CORRECT EXCHANGE FANCY LOGIC
-            // Exchange rule: Equality (actualRuns === line) ALWAYS GOES TO LAY (NO)
-            // Cancellation ONLY happens if admin manually cancels (isCancel === true)
-            // BACK: actualRuns > line → WIN, actualRuns ≤ line → LOSS
-            // LAY: actualRuns ≤ line → WIN, actualRuns > line → LOSS
-            const isBack = betType === 'BACK' || betType === 'YES';
-            const isLay = betType === 'LAY' || betType === 'NO';
-
-            let isWin = false;
-            // ✅ EXCHANGE RULE: Equality goes to LAY (≤)
-            if (isBack && actualRuns > line) isWin = true;
-            if (isLay && actualRuns <= line) isWin = true;
-
+            // ✅ Get win/loss result from group evaluator (handles single fancy and double/gola fancy)
+            const isWin = winResultMap.get(bet.id) ?? false;
+            
             // 3️⃣ Always release liability (use liabilityAmount which is lossAmount for LAY, stake for BACK)
             liabilityDelta -= liabilityAmount;
 

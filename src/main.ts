@@ -38,9 +38,31 @@ async function bootstrap() {
     ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
     : ['*'];
   
+  const isWildcard = allowedOrigins.includes('*');
+  
   await app.register(cors, {
-    origin: allowedOrigins.includes('*') ? true : allowedOrigins,
-    credentials: allowedOrigins.includes('*') ? false : true, // Can't use credentials with wildcard
+    origin: isWildcard ? true : (origin, cb) => {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) {
+        return cb(null, true);
+      }
+      // Check if origin is in allowed list
+      if (allowedOrigins.includes(origin)) {
+        return cb(null, true);
+      }
+      // For production, also allow subdomains
+      const originHost = new URL(origin).hostname;
+      const isAllowed = allowedOrigins.some(allowed => {
+        try {
+          const allowedHost = new URL(allowed).hostname;
+          return originHost === allowedHost || originHost.endsWith('.' + allowedHost);
+        } catch {
+          return false;
+        }
+      });
+      cb(null, isAllowed);
+    },
+    credentials: !isWildcard, // Can't use credentials with wildcard
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type', 
@@ -50,10 +72,12 @@ async function bootstrap() {
       'Origin',
       'Access-Control-Request-Method',
       'Access-Control-Request-Headers',
+      'Content-Length',
     ],
     exposedHeaders: ['Content-Type', 'Authorization'],
     preflight: true,
     strictPreflight: false,
+    maxAge: 86400, // 24 hours
   });
   
   // Enable validation pipes globally
