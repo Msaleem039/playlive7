@@ -1372,7 +1372,74 @@ export class BetsService {
       // If vendor API integration is needed in the future, it can be re-enabled here
 
       this.logger.log(`Bet placed successfully: ${result.betId} for user ${userId}`);
-      return { success: true, debug, available_balance: wallet.balance };
+
+      // Calculate positions for match odds & bookmaker markets only
+      let positions: Record<string, number> = {};
+      
+      // Only calculate positions for match odds and bookmaker markets (exclude fancy)
+      if (actualMarketType === 'matchodds' || actualMarketType === 'match' || actualMarketType === 'bookmaker') {
+        try {
+          // Fetch all pending bets for this user and market
+          const pendingBets = await this.prisma.bet.findMany({
+            where: {
+              userId,
+              marketId,
+              status: BetStatus.PENDING,
+            },
+            select: {
+              selectionId: true,
+              betType: true,
+              betRate: true,
+              odds: true,
+              betValue: true,
+              amount: true,
+              gtype: true,
+            },
+          });
+
+          // Filter to only include match odds and bookmaker bets (exclude fancy)
+          const relevantBets = pendingBets.filter((bet) => {
+            const betGtype = (bet.gtype || '').toLowerCase();
+            return (
+              betGtype === 'matchodds' || 
+              betGtype === 'match' ||
+              betGtype === 'bookmaker' ||
+              (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds')
+            );
+          });
+
+          if (relevantBets.length > 0) {
+            // Extract unique selectionIds from filtered bets to use as selections array
+            const selectionIds = Array.from(
+              new Set(
+                relevantBets
+                  .map((bet) => bet.selectionId)
+                  .filter((id) => id !== null && id !== undefined)
+                  .map((id) => String(id))
+              )
+            );
+
+            if (selectionIds.length > 0) {
+              // Calculate positions using the existing helper function
+              positions = calculatePositions(selectionIds, relevantBets as Bet[]);
+            }
+          }
+        } catch (positionError) {
+          // Log error but don't fail bet placement if position calculation fails
+          this.logger.warn(
+            `Failed to calculate positions for user ${userId}, market ${marketId}:`,
+            positionError instanceof Error ? positionError.message : String(positionError),
+          );
+        }
+      }
+
+      return { 
+        success: true, 
+        betId: result.betId,
+        positions,
+        debug, 
+        available_balance: wallet.balance 
+      };
     } catch (error) {
       this.logger.error(`Error placing bet for user ${userId}:`, error);
       

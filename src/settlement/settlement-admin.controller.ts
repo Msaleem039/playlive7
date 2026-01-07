@@ -323,12 +323,12 @@ export class SettlementAdminController {
   }
 
   /**
-   * Get bet history for a specific user (Admin only)
+   * Get bet history for a specific user (Admin, Agent, and Client access)
    * GET /admin/settlement/bets/user/:userId
    * 
    * Query Parameters:
    * - status (optional): Filter by bet status (PENDING, WON, LOST, CANCELLED)
-   * - limit (optional): Number of results per page (default: 100)
+   * - limit (optional): Number of results per page (default: 20)
    * - offset (optional): Pagination offset (default: 0)
    * - startDate (optional): Filter from date (ISO string)
    * - endDate (optional): Filter to date (ISO string)
@@ -340,6 +340,13 @@ export class SettlementAdminController {
    * - GET /admin/settlement/bets/user/user123?startDate=2024-01-01T00:00:00.000Z&endDate=2024-01-31T23:59:59.999Z
    */
   @Get('bets/user/:userId')
+  @Roles(
+    UserRole.SUPER_ADMIN,
+    UserRole.ADMIN,
+    'SETTLEMENT_ADMIN' as UserRole,
+    UserRole.AGENT,
+    UserRole.CLIENT,
+  )
   async getUserBetHistory(
     @Param('userId') userId: string,
     @Query('status') status?: string,
@@ -363,11 +370,14 @@ export class SettlementAdminController {
       ...(status && { status: status.toUpperCase() }),
     };
 
+    // Set default limit to 20 if not provided
     if (limit) {
       filters.limit = parseInt(limit, 10);
       if (isNaN(filters.limit) || filters.limit < 1) {
         throw new BadRequestException('limit must be a positive number');
       }
+    } else {
+      filters.limit = 20; // Default pagination limit
     }
 
     if (offset) {
@@ -375,6 +385,8 @@ export class SettlementAdminController {
       if (isNaN(filters.offset) || filters.offset < 0) {
         throw new BadRequestException('offset must be a non-negative number');
       }
+    } else {
+      filters.offset = 0; // Default offset
     }
 
     if (startDate) {
