@@ -10,13 +10,44 @@ import { HierarchyPnlService } from './hierarchy-pnl.service';
 @Injectable()
 export class SettlementService {
   private readonly logger = new Logger(SettlementService.name);
+  // Cache for expired/invalid eventIds to avoid repeated API calls
+  private readonly expiredEventIdsCache = new Set<string>();
+  private readonly CACHE_TTL = 60 * 60 * 1000; // 1 hour
+  private readonly cacheTimestamps = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly aggregatorService: AggregatorService,
     private readonly pnlService: PnlService,
     private readonly hierarchyPnlService: HierarchyPnlService,
-  ) {}
+  ) {
+    // Clean expired cache entries every 5 minutes
+    setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
+  }
+
+  private cleanExpiredCache() {
+    const now = Date.now();
+    for (const [eventId, timestamp] of this.cacheTimestamps.entries()) {
+      if (now - timestamp > this.CACHE_TTL) {
+        this.expiredEventIdsCache.delete(eventId);
+        this.cacheTimestamps.delete(eventId);
+      }
+    }
+  }
+
+  private isEventIdExpired(eventId: string): boolean {
+    // Check if eventId is in cache and still valid
+    const timestamp = this.cacheTimestamps.get(eventId);
+    if (timestamp && Date.now() - timestamp < this.CACHE_TTL) {
+      return this.expiredEventIdsCache.has(eventId);
+    }
+    return false;
+  }
+
+  private markEventIdAsExpired(eventId: string) {
+    this.expiredEventIdsCache.add(eventId);
+    this.cacheTimestamps.set(eventId, Date.now());
+  }
 
   // 🧮 HELPER FUNCTIONS (PURE & SAFE)
   // 🔐 STRICT: Use fixed decimal precision (2 decimal places) to avoid floating point drift
@@ -334,10 +365,40 @@ export class SettlementService {
           let balanceDelta = 0;
           let liabilityDelta = 0;
 
+          // ✅ Track credited GOLA groups to prevent over-crediting
+          const creditedGolaGroups = new Set<string>();
+
           // ✅ Evaluate fancy groups (single or double/gola) BEFORE processing bets
           const winResultMap = isCancel
             ? new Map<string, boolean>() // Cancel doesn't need evaluation
             : this.evaluateFancyGroup(userBets, actualRuns);
+
+          // ✅ Pre-calculate GOLA group totals to credit wallet correctly
+          const golaGroupTotals = new Map<string, { totalStake: number; totalProfit: number; betType: string }>();
+          if (!isCancel) {
+            for (const bet of userBets) {
+              const isWin = winResultMap.get(bet.id) ?? false;
+              if (isWin) {
+                const metadata = bet.metadata as any;
+                const isGola = metadata?.fancyGroupType === 'GOLA';
+                const golaGroupId = metadata?.fancyGroupId;
+                
+                if (isGola && golaGroupId) {
+                  const stake = bet.amount ?? 0;
+                  const winAmount = bet.winAmount ?? stake;
+                  const betType = bet.betType?.toUpperCase() || '';
+                  
+                  if (!golaGroupTotals.has(golaGroupId)) {
+                    golaGroupTotals.set(golaGroupId, { totalStake: 0, totalProfit: 0, betType });
+                  }
+                  
+                  const totals = golaGroupTotals.get(golaGroupId)!;
+                  totals.totalStake += stake;
+                  totals.totalProfit += winAmount;
+                }
+              }
+            }
+          }
 
           // 3️⃣ Process each bet
           for (const bet of userBets) {
@@ -377,8 +438,34 @@ export class SettlementService {
 
             // 4️⃣ Apply result (use winAmount/lossAmount from bet record)
             if (isWin) {
-              // ✅ CORRECT: Use winAmount as profit (stored at bet placement)
-              balanceDelta += winAmount;
+              // ✅ GOLA FANCY FIX: Credit wallet ONLY ONCE per group
+              const metadata = bet.metadata as any;
+              const isGola = metadata?.fancyGroupType === 'GOLA';
+              const golaGroupId = metadata?.fancyGroupId;
+
+              if (isGola && golaGroupId) {
+                // GOLA: Credit wallet ONLY ONCE per group with total stake + total profit
+                if (!creditedGolaGroups.has(golaGroupId)) {
+                  // ✅ Credit wallet for GOLA group (ONCE) with total amounts
+                  const groupTotals = golaGroupTotals.get(golaGroupId);
+                  if (groupTotals) {
+                    if (betType === 'BACK' || betType === 'YES') {
+                      balanceDelta += groupTotals.totalStake + groupTotals.totalProfit; // Return total stake + total profit for BACK/YES
+                    } else {
+                      balanceDelta += groupTotals.totalProfit; // Total profit only for LAY/NO
+                    }
+                  }
+                  creditedGolaGroups.add(golaGroupId);
+                }
+                // Other bets in the GOLA group are marked WON but don't affect wallet
+              } else {
+                // ✅ SINGLE/DOUBLE FANCY: Credit wallet per bet (existing logic)
+                if (betType === 'BACK' || betType === 'YES') {
+                  balanceDelta += stake + winAmount; // Return stake + profit for BACK/YES
+                } else {
+                  balanceDelta += winAmount; // Profit only for LAY/NO
+                }
+              }
 
               await tx.bet.update({
                 where: { id: bet.id },
@@ -3351,6 +3438,20 @@ export class SettlementService {
       Array.from(matchMap.values()).map(async (match) => {
         // Fetch market details if we have match odds, match odds including tie, or tied match bets
         if ((match.matchOdds.count > 0 || match.matchOddsIncludingTie.count > 0 || match.tiedMatch.count > 0) && match.eventId) {
+          // Skip if we know this eventId is expired (cached to reduce log noise)
+          if (this.isEventIdExpired(match.eventId)) {
+            return match;
+          }
+
+          // Skip validation for old matches (likely expired) - older than 7 days
+          const matchAge = Date.now() - match.startTime.getTime();
+          const sevenDaysInMs = 7 * 24 * 60 * 60 * 1000;
+          if (matchAge > sevenDaysInMs) {
+            // Auto-mark as expired for very old matches to avoid API calls
+            this.markEventIdAsExpired(match.eventId);
+            return match;
+          }
+
           try {
             const marketDetails = await this.aggregatorService.getMatchDetail(match.eventId);
 
@@ -3675,10 +3776,22 @@ export class SettlementService {
                 );
               }
             }
-          } catch (error) {
-            this.logger.debug(
-              `Failed to fetch market details for eventId ${match.eventId}: ${(error as Error).message}`,
-            );
+          } catch (error: any) {
+            // Suppress duplicate logging for 400 errors - AggregatorService already logs them
+            const errorMessage = (error as Error).message || '';
+            const status = error?.details?.status;
+            const is400Error = status === 400 || errorMessage.includes('status code 400') || errorMessage.includes('(Status: 400)');
+            
+            if (is400Error) {
+              // Cache expired eventId to avoid repeated API calls on subsequent polls
+              if (match.eventId) {
+                this.markEventIdAsExpired(match.eventId);
+              }
+            } else {
+              this.logger.debug(
+                `Failed to fetch market details for eventId ${match.eventId}: ${errorMessage}`,
+              );
+            }
           }
         }
 
@@ -4235,6 +4348,20 @@ export class SettlementService {
       Array.from(matchMap.values()).map(async (match) => {
         // Fetch market details if we have match odds, match odds including tie, or tied match bets
         if ((match.matchOdds.count > 0 || match.matchOddsIncludingTie.count > 0 || match.tiedMatch.count > 0) && match.eventId) {
+          // Skip if we know this eventId is expired (cached to reduce log noise)
+          if (this.isEventIdExpired(match.eventId)) {
+            return match;
+          }
+
+          // Skip validation for old matches (likely expired) - older than 7 days
+          const matchAge = Date.now() - match.startTime.getTime();
+          const sevenDaysInMs = 7 * 24 * 60 * 60 * 1000;
+          if (matchAge > sevenDaysInMs) {
+            // Auto-mark as expired for very old matches to avoid API calls
+            this.markEventIdAsExpired(match.eventId);
+            return match;
+          }
+
           try {
             const marketDetails = await this.aggregatorService.getMatchDetail(match.eventId);
             
@@ -4562,9 +4689,13 @@ export class SettlementService {
               }
             }
           } catch (error) {
-            this.logger.debug(
-              `Failed to fetch market details for eventId ${match.eventId}: ${(error as Error).message}`,
-            );
+            // Suppress duplicate logging for 400 errors - AggregatorService already logs them
+            const errorMessage = (error as Error).message || '';
+            if (!errorMessage.includes('status code 400')) {
+              this.logger.debug(
+                `Failed to fetch market details for eventId ${match.eventId}: ${errorMessage}`,
+              );
+            }
           }
         }
 

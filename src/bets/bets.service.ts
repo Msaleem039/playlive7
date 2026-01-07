@@ -90,61 +90,75 @@ export class BetsService {
     userId: string,
     marketId: string,
   ): Promise<number> {
-    const bets = await tx.bet.findMany({
-      where: {
-        userId,
-        marketId,
-        status: BetStatus.PENDING,
-        gtype: { in: ['matchodds', 'match'] },
-      },
-      select: {
-        betType: true,
-        winAmount: true,
-        lossAmount: true,
-        betValue: true,
-        selectionId: true,
-      },
-    });
-  
-    /**
-     * Group by selection (runner)
-     */
-    const selectionMap = new Map<
-      number,
-      {
-        profitIfWin: number;
-        profitIfLose: number;
+    try {
+      const bets = await tx.bet.findMany({
+        where: {
+          userId,
+          marketId,
+          status: BetStatus.PENDING,
+          gtype: { in: ['matchodds', 'match'] },
+        },
+        select: {
+          betType: true,
+          winAmount: true,
+          lossAmount: true,
+          betValue: true,
+          selectionId: true,
+        },
+      });
+    
+      /**
+       * Group by selection (runner)
+       */
+      const selectionMap = new Map<
+        number,
+        {
+          profitIfWin: number;
+          profitIfLose: number;
+        }
+      >();
+    
+      for (const bet of bets) {
+        if (!selectionMap.has(bet.selectionId)) {
+          selectionMap.set(bet.selectionId, {
+            profitIfWin: 0,
+            profitIfLose: 0,
+          });
+        }
+    
+        const pnl = selectionMap.get(bet.selectionId)!;
+    
+        if (bet.betType === 'BACK') {
+          pnl.profitIfWin += bet.winAmount;
+          pnl.profitIfLose -= bet.lossAmount;
+        } else {
+          // LAY
+          pnl.profitIfWin -= bet.lossAmount;
+          pnl.profitIfLose += bet.betValue;
+        }
       }
-    >();
-  
-    for (const bet of bets) {
-      if (!selectionMap.has(bet.selectionId)) {
-        selectionMap.set(bet.selectionId, {
-          profitIfWin: 0,
-          profitIfLose: 0,
-        });
+    
+      let marketExposure = 0;
+    
+      for (const [, pnl] of selectionMap) {
+        const worstLoss = Math.min(pnl.profitIfWin, pnl.profitIfLose, 0);
+        marketExposure += Math.abs(worstLoss);
       }
-  
-      const pnl = selectionMap.get(bet.selectionId)!;
-  
-      if (bet.betType === 'BACK') {
-        pnl.profitIfWin += bet.winAmount;
-        pnl.profitIfLose -= bet.lossAmount;
-      } else {
-        // LAY
-        pnl.profitIfWin -= bet.lossAmount;
-        pnl.profitIfLose += bet.betValue;
+    
+      return marketExposure;
+    } catch (error: any) {
+      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+      if (error?.message?.includes('Transaction not found') || 
+          error?.message?.includes('Transaction ID is invalid') ||
+          error?.message?.includes('Transaction already closed')) {
+        this.logger.warn(
+          `Transaction invalid in calculateMatchOddsExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
+        );
+        return 0;
       }
+      // Re-throw other errors
+      throw error;
     }
-  
-    let marketExposure = 0;
-  
-    for (const [, pnl] of selectionMap) {
-      const worstLoss = Math.min(pnl.profitIfWin, pnl.profitIfLose, 0);
-      marketExposure += Math.abs(worstLoss);
-    }
-  
-    return marketExposure;
   }
   
 
@@ -166,37 +180,52 @@ export class BetsService {
     userId: string,
     marketId: string,
   ): Promise<number> {
-    const bets = await tx.bet.findMany({
-      where: {
-        userId,
-        status: BetStatus.PENDING,
-        gtype: 'fancy',
-        marketId,
-      },
-      select: {
-        betType: true,
-        betValue: true,
-        amount: true,
-      },
-    });
+    try {
+      const bets = await tx.bet.findMany({
+        where: {
+          userId,
+          status: BetStatus.PENDING,
+          gtype: 'fancy',
+          marketId,
+        },
+        select: {
+          betType: true,
+          betValue: true,
+          amount: true,
+        },
+      });
 
-    let totalBackStake = 0;
-    let totalLayStake = 0;
+      let totalBackStake = 0;
+      let totalLayStake = 0;
 
-    for (const bet of bets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
+      for (const bet of bets) {
+        const stake = bet.betValue ?? bet.amount ?? 0;
+        const betTypeUpper = (bet.betType || '').toUpperCase();
 
-      // FANCY: liability = stake (for both BACK and LAY)
-      if (betTypeUpper === 'BACK') {
-        totalBackStake += stake;
-      } else if (betTypeUpper === 'LAY') {
-        totalLayStake += stake;
+        // FANCY: liability = stake (for both BACK and LAY)
+        // YES/NO are treated the same as BACK/LAY
+        if (betTypeUpper === 'BACK' || betTypeUpper === 'YES') {
+          totalBackStake += stake;
+        } else if (betTypeUpper === 'LAY' || betTypeUpper === 'NO') {
+          totalLayStake += stake;
+        }
       }
-    }
 
-    // Exposure = abs(totalBackStake - totalLayStake)
-    return Math.abs(totalBackStake - totalLayStake);
+      // Exposure = abs(totalBackStake - totalLayStake)
+      return Math.abs(totalBackStake - totalLayStake);
+    } catch (error: any) {
+      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+      if (error?.message?.includes('Transaction not found') || 
+          error?.message?.includes('Transaction ID is invalid') ||
+          error?.message?.includes('Transaction already closed')) {
+        this.logger.warn(
+          `Transaction invalid in calculateFancyExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
+        );
+        return 0;
+      }
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   /**
@@ -217,50 +246,64 @@ export class BetsService {
     userId: string,
     marketId: string,
   ): Promise<number> {
-    // Query for bookmaker bets: includes 'bookmaker' and numbered match variants (match1, match2, etc.)
-    // First, find all bets for this marketId to check gtype patterns
-    const allBets = await tx.bet.findMany({
-      where: {
-        userId,
-        status: BetStatus.PENDING,
-        marketId,
-      },
-      select: {
-        gtype: true,
-        betType: true,
-        betValue: true,
-        amount: true,
-        betRate: true,
-        odds: true,
-      },
-    });
+    try {
+      // Query for bookmaker bets: includes 'bookmaker' and numbered match variants (match1, match2, etc.)
+      // First, find all bets for this marketId to check gtype patterns
+      const allBets = await tx.bet.findMany({
+        where: {
+          userId,
+          status: BetStatus.PENDING,
+          marketId,
+        },
+        select: {
+          gtype: true,
+          betType: true,
+          betValue: true,
+          amount: true,
+          betRate: true,
+          odds: true,
+        },
+      });
 
-    // Filter for bookmaker bets: 'bookmaker' or numbered match variants (match1, match2, etc.)
-    const bets = allBets.filter((bet: any) => {
-      const betGtype = (bet.gtype || '').toLowerCase();
-      return betGtype === 'bookmaker' || 
-             (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds');
-    });
+      // Filter for bookmaker bets: 'bookmaker' or numbered match variants (match1, match2, etc.)
+      const bets = allBets.filter((bet: any) => {
+        const betGtype = (bet.gtype || '').toLowerCase();
+        return betGtype === 'bookmaker' || 
+               (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds');
+      });
 
-    let totalBackStake = 0;
-    let totalLayLiability = 0;
+      let totalBackStake = 0;
+      let totalLayLiability = 0;
 
-    for (const bet of bets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const odds = bet.betRate ?? bet.odds ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
+      for (const bet of bets) {
+        const stake = bet.betValue ?? bet.amount ?? 0;
+        const odds = bet.betRate ?? bet.odds ?? 0;
+        const betTypeUpper = (bet.betType || '').toUpperCase();
 
-      if (betTypeUpper === 'BACK') {
-        // BOOKMAKER BACK: liability = stake
-        totalBackStake += stake;
-      } else if (betTypeUpper === 'LAY') {
-        // BOOKMAKER LAY: liability = (odds - 1) × stake
-        totalLayLiability += (odds - 1) * stake;
+        if (betTypeUpper === 'BACK') {
+          // BOOKMAKER BACK: liability = stake
+          totalBackStake += stake;
+        } else if (betTypeUpper === 'LAY') {
+          // BOOKMAKER LAY: liability = (odds - 1) × stake
+          totalLayLiability += (odds - 1) * stake;
+        }
       }
-    }
 
-    // Exposure = abs(totalBackStake - totalLayLiability)
-    return Math.abs(totalBackStake - totalLayLiability);
+      // Exposure = abs(totalBackStake - totalLayLiability)
+      return Math.abs(totalBackStake - totalLayLiability);
+    } catch (error: any) {
+      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+      if (error?.message?.includes('Transaction not found') || 
+          error?.message?.includes('Transaction ID is invalid') ||
+          error?.message?.includes('Transaction already closed')) {
+        this.logger.warn(
+          `Transaction invalid in calculateBookmakerExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
+        );
+        return 0;
+      }
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   /**
@@ -274,40 +317,54 @@ export class BetsService {
    * @returns Total net exposure across all markets
    */
   private async calculateTotalExposure(tx: any, userId: string): Promise<number> {
-    // Get all unique marketIds grouped by gtype
-    const bets = await tx.bet.findMany({
-      where: {
-        userId,
-        status: BetStatus.PENDING,
-      },
-      select: {
-        gtype: true,
-        marketId: true,
-      },
-      distinct: ['gtype', 'marketId'],
-    });
+    try {
+      // Get all unique marketIds grouped by gtype
+      const bets = await tx.bet.findMany({
+        where: {
+          userId,
+          status: BetStatus.PENDING,
+        },
+        select: {
+          gtype: true,
+          marketId: true,
+        },
+        distinct: ['gtype', 'marketId'],
+      });
 
-    let totalExposure = 0;
+      let totalExposure = 0;
 
-    for (const bet of bets) {
-      if (!bet.marketId) continue;
+      for (const bet of bets) {
+        if (!bet.marketId) continue;
 
-      const gtype = (bet.gtype || '').toLowerCase();
-      const marketId = bet.marketId;
+        const gtype = (bet.gtype || '').toLowerCase();
+        const marketId = bet.marketId;
 
-      // Handle "match" as alias for "matchodds"
-      if (gtype === 'matchodds' || gtype === 'match') {
-        totalExposure += await this.calculateMatchOddsExposure(tx, userId, marketId);
-      } else if (gtype === 'fancy') {
-        totalExposure += await this.calculateFancyExposure(tx, userId, marketId);
-      } else if (gtype === 'bookmaker' || 
-                 (gtype.startsWith('match') && gtype !== 'match' && gtype !== 'matchodds')) {
-        // Handle "match1", "match2", etc. as bookmaker (numbered match markets are bookmaker)
-        totalExposure += await this.calculateBookmakerExposure(tx, userId, marketId);
+        // Handle "match" as alias for "matchodds"
+        if (gtype === 'matchodds' || gtype === 'match') {
+          totalExposure += await this.calculateMatchOddsExposure(tx, userId, marketId);
+        } else if (gtype === 'fancy') {
+          totalExposure += await this.calculateFancyExposure(tx, userId, marketId);
+        } else if (gtype === 'bookmaker' || 
+                   (gtype.startsWith('match') && gtype !== 'match' && gtype !== 'matchodds')) {
+          // Handle "match1", "match2", etc. as bookmaker (numbered match markets are bookmaker)
+          totalExposure += await this.calculateBookmakerExposure(tx, userId, marketId);
+        }
       }
-    }
 
-    return totalExposure;
+      return totalExposure;
+    } catch (error: any) {
+      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+      if (error?.message?.includes('Transaction not found') || 
+          error?.message?.includes('Transaction ID is invalid') ||
+          error?.message?.includes('Transaction already closed')) {
+        this.logger.warn(
+          `Transaction invalid in calculateTotalExposure for userId: ${userId}. Returning 0 exposure.`,
+        );
+        return 0;
+      }
+      // Re-throw other errors
+      throw error;
+    }
   }
 
   // ---------------------------- MOCK DATABASE FUNCTIONS ---------------------------- //
@@ -875,43 +932,60 @@ export class BetsService {
 
         const bet = await tx.bet.create({ data: betData });
 
-        // Step 4: Fancy wallet update (SIMPLIFIED - NO EXPOSURE CALCULATION NEEDED)
+        // Step 4: Fancy wallet update with YES/NO netting
         // ✅ EXCHANGE RULE: Fancy liability ALWAYS = stake (for both BACK and LAY)
         // Every Fancy bet adds exactly `stake` to liability
         // Wallet invariant: balance + liability = constant
-        const stake = normalizedBetValue;
+        
+        // ✅ Recalculate total fancy exposure AFTER bet creation
+        const newExposure = await this.calculateFancyExposure(
+          tx,
+          userId,
+          marketId,
+        );
 
-        if (currentBalance < stake) {
+        const exposureDelta = newExposure - currentLiability;
+
+        // Deduct only if exposure increases
+        if (exposureDelta > 0 && currentBalance < exposureDelta) {
           throw new Error(
             `Insufficient available balance. ` +
-            `Balance: ${currentBalance}, Required: ${stake}, ` +
-            `Current Liability: ${currentLiability}`,
+            `Balance: ${currentBalance}, Required: ${exposureDelta}`,
           );
         }
 
-        // ✅ FANCY: Direct deduction - liability always increases by stake
         await tx.wallet.update({
           where: { userId },
           data: {
-            balance: currentBalance - stake,
-            liability: currentLiability + stake,
+            balance:
+              exposureDelta >= 0
+                ? currentBalance - exposureDelta
+                : currentBalance + Math.abs(exposureDelta),
+            liability: newExposure,
           },
         });
 
+        const stake = normalizedBetValue;
         await tx.transaction.create({
           data: {
             walletId: currentWallet.id,
-            amount: stake,
+            amount: Math.abs(exposureDelta),
             type: TransactionType.BET_PLACED,
-            description: `Fancy bet placed: ${bet_name} (${bet_type}) - Stake: ${stake}`,
+            description:
+              exposureDelta > 0
+                ? `Fancy bet placed (net): ${bet_name} (${bet_type}) - Stake: ${exposureDelta}`
+                : `Fancy bet offset: ${bet_name} (${bet_type})`,
           },
         });
 
         debug.fancy_stake = stake;
         debug.fancy_old_balance = currentBalance;
-        debug.fancy_new_balance = currentBalance - stake;
+        debug.fancy_new_balance =
+          exposureDelta >= 0
+            ? currentBalance - exposureDelta
+            : currentBalance + Math.abs(exposureDelta);
         debug.fancy_old_liability = currentLiability;
-        debug.fancy_new_liability = currentLiability + stake;
+        debug.fancy_new_liability = newExposure;
 
         return { betId: bet.id };
       },
