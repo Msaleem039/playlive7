@@ -298,93 +298,87 @@ export class BetsService {
    * All wallet updates MUST use exposureDelta = totalExposureAfter - totalExposureBefore
    * to maintain this invariant across all market types.
    * 
+   * 🚀 OPTIMIZED: Fetches all bets in a single query to avoid transaction timeouts
+   * 
    * @param tx - Prisma transaction client
    * @param userId - User ID
    * @returns Total net exposure across all markets
    */
   private async calculateTotalExposure(tx: any, userId: string): Promise<number> {
     try {
-      // ✅ CRITICAL: Get unique marketIds for Match Odds and Bookmaker separately
-      // Get unique (eventId, selectionId) for Fancy separately
-      // This ensures we never miss exposure from any market type
-      
-      // Get all unique Match Odds marketIds
-      const matchOddsBets = await tx.bet.findMany({
+      // ✅ OPTIMIZED: Fetch ALL pending bets in a single query to avoid transaction timeout
+      // This reduces N+1 queries from potentially dozens to just 1 query
+      const allBets = await tx.bet.findMany({
         where: {
           userId,
           status: BetStatus.PENDING,
-          gtype: { in: ['matchodds', 'match'] },
-          marketId: { not: null },
-        },
-        select: {
-          marketId: true,
-        },
-        distinct: ['marketId'],
-      });
-
-      // Get all unique Bookmaker marketIds
-      // Bookmaker includes 'bookmaker' and numbered match variants (match1, match2, etc.)
-      const allBookmakerBets = await tx.bet.findMany({
-        where: {
-          userId,
-          status: BetStatus.PENDING,
-          marketId: { not: null },
         },
         select: {
           gtype: true,
           marketId: true,
-        },
-      });
-
-      // Filter for bookmaker bets: 'bookmaker' or numbered match variants (match1, match2, etc.)
-      const bookmakerMarketIds = new Set<string>();
-      for (const bet of allBookmakerBets) {
-        const betGtype = (bet.gtype || '').toLowerCase();
-        if (
-          betGtype === 'bookmaker' ||
-          (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds')
-        ) {
-          if (bet.marketId) {
-            bookmakerMarketIds.add(bet.marketId);
-          }
-        }
-      }
-
-      // Get all unique Fancy (eventId, selectionId) combinations
-      const fancyBets = await tx.bet.findMany({
-        where: {
-          userId,
-          status: BetStatus.PENDING,
-          gtype: 'fancy',
-          eventId: { not: null },
-          selectionId: { not: null },
-        },
-        select: {
           eventId: true,
           selectionId: true,
+          betType: true,
+          winAmount: true,
+          lossAmount: true,
+          betValue: true,
+          amount: true,
+          betRate: true,
+          odds: true,
         },
-        distinct: ['eventId', 'selectionId'],
       });
+
+      // Group bets by market type for efficient calculation
+      const matchOddsBetsByMarket = new Map<string, typeof allBets>();
+      const bookmakerBetsByMarket = new Map<string, typeof allBets>();
+      const fancyBetsBySelection = new Map<string, typeof allBets>();
+
+      for (const bet of allBets) {
+        const betGtype = (bet.gtype || '').toLowerCase();
+        
+        // Match Odds bets
+        if ((betGtype === 'matchodds' || betGtype === 'match') && bet.marketId) {
+          if (!matchOddsBetsByMarket.has(bet.marketId)) {
+            matchOddsBetsByMarket.set(bet.marketId, []);
+          }
+          matchOddsBetsByMarket.get(bet.marketId)!.push(bet);
+        }
+        // Bookmaker bets (including match1, match2, etc.)
+        else if (
+          bet.marketId &&
+          (betGtype === 'bookmaker' ||
+           (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds'))
+        ) {
+          if (!bookmakerBetsByMarket.has(bet.marketId)) {
+            bookmakerBetsByMarket.set(bet.marketId, []);
+          }
+          bookmakerBetsByMarket.get(bet.marketId)!.push(bet);
+        }
+        // Fancy bets
+        else if (betGtype === 'fancy' && bet.eventId && bet.selectionId) {
+          const key = `${bet.eventId}_${bet.selectionId}`;
+          if (!fancyBetsBySelection.has(key)) {
+            fancyBetsBySelection.set(key, []);
+          }
+          fancyBetsBySelection.get(key)!.push(bet);
+        }
+      }
 
       let totalExposure = 0;
 
-      // ✅ Calculate Match Odds exposure ONCE per marketId
-      for (const bet of matchOddsBets) {
-        if (bet.marketId) {
-          totalExposure += await this.calculateMatchOddsExposure(tx, userId, bet.marketId);
-        }
+      // Calculate Match Odds exposure (in memory, no additional queries)
+      for (const [marketId, bets] of matchOddsBetsByMarket) {
+        totalExposure += this.calculateMatchOddsExposureInMemory(bets);
       }
 
-      // ✅ Calculate Bookmaker exposure ONCE per marketId
-      for (const marketId of bookmakerMarketIds) {
-        totalExposure += await this.calculateBookmakerExposure(tx, userId, marketId);
+      // Calculate Bookmaker exposure (in memory, no additional queries)
+      for (const [marketId, bets] of bookmakerBetsByMarket) {
+        totalExposure += this.calculateBookmakerExposureInMemory(bets);
       }
 
-      // ✅ Calculate Fancy exposure per (eventId, selectionId)
-      for (const bet of fancyBets) {
-        if (bet.eventId && bet.selectionId) {
-          totalExposure += await this.calculateFancyExposure(tx, userId, bet.eventId, Number(bet.selectionId));
-        }
+      // Calculate Fancy exposure (in memory, no additional queries)
+      for (const [key, bets] of fancyBetsBySelection) {
+        totalExposure += this.calculateFancyExposureInMemory(bets);
       }
 
       return totalExposure;
@@ -401,6 +395,98 @@ export class BetsService {
       // Re-throw other errors
       throw error;
     }
+  }
+
+  /**
+   * Calculate Match Odds exposure in memory (no database queries)
+   * @param bets - Array of bets for the market
+   * @returns Net exposure for this Match Odds market
+   */
+  private calculateMatchOddsExposureInMemory(bets: any[]): number {
+    // Group by selection (runner)
+    const selectionMap = new Map<
+      number,
+      {
+        profitIfWin: number;
+        profitIfLose: number;
+      }
+    >();
+
+    for (const bet of bets) {
+      if (!selectionMap.has(bet.selectionId)) {
+        selectionMap.set(bet.selectionId, {
+          profitIfWin: 0,
+          profitIfLose: 0,
+        });
+      }
+
+      const pnl = selectionMap.get(bet.selectionId)!;
+
+      if (bet.betType === 'BACK') {
+        pnl.profitIfWin += bet.winAmount || 0;
+        pnl.profitIfLose -= bet.lossAmount || 0;
+      } else {
+        // LAY
+        pnl.profitIfWin -= bet.lossAmount || 0;
+        pnl.profitIfLose += bet.betValue || bet.amount || 0;
+      }
+    }
+
+    let marketExposure = 0;
+
+    for (const [, pnl] of selectionMap) {
+      const worstLoss = Math.min(pnl.profitIfWin, pnl.profitIfLose, 0);
+      marketExposure += Math.abs(worstLoss);
+    }
+
+    return marketExposure;
+  }
+
+  /**
+   * Calculate Bookmaker exposure in memory (no database queries)
+   * @param bets - Array of bets for the market
+   * @returns Net exposure for this Bookmaker market
+   */
+  private calculateBookmakerExposureInMemory(bets: any[]): number {
+    let totalBackStake = 0;
+    let totalLayLiability = 0;
+
+    for (const bet of bets) {
+      const stake = bet.betValue ?? bet.amount ?? 0;
+      const odds = bet.betRate ?? bet.odds ?? 0;
+      const betTypeUpper = (bet.betType || '').toUpperCase();
+
+      if (betTypeUpper === 'BACK') {
+        totalBackStake += stake;
+      } else if (betTypeUpper === 'LAY') {
+        totalLayLiability += (odds - 1) * stake;
+      }
+    }
+
+    return Math.abs(totalBackStake - totalLayLiability);
+  }
+
+  /**
+   * Calculate Fancy exposure in memory (no database queries)
+   * @param bets - Array of bets for the fancy selection
+   * @returns Net exposure for this Fancy selection
+   */
+  private calculateFancyExposureInMemory(bets: any[]): number {
+    let totalBackStake = 0;
+    let totalLayStake = 0;
+
+    for (const bet of bets) {
+      const stake = bet.betValue ?? bet.amount ?? 0;
+      const betTypeUpper = (bet.betType || '').toUpperCase();
+
+      if (betTypeUpper === 'BACK' || betTypeUpper === 'YES') {
+        totalBackStake += stake;
+      } else if (betTypeUpper === 'LAY' || betTypeUpper === 'NO') {
+        totalLayStake += stake;
+      }
+    }
+
+    return Math.abs(totalBackStake - totalLayStake);
   }
 
   async selectOneRow(table: string, idField: string, userId: string) {
@@ -782,8 +868,8 @@ export class BetsService {
         return { betId: bet.id };
       },
       {
-        maxWait: 10000,
-        timeout: 20000,
+        maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
+        timeout: 30000, // Increased from 20000 to prevent transaction timeouts
       },
     );
   }
@@ -948,8 +1034,8 @@ export class BetsService {
         return { betId: bet.id };
       },
       {
-        maxWait: 10000,
-        timeout: 20000,
+        maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
+        timeout: 30000, // Increased from 20000 to prevent transaction timeouts
       },
     );
   }
