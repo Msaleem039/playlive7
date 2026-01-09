@@ -1368,12 +1368,36 @@ export class BetsService {
 
           debug.exposure_delta = exposureDelta;
           debug.market_type = actualMarketType;
+          
+          // Add market-specific exposure breakdowns for debugging (matching old format for compatibility)
+          if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
+            debug.matchodds_old_exposure = oldExposure.matchOdds;
+            debug.matchodds_new_exposure = newExposure.matchOdds;
+            debug.matchodds_exposure_diff = newExposure.matchOdds - oldExposure.matchOdds;
+          } else if (actualMarketType === 'fancy') {
+            debug.fancy_old_exposure = oldExposure.fancy;
+            debug.fancy_new_exposure = newExposure.fancy;
+            debug.fancy_exposure_diff = newExposure.fancy - oldExposure.fancy;
+          } else if (actualMarketType === 'bookmaker') {
+            debug.bookmaker_old_exposure = oldExposure.bookmaker;
+            debug.bookmaker_new_exposure = newExposure.bookmaker;
+            debug.bookmaker_exposure_diff = newExposure.bookmaker - oldExposure.bookmaker;
+          }
+          
+          // Add current wallet state for debugging
+          debug.current_balance = currentBalance;
+          debug.current_liability = currentLiability;
+          debug.new_total_exposure = newNetExposure;
 
           // 🔐 STEP 6: Validate balance (only if exposure is increasing)
           if (exposureDelta > 0 && currentBalance < exposureDelta) {
+            const shortfall = exposureDelta - currentBalance;
             throw new Error(
               `Insufficient available balance. ` +
-              `Balance: ${currentBalance}, Required: ${exposureDelta}`,
+              `Balance: ${currentBalance}, Required: ${exposureDelta}, Shortfall: ${shortfall}. ` +
+              `Current Liability: ${currentLiability}, Old Net Exposure: ${oldNetExposure.toFixed(2)}, New Net Exposure: ${newNetExposure.toFixed(2)}. ` +
+              `Old Exposure Breakdown: MO=${oldExposure.matchOdds.toFixed(2)}, Fancy=${oldExposure.fancy.toFixed(2)}, BM=${oldExposure.bookmaker.toFixed(2)}. ` +
+              `New Exposure Breakdown: MO=${newExposure.matchOdds.toFixed(2)}, Fancy=${newExposure.fancy.toFixed(2)}, BM=${newExposure.bookmaker.toFixed(2)}`,
             );
           }
 
@@ -1554,14 +1578,19 @@ export class BetsService {
 
       // Handle insufficient funds error (thrown from transaction)
       if (errorMessage.includes('Insufficient available balance')) {
+        // Extract shortfall from error message if available
+        const shortfallMatch = errorMessage.match(/Shortfall: ([\d.]+)/);
+        const shortfall = shortfallMatch ? parseFloat(shortfallMatch[1]) : null;
+        
         throw new HttpException(
           {
             success: false,
-            error: 'Insufficient available balance to lock liability.',
+            error: `Insufficient available balance to lock liability. ${shortfall ? `Shortfall: ${shortfall}` : ''}`,
             code: 'INSUFFICIENT_FUNDS',
             debug: {
               ...debug,
               error_details: errorMessage,
+              ...(shortfall && { shortfall }),
             },
           },
           400,
