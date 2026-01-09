@@ -420,4 +420,82 @@ export class SettlementAdminController {
   ) {
     return this.settlementService.deleteBet(betIdOrSettlementId, user.id);
   }
+
+  /**
+   * Cancel multiple bets and refund all affected users (Admin only)
+   * Accessible by: SUPER_ADMIN, ADMIN, SETTLEMENT_ADMIN
+   * POST /admin/settlement/cancel-bets
+   * 
+   * This will:
+   * - Cancel all pending bets matching the criteria
+   * - Refund all users who placed those bets
+   * - Release liability for all cancelled bets
+   * - Create refund transaction records
+   * 
+   * Request Body (at least one filter required):
+   * {
+   *   "settlementId": "CRICKET:MATCHODDS:35100660:6571503686236",  // Optional: Cancel by settlementId
+   *   "eventId": "35100660",                                        // Optional: Cancel all bets for event
+   *   "marketId": "6571503686236",                                  // Optional: Cancel bets for specific market
+   *   "selectionId": "5728187",                                     // Optional: Cancel bets for specific selection (Fancy)
+   *   "betIds": ["bet1", "bet2", "bet3"]                           // Optional: Cancel specific bet IDs
+   * }
+   * 
+   * Examples:
+   * 1. Cancel all bets for a market:
+   *    POST /admin/settlement/cancel-bets
+   *    { "eventId": "35100660", "marketId": "6571503686236" }
+   * 
+   * 2. Cancel all bets for an event:
+   *    POST /admin/settlement/cancel-bets
+   *    { "eventId": "35100660" }
+   * 
+   * 3. Cancel all fancy bets for a selection:
+   *    POST /admin/settlement/cancel-bets
+   *    { "eventId": "35100660", "selectionId": "12345" }
+   * 
+   * 4. Cancel specific bets by ID:
+   *    POST /admin/settlement/cancel-bets
+   *    { "betIds": ["bet1", "bet2", "bet3"] }
+   * 
+   * 5. Cancel by settlementId:
+   *    POST /admin/settlement/cancel-bets
+   *    { "settlementId": "CRICKET:MATCHODDS:35100660:6571503686236" }
+   * 
+   * Response:
+   * {
+   *   "success": true,
+   *   "message": "Successfully cancelled X bet(s) and refunded Y user(s)",
+   *   "data": {
+   *     "cancelledBetsCount": 10,
+   *     "refundedUsersCount": 5,
+   *     "totalRefundAmount": 1500.00,
+   *     "cancelledBets": [...]
+   *   }
+   * }
+   */
+  @Post('cancel-bets')
+  async cancelBetsBulk(
+    @Body() filters: {
+      settlementId?: string;
+      eventId?: string;
+      marketId?: string;
+      selectionId?: string;
+      betIds?: string[];
+    },
+    @CurrentUser() user: User,
+  ) {
+    // Validate that at least one filter is provided
+    if (
+      !filters.settlementId &&
+      !filters.eventId &&
+      (!filters.betIds || filters.betIds.length === 0)
+    ) {
+      throw new BadRequestException(
+        'At least one filter must be provided: settlementId, eventId, or betIds',
+      );
+    }
+
+    return this.settlementService.cancelBetsBulk(user.id, filters);
+  }
 }

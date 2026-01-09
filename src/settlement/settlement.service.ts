@@ -1239,10 +1239,16 @@ export class SettlementService {
       let marketDetails: any[] | null = null; // Declared here for reuse in tie handling
       let validSelectionIds: number[] | null = null;
 
-      // Try to fetch market details from API
-      try {
-        const apiResponse = await this.aggregatorService.getMatchDetail(eventId);
-        marketDetails = Array.isArray(apiResponse) ? apiResponse : null;
+      // Check if eventId is already known to be expired (avoid unnecessary API calls)
+      if (this.isEventIdExpired(eventId)) {
+        this.logger.debug(
+          `Skipping API call for expired eventId ${eventId} (cached). Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
+        );
+      } else {
+        // Try to fetch market details from API
+        try {
+          const apiResponse = await this.aggregatorService.getMatchDetail(eventId);
+          marketDetails = Array.isArray(apiResponse) ? apiResponse : null;
         if (marketDetails && marketDetails.length > 0) {
           // Find Match Odds market
           const matchOddsMarket = marketDetails.find((market: any) => {
@@ -1263,12 +1269,23 @@ export class SettlementService {
             );
           }
         }
-      } catch (error) {
-        // API failed - will validate against bets instead
-        this.logger.warn(
-          `Market API validation failed: ${(error as Error).message}. ` +
-          `Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
-        );
+        } catch (error: any) {
+          // Check if this is a 400 error (invalid/expired eventId) - mark as expired
+          const status = error?.details?.status || error?.response?.status;
+          if (status === 400) {
+            // Mark as expired to avoid future API calls for this eventId
+            this.markEventIdAsExpired(eventId);
+            this.logger.debug(
+              `EventId ${eventId} marked as expired. Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
+            );
+          } else {
+            // API failed for other reasons - will validate against bets instead
+            this.logger.warn(
+              `Market API validation failed: ${(error as Error).message}. ` +
+              `Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
+            );
+          }
+        }
       }
 
       // If API validation failed or no valid runners found, validate against bets
@@ -1337,17 +1354,35 @@ export class SettlementService {
       // 🔐 STRICT TIE HANDLING: Check for tie result using market runners
       // ✅ CORRECT RULE: Market runners define outcome - never bets
       let isCancel = false;
-      // Reuse marketDetails if already fetched, otherwise try to fetch
+      // Reuse marketDetails if already fetched, otherwise try to fetch (but check cache first)
       if (!marketDetails) {
-        try {
-          const apiResponse = await this.aggregatorService.getMatchDetail(eventId);
-          marketDetails = Array.isArray(apiResponse) ? apiResponse : null;
-        } catch (error) {
-          this.logger.warn(
-            `Could not fetch market details for tie detection: ${(error as Error).message}. ` +
-            `Skipping tie detection - will settle normally.`,
+        // Check if eventId is already known to be expired (avoid unnecessary API calls)
+        if (this.isEventIdExpired(eventId)) {
+          this.logger.debug(
+            `Skipping tie detection API call for expired eventId ${eventId} (cached). Will settle normally.`,
           );
           marketDetails = null;
+        } else {
+          try {
+            const apiResponse = await this.aggregatorService.getMatchDetail(eventId);
+            marketDetails = Array.isArray(apiResponse) ? apiResponse : null;
+          } catch (error: any) {
+            // Check if this is a 400 error (invalid/expired eventId) - mark as expired
+            const status = error?.details?.status || error?.response?.status;
+            if (status === 400) {
+              // Mark as expired to avoid future API calls for this eventId
+              this.markEventIdAsExpired(eventId);
+              this.logger.debug(
+                `EventId ${eventId} marked as expired. Skipping tie detection - will settle normally.`,
+              );
+            } else {
+              this.logger.warn(
+                `Could not fetch market details for tie detection: ${(error as Error).message}. ` +
+                `Skipping tie detection - will settle normally.`,
+              );
+            }
+            marketDetails = null;
+          }
         }
       }
 
@@ -2425,6 +2460,251 @@ export class SettlementService {
         refundAmount,
       },
     };
+  }
+
+  /**
+   * Cancel all pending bets for a specific market/event/selection and refund all affected users
+   * 
+   * This method cancels all pending bets matching the criteria and refunds all users who placed those bets.
+   * Supports cancellation by:
+   * - settlementId (e.g., "CRICKET:MATCHODDS:35100660:6571503686236")
+   * - eventId + marketId (for Match Odds/Bookmaker markets)
+   * - eventId + selectionId (for Fancy markets)
+   * - eventId only (all markets for the event)
+   * 
+   * @param adminId - Admin user ID who is performing the cancellation
+   * @param filters - Filter criteria to select which bets to cancel
+   * @returns Summary of cancelled bets and refunds
+   */
+  async cancelBetsBulk(
+    adminId: string,
+    filters: {
+      settlementId?: string;
+      eventId?: string;
+      marketId?: string;
+      selectionId?: string;
+      betIds?: string[];
+    },
+  ) {
+    try {
+      // Build where clause for finding bets to cancel
+      const whereClause: any = {
+        status: BetStatus.PENDING,
+      };
+
+      // Filter by settlementId if provided (most specific)
+      if (filters.settlementId) {
+        whereClause.settlementId = filters.settlementId;
+      } else if (filters.eventId) {
+        whereClause.eventId = filters.eventId;
+        
+        // Add marketId filter if provided (for Match Odds/Bookmaker)
+        if (filters.marketId) {
+          whereClause.marketId = filters.marketId;
+        }
+        
+        // Add selectionId filter if provided (for Fancy)
+        if (filters.selectionId) {
+          whereClause.selectionId = Number(filters.selectionId);
+        }
+      } else if (filters.betIds && filters.betIds.length > 0) {
+        // Filter by specific bet IDs
+        whereClause.id = { in: filters.betIds };
+      } else {
+        throw new BadRequestException(
+          'At least one filter must be provided: settlementId, eventId, or betIds',
+        );
+      }
+
+      // Find all pending bets matching the criteria
+      const betsToCancel = await this.prisma.bet.findMany({
+        where: whereClause,
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+        },
+      });
+
+      if (betsToCancel.length === 0) {
+        return {
+          success: true,
+          message: 'No pending bets found matching the criteria',
+          data: {
+            cancelledBetsCount: 0,
+            refundedUsersCount: 0,
+            totalRefundAmount: 0,
+            cancelledBets: [],
+          },
+        };
+      }
+
+      // Group bets by user for efficient wallet updates
+      const betsByUser = new Map<string, typeof betsToCancel>();
+      for (const bet of betsToCancel) {
+        if (!betsByUser.has(bet.userId)) {
+          betsByUser.set(bet.userId, []);
+        }
+        betsByUser.get(bet.userId)!.push(bet);
+      }
+
+      const cancelledBets: Array<{
+        betId: string;
+        userId: string;
+        userName: string;
+        refundAmount: number;
+      }> = [];
+      let totalRefundAmount = 0;
+
+      // Cancel bets and refund users in a transaction
+      await this.prisma.$transaction(
+        async (tx) => {
+          // Process each user's bets
+          for (const [userId, userBets] of betsByUser.entries()) {
+            // Get wallet
+            const wallet = await tx.wallet.findUnique({
+              where: { userId },
+            });
+
+            if (!wallet) {
+              this.logger.warn(`Wallet not found for user ${userId}`);
+              continue;
+            }
+
+            let totalUserRefund = 0;
+            let totalLiabilityRelease = 0;
+
+            // Process each bet for this user
+            for (const bet of userBets) {
+              const stake = bet.betValue ?? bet.amount ?? 0;
+              const odds = bet.betRate ?? bet.odds ?? 0;
+              const betType = bet.betType?.toUpperCase() || '';
+
+              // Calculate liability/refund amount based on bet type
+              let refundAmount = 0;
+              let liabilityRelease = 0;
+
+              if (betType === 'BACK' || betType === 'YES') {
+                // BACK/YES: liability = stake
+                refundAmount = stake;
+                liabilityRelease = stake;
+              } else if (betType === 'LAY' || betType === 'NO') {
+                // LAY/NO: For Match Odds, liability = (odds - 1) * stake
+                // For Fancy, check lossAmount
+                if (bet.lossAmount) {
+                  refundAmount = bet.lossAmount;
+                  liabilityRelease = bet.lossAmount;
+                } else {
+                  liabilityRelease = (odds - 1) * stake;
+                  refundAmount = liabilityRelease;
+                }
+              } else {
+                // Fallback: use stake
+                refundAmount = stake;
+                liabilityRelease = stake;
+              }
+
+              // Update bet status to CANCELLED
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.CANCELLED,
+                  // @ts-ignore
+                  pnl: 0, // No P/L for cancelled bets
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+
+              totalUserRefund += refundAmount;
+              totalLiabilityRelease += liabilityRelease;
+
+              cancelledBets.push({
+                betId: bet.id,
+                userId: bet.userId,
+                userName: bet.user.name || bet.user.username || 'Unknown',
+                refundAmount,
+              });
+            }
+
+            // Update wallet: credit refund and release liability
+            if (totalUserRefund > 0 || totalLiabilityRelease > 0) {
+              // Safety check: Ensure liability doesn't go negative
+              // Get current wallet state to check liability
+              const currentWallet = await tx.wallet.findUnique({
+                where: { userId },
+                select: { liability: true },
+              });
+              
+              const currentLiability = currentWallet?.liability ?? 0;
+              const newLiability = Math.max(0, currentLiability - totalLiabilityRelease);
+              
+              await tx.wallet.update({
+                where: { userId },
+                data: {
+                  balance: { increment: totalUserRefund },
+                  liability: newLiability,
+                },
+              });
+
+              // Create refund transaction record
+              if (totalUserRefund > 0) {
+                await tx.transaction.create({
+                  data: {
+                    walletId: wallet.id,
+                    amount: totalUserRefund,
+                    type: TransactionType.REFUND,
+                    description: `Bulk bet cancellation by admin. ` +
+                      `Cancelled ${userBets.length} bet(s). ` +
+                      `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
+                  },
+                });
+              }
+            }
+
+            totalRefundAmount += totalUserRefund;
+          }
+        },
+        {
+          maxWait: 15000,
+          timeout: 30000,
+        },
+      );
+
+      this.logger.log(
+        `Bulk bet cancellation completed by admin ${adminId}. ` +
+        `Cancelled ${betsToCancel.length} bets for ${betsByUser.size} users. ` +
+        `Total refund amount: ${totalRefundAmount}`,
+      );
+
+      return {
+        success: true,
+        message: `Successfully cancelled ${betsToCancel.length} bet(s) and refunded ${betsByUser.size} user(s)`,
+        data: {
+          cancelledBetsCount: betsToCancel.length,
+          refundedUsersCount: betsByUser.size,
+          totalRefundAmount,
+          cancelledBets,
+        },
+      };
+    } catch (error) {
+      this.logger.error(
+        `Error cancelling bets bulk: ${(error as Error).message}`,
+        (error as Error).stack,
+      );
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      throw new BadRequestException(
+        `Failed to cancel bets: ${(error as Error).message}`,
+      );
+    }
   }
 
   /**
@@ -3777,17 +4057,20 @@ export class SettlementService {
               }
             }
           } catch (error: any) {
-            // Suppress duplicate logging for 400 errors - AggregatorService already logs them
+            // Check if this is a 400 error (invalid/expired eventId) - mark as expired
             const errorMessage = (error as Error).message || '';
-            const status = error?.details?.status;
+            const status = error?.details?.status || error?.response?.status;
             const is400Error = status === 400 || errorMessage.includes('status code 400') || errorMessage.includes('(Status: 400)');
             
             if (is400Error) {
-              // Cache expired eventId to avoid repeated API calls on subsequent polls
+              // Mark as expired to avoid future API calls for this eventId
+              // This prevents repeated DEBUG logs for the same expired eventId
               if (match.eventId) {
                 this.markEventIdAsExpired(match.eventId);
+                // No need to log here - AggregatorService already logged it as DEBUG
               }
             } else {
+              // Log other errors (5xx, network errors, etc.) as they're unexpected
               this.logger.debug(
                 `Failed to fetch market details for eventId ${match.eventId}: ${errorMessage}`,
               );
@@ -4688,10 +4971,21 @@ export class SettlementService {
                 );
               }
             }
-          } catch (error) {
-            // Suppress duplicate logging for 400 errors - AggregatorService already logs them
+          } catch (error: any) {
+            // Check if this is a 400 error (invalid/expired eventId) - mark as expired
             const errorMessage = (error as Error).message || '';
-            if (!errorMessage.includes('status code 400')) {
+            const status = error?.details?.status || error?.response?.status;
+            const is400Error = status === 400 || errorMessage.includes('status code 400') || errorMessage.includes('(Status: 400)');
+            
+            if (is400Error) {
+              // Mark as expired to avoid future API calls for this eventId
+              // This prevents repeated DEBUG logs for the same expired eventId
+              if (match.eventId) {
+                this.markEventIdAsExpired(match.eventId);
+                // No need to log here - AggregatorService already logged it as DEBUG
+              }
+            } else {
+              // Log other errors (5xx, network errors, etc.) as they're unexpected
               this.logger.debug(
                 `Failed to fetch market details for eventId ${match.eventId}: ${errorMessage}`,
               );
