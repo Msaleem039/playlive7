@@ -16,6 +16,7 @@ import { BetsModule } from './bets/bets.module';
 import { ResultsModule } from './results/results.module';
 import { SettlementModule } from './settlement/settlement.module';
 import { SiteVideoModule } from './site-video/site-video.module';
+import { PositionModule } from './positions/position.module';
 import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
@@ -37,6 +38,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     ResultsModule,
     SettlementModule,
     SiteVideoModule,
+    PositionModule,
   ],
   controllers: [AppController, BetfairController],
   providers: [AppService, BettingGateway],

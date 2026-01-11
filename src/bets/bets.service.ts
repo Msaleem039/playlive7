@@ -2,7 +2,12 @@ import { BadRequestException, HttpException, HttpStatus, Injectable, Logger } fr
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { BetStatus, MatchStatus, TransactionType, Prisma, Wallet, Bet } from '@prisma/client';
-import { calculatePositions } from '../positions/position.service';
+import { 
+  calculatePositions, 
+  calculateMatchOddsPosition, 
+  calculateBookmakerPosition,
+  calculateFancyPosition,
+} from '../positions/position.service';
 
 @Injectable()
 export class BetsService {
@@ -1273,7 +1278,7 @@ export class BetsService {
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
-      return await this.prisma.$transaction(
+      const transactionResult = await this.prisma.$transaction(
         async (tx) => {
           // Ensure match exists
           await tx.match.upsert({
@@ -1468,71 +1473,14 @@ export class BetsService {
             `Delta: ${exposureDelta}`,
           );
 
-          // Calculate positions for match odds & bookmaker markets only (outside transaction)
-          let positions: Record<string, number> = {};
-          
-          if (actualMarketType === 'matchodds' || actualMarketType === 'bookmaker') {
-            try {
-              // Fetch all pending bets for this user and market (after transaction)
-              const pendingBets = await this.prisma.bet.findMany({
-                where: {
-                  userId,
-                  marketId,
-                  status: BetStatus.PENDING,
-                },
-                select: {
-                  selectionId: true,
-                  betType: true,
-                  betRate: true,
-                  odds: true,
-                  betValue: true,
-                  amount: true,
-                  gtype: true,
-                },
-              });
-
-              // Filter to only include match odds and bookmaker bets (exclude fancy)
-              const relevantBets = pendingBets.filter((bet) => {
-                const betGtype = (bet.gtype || '').toLowerCase();
-                return (
-                  betGtype === 'matchodds' || 
-                  betGtype === 'match' ||
-                  betGtype === 'bookmaker' ||
-                  (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds')
-                );
-              });
-
-              if (relevantBets.length > 0) {
-                // Extract unique selectionIds from filtered bets
-                const selectionIds = Array.from(
-                  new Set(
-                    relevantBets
-                      .map((bet) => bet.selectionId)
-                      .filter((id) => id !== null && id !== undefined)
-                      .map((id) => String(id))
-                  )
-                );
-
-                if (selectionIds.length > 0) {
-                  // Calculate positions using the existing helper function
-                  positions = calculatePositions(selectionIds, relevantBets as Bet[]);
-                }
-              }
-            } catch (positionError) {
-              // Log error but don't fail bet placement if position calculation fails
-              this.logger.warn(
-                `Failed to calculate positions for user ${userId}, market ${marketId}:`,
-                positionError instanceof Error ? positionError.message : String(positionError),
-              );
-            }
-          }
-
+          // Return bet info - position calculation happens AFTER transaction commits
           return {
             success: true,
             betId: createdBet.id,
-            positions,
             debug,
             available_balance: newBalance,
+            marketType: actualMarketType,
+            marketId,
           };
         },
         {
@@ -1540,6 +1488,100 @@ export class BetsService {
           timeout: 30000,
         },
       );
+
+      // ✅ POSITION CALCULATION (PURE, READ-ONLY, AFTER TRANSACTION)
+      // Position is calculated fresh from all open bets - NOT stored in DB
+      // Position calculation is isolated and never touches wallet/DB
+      let positions: Record<string, { win: number; lose: number }> = {};
+      
+      try {
+        // Fetch all pending bets for this user and market (after transaction commits)
+        const pendingBets = await this.prisma.bet.findMany({
+          where: {
+            userId,
+            marketId,
+            status: BetStatus.PENDING,
+          },
+          select: {
+            selectionId: true,
+            betType: true,
+            betRate: true,
+            odds: true,
+            betValue: true,
+            amount: true,
+            gtype: true,
+            status: true,
+          },
+        });
+
+        this.logger.debug(
+          `Position calculation: Found ${pendingBets.length} pending bets for user ${userId}, market ${marketId}`,
+        );
+
+        // ✅ MARKET ISOLATION: Use market-specific position functions
+        if (transactionResult.marketType === 'matchodds' || transactionResult.marketType === 'match') {
+          // Calculate Match Odds position (isolated)
+          const matchOddsPosition = calculateMatchOddsPosition(pendingBets as Bet[], marketId);
+          if (matchOddsPosition) {
+            // Convert to backward-compatible format
+            for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
+              positions[selectionId] = {
+                win: position.profit,
+                lose: position.loss,
+              };
+            }
+            this.logger.debug(
+              `Match Odds position calculated: ${JSON.stringify(positions)}`,
+            );
+          }
+        } else if (transactionResult.marketType === 'bookmaker') {
+          // Calculate Bookmaker position (isolated)
+          const bookmakerPosition = calculateBookmakerPosition(pendingBets as Bet[], marketId);
+          if (bookmakerPosition) {
+            // Convert to backward-compatible format
+            // Bookmaker position is net position per selection
+            for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+              positions[selectionId] = {
+                win: netPosition > 0 ? netPosition : 0,
+                lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+              };
+            }
+            this.logger.debug(
+              `Bookmaker position calculated: ${JSON.stringify(positions)}`,
+            );
+          }
+        } else if (transactionResult.marketType === 'fancy') {
+          // Calculate Fancy position (isolated)
+          const fancyPositions = calculateFancyPosition(pendingBets as Bet[]);
+          // Fancy positions are grouped by fancyId, not selectionId
+          // For backward compatibility, we return empty or could return first fancy position
+          // Note: Fancy positions should typically be fetched via separate endpoint
+          this.logger.debug(
+            `Fancy position calculated for ${fancyPositions.length} fancy markets`,
+          );
+        } else {
+          this.logger.debug(
+            `Position calculation: Skipped for market type ${transactionResult.marketType}`,
+          );
+        }
+      } catch (positionError) {
+        // Log error but don't fail bet placement if position calculation fails
+        // Position is UI-only and doesn't affect bet placement
+        this.logger.warn(
+          `Failed to calculate positions for user ${userId}, market ${marketId}:`,
+          positionError instanceof Error ? positionError.message : String(positionError),
+          positionError instanceof Error ? positionError.stack : undefined,
+        );
+      }
+
+      // Return final result with positions
+      return {
+        success: true,
+        betId: transactionResult.betId,
+        positions,
+        debug: transactionResult.debug,
+        available_balance: transactionResult.available_balance,
+      };
     } catch (error) {
       this.logger.error(`Error placing bet for user ${userId}:`, error);
       
@@ -1669,13 +1711,13 @@ export class BetsService {
    * @param bet - Bet object to place (must have all required fields including userId, matchId, marketId)
    * @param userId - User ID
    * @param selections - Array of selection IDs (as strings) for position calculation
-   * @returns Calculated positions for the market
+   * @returns Calculated positions for the market (win/lose scenarios per selection)
    */
   async placeBetAndCalculatePositions(
     bet: Partial<Bet> & { userId: string; matchId: string; marketId: string },
     userId: string,
     selections: string[],
-  ): Promise<Record<string, number>> {
+  ): Promise<Record<string, { win: number; lose: number }>> {
     // 1️⃣ Validate balance & exposure
     await this.validateExposure(userId, bet);
 
@@ -1717,8 +1759,38 @@ export class BetsService {
       },
     });
 
-    // 4️⃣ Recalculate authoritative positions
-    const authoritativePositions = calculatePositions(selections, pendingBets);
+    // 4️⃣ Recalculate authoritative positions using market-specific functions
+    // Determine market type from bets
+    const betGtype = (bet.gtype || '').toLowerCase();
+    let authoritativePositions: Record<string, { win: number; lose: number }> = {};
+
+    if (betGtype === 'matchodds' || betGtype === 'match') {
+      // Match Odds position
+      const matchOddsPosition = calculateMatchOddsPosition(pendingBets, bet.marketId);
+      if (matchOddsPosition) {
+        for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
+          authoritativePositions[selectionId] = {
+            win: position.profit,
+            lose: position.loss,
+          };
+        }
+      }
+    } else if (betGtype === 'bookmaker' || 
+               (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds')) {
+      // Bookmaker position
+      const bookmakerPosition = calculateBookmakerPosition(pendingBets, bet.marketId);
+      if (bookmakerPosition) {
+        for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+          authoritativePositions[selectionId] = {
+            win: netPosition > 0 ? netPosition : 0,
+            lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+          };
+        }
+      }
+    } else {
+      // Fallback to old function for backward compatibility (e.g., fancy or unknown)
+      authoritativePositions = calculatePositions(selections, pendingBets);
+    }
 
     return authoritativePositions;
   }
@@ -1726,16 +1798,18 @@ export class BetsService {
   /**
    * Get position details for a user's bets in a specific market
    * 
+   * ✅ Uses market-specific position functions for proper isolation
+   * 
    * @param userId - User ID
    * @param marketId - Market ID
-   * @param marketSelections - Array of selection IDs (as strings) for position calculation
-   * @returns Calculated positions for each selection
+   * @param marketSelections - Array of selection IDs (as strings) for position calculation (backward compatibility)
+   * @returns Calculated positions for each selection (win/lose scenarios)
    */
   async getMarketPositions(
     userId: string,
     marketId: string,
     marketSelections: string[],
-  ): Promise<Record<string, number>> {
+  ): Promise<Record<string, { win: number; lose: number }>> {
     // Fetch all pending bets for the market
     const pendingBets = await this.prisma.bet.findMany({
       where: {
@@ -1745,8 +1819,45 @@ export class BetsService {
       },
     });
 
-    // Calculate authoritative positions
-    const authoritativePositions = calculatePositions(marketSelections, pendingBets);
+    if (pendingBets.length === 0) {
+      return {};
+    }
+
+    // Determine market type from first bet (all bets in market should have same gtype)
+    const firstBetGtype = (pendingBets[0]?.gtype || '').toLowerCase();
+    let authoritativePositions: Record<string, { win: number; lose: number }> = {};
+
+    if (firstBetGtype === 'matchodds' || firstBetGtype === 'match') {
+      // Match Odds position (isolated)
+      const matchOddsPosition = calculateMatchOddsPosition(pendingBets, marketId);
+      if (matchOddsPosition) {
+        for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
+          authoritativePositions[selectionId] = {
+            win: position.profit,
+            lose: position.loss,
+          };
+        }
+      }
+    } else if (firstBetGtype === 'bookmaker' || 
+               (firstBetGtype.startsWith('match') && firstBetGtype !== 'match' && firstBetGtype !== 'matchodds')) {
+      // Bookmaker position (isolated)
+      const bookmakerPosition = calculateBookmakerPosition(pendingBets, marketId);
+      if (bookmakerPosition) {
+        for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+          authoritativePositions[selectionId] = {
+            win: netPosition > 0 ? netPosition : 0,
+            lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+          };
+        }
+      }
+    } else if (firstBetGtype === 'fancy') {
+      // Fancy position (isolated) - returns empty for backward compatibility
+      // Fancy positions should be fetched via separate endpoint that returns proper structure
+      this.logger.debug(`Fancy positions not returned in getMarketPositions - use dedicated fancy endpoint`);
+    } else {
+      // Fallback to old function for unknown market types (backward compatibility)
+      authoritativePositions = calculatePositions(marketSelections, pendingBets);
+    }
 
     return authoritativePositions;
   }
