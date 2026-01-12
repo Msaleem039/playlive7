@@ -772,7 +772,7 @@ export class SettlementService {
             if (bet.betType?.toUpperCase() === 'BACK') {
               if (isWinner) {
                 const profit = this.backProfit(stake, odds);
-                balanceDelta += profit; // credit profit only
+                balanceDelta += stake + profit; // credit stake back + profit (stake was deducted at placement)
 
                 await tx.bet.update({
                   where: { id: bet.id },
@@ -785,7 +785,7 @@ export class SettlementService {
                   },
                 });
                 this.logger.debug(
-                  `BACK bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, profit: ${profit}`,
+                  `BACK bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, stake returned: ${stake}, profit: ${profit}, total credited: ${stake + profit}`,
                 );
               } else {
                 await tx.bet.update({
