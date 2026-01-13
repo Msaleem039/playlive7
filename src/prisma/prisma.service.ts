@@ -48,13 +48,10 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
           urlObj.searchParams.set('pgbouncer', 'true');
         }
         // Supabase handles connection pooling automatically
-        // Increased limits to handle concurrent operations (match syncing, settlements, etc.)
-        if (!urlObj.searchParams.has('connection_limit')) {
-          urlObj.searchParams.set('connection_limit', '25'); // Increased from 10 to handle concurrent operations
-        }
-        if (!urlObj.searchParams.has('pool_timeout')) {
-          urlObj.searchParams.set('pool_timeout', '20'); // Increased from 10 to reduce timeout errors
-        }
+        // 🔐 CRITICAL: Force override connection pool settings to prevent P2024 errors
+        // Always set these values (override existing ones) to ensure proper pool configuration
+        urlObj.searchParams.set('connection_limit', '25'); // Increased from 10 to handle concurrent operations
+        urlObj.searchParams.set('pool_timeout', '20'); // Increased from 10 to reduce timeout errors
       } else {
         // Generic PostgreSQL settings
         if (!urlObj.searchParams.has('connection_limit')) {
@@ -91,6 +88,15 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
       dbUrl = PrismaService.normalizeConnectionString(originalDbUrl);
       if (dbUrl !== originalDbUrl) {
         process.env.DATABASE_URL = dbUrl;
+        // Log the connection pool settings for verification
+        try {
+          const urlObj = new URL(dbUrl);
+          const connectionLimit = urlObj.searchParams.get('connection_limit');
+          const poolTimeout = urlObj.searchParams.get('pool_timeout');
+          console.log(`[PrismaService] Connection pool settings: connection_limit=${connectionLimit}, pool_timeout=${poolTimeout}`);
+        } catch {
+          // Ignore URL parsing errors in logging
+        }
       }
     }
     
