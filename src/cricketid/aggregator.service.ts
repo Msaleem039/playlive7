@@ -200,14 +200,16 @@ export class AggregatorService {
       const matches = Array.isArray(response) ? response : [];
 
       // Sync matches with visibility table (create if not exists)
-      for (const match of matches) {
-        const eventId = match?.event?.id;
-        if (eventId) {
-          // Fire and forget - don't wait for sync to complete
-          this.matchVisibilityService.syncMatch(eventId).catch((err) => {
-            this.logger.debug(`Failed to sync match ${eventId}:`, err);
-          });
-        }
+      // Use batch sync to prevent connection pool exhaustion
+      const eventIds = matches
+        .map((match) => match?.event?.id)
+        .filter((id): id is string => !!id);
+      
+      if (eventIds.length > 0) {
+        // Batch sync all matches in a single transaction (prevents connection pool exhaustion)
+        this.matchVisibilityService.syncMatchesBatch(eventIds).catch((err) => {
+          this.logger.debug(`Failed to batch sync ${eventIds.length} matches:`, err);
+        });
       }
 
       return matches;

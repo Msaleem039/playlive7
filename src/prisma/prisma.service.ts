@@ -48,12 +48,12 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
           urlObj.searchParams.set('pgbouncer', 'true');
         }
         // Supabase handles connection pooling automatically
-        // But we can set reasonable limits for Prisma
+        // Increased limits to handle concurrent operations (match syncing, settlements, etc.)
         if (!urlObj.searchParams.has('connection_limit')) {
-          urlObj.searchParams.set('connection_limit', '10'); // Supabase recommended limit
+          urlObj.searchParams.set('connection_limit', '25'); // Increased from 10 to handle concurrent operations
         }
         if (!urlObj.searchParams.has('pool_timeout')) {
-          urlObj.searchParams.set('pool_timeout', '10');
+          urlObj.searchParams.set('pool_timeout', '20'); // Increased from 10 to reduce timeout errors
         }
       } else {
         // Generic PostgreSQL settings

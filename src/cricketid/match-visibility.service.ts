@@ -29,6 +29,40 @@ export class MatchVisibilityService {
   }
 
   /**
+   * Batch sync multiple matches - prevents connection pool exhaustion
+   * Uses a single transaction to insert/update multiple records efficiently
+   */
+  async syncMatchesBatch(eventIds: string[]): Promise<void> {
+    if (eventIds.length === 0) {
+      return;
+    }
+
+    try {
+      const prisma = this.prisma as any;
+      
+      // Use transaction to batch all upserts efficiently
+      await prisma.$transaction(
+        eventIds.map((eventId) =>
+          prisma.matchVisibility.upsert({
+            where: { eventId },
+            update: {}, // No update needed if exists
+            create: { eventId, isEnabled: true },
+          })
+        ),
+        {
+          maxWait: 10000, // 10 seconds max wait
+          timeout: 30000, // 30 seconds timeout
+        }
+      );
+      
+      this.logger.debug(`Batch synced ${eventIds.length} MatchVisibility records`);
+    } catch (error) {
+      this.logger.error(`Error batch syncing match visibility for ${eventIds.length} matches:`, error);
+      // Don't throw - allow the flow to continue even if batch sync fails
+    }
+  }
+
+  /**
    * Check if a match is enabled (visible)
    */
   async isMatchEnabled(eventId: string): Promise<boolean> {
