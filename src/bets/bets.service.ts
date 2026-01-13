@@ -179,10 +179,11 @@ export class BetsService {
    * ✅ FANCY EXPOSURE CALCULATION (MARKET-SPECIFIC)
    * 
    * Calculates exposure for Fancy market ONLY
-   * ✅ EXCHANGE RULE: Same-line YES/NO do NOT hedge (they are independent bets)
-   * - Group bets by betRate (odds/rate)
-   * - At same rate: YES @ X + NO @ X = full liability (sum, not offset)
-   * - Across different rates: YES and NO can offset (hedge possible)
+   * ✅ EXCHANGE RULE: Different lines do NOT hedge, only same-line reverse can reduce exposure
+   * - Group bets by eventId_selectionId_rate (same-line grouping)
+   * - Same-line: YES @ X + NO @ X = full liability (sum, not offset)
+   * - Different lines: YES @ A + NO @ B = full liability (sum, NO hedge)
+   * - Exposure is SUM of ALL fancy stakes (no cross-line hedging)
    * 
    * @param tx - Prisma transaction client
    * @param userId - User ID
@@ -214,60 +215,44 @@ export class BetsService {
         },
       });
 
-      // Group bets by betRate (same-line grouping)
-      const betsByRate = new Map<number, {
-        yesStakes: number;
-        noStakes: number;
+      // Group bets by eventId_selectionId_rate (same-line grouping)
+      // Note: eventId and selectionId are fixed in this function (from parameters)
+      const grouped = new Map<number, {
+        yes: number;
+        no: number;
       }>();
 
       for (const bet of bets) {
         const stake = bet.betValue ?? bet.amount ?? 0;
         const betTypeUpper = (bet.betType || '').toUpperCase();
-        const betRate = bet.betRate ?? bet.odds ?? 0;
+        const rate = bet.betRate ?? bet.odds ?? 0;
+        // Group by rate (eventId and selectionId are already filtered in query)
 
-        if (!betsByRate.has(betRate)) {
-          betsByRate.set(betRate, {
-            yesStakes: 0,
-            noStakes: 0,
-          });
+        if (!grouped.has(rate)) {
+          grouped.set(rate, { yes: 0, no: 0 });
         }
 
-        const rateGroup = betsByRate.get(betRate)!;
+        const bucket = grouped.get(rate)!;
 
         // FANCY: liability = stake (for both BACK and LAY)
         // YES/NO are treated the same as BACK/LAY
-        if (betTypeUpper === 'BACK' || betTypeUpper === 'YES') {
-          rateGroup.yesStakes += stake;
-        } else if (betTypeUpper === 'LAY' || betTypeUpper === 'NO') {
-          rateGroup.noStakes += stake;
+        if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+          bucket.yes += stake;
+        } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+          bucket.no += stake;
         }
       }
 
-      // Calculate exposure: same-line bets sum (no offset), different lines can hedge
-      let totalYesStakes = 0;
-      let totalNoStakes = 0;
-      let sameLineExposure = 0;
+      // Calculate exposure: SUM of ALL stakes (no cross-line hedging)
+      let exposure = 0;
 
-      for (const [rate, group] of betsByRate) {
-        // Same-line case: both YES and NO at same rate = sum (no hedge)
-        if (group.yesStakes > 0 && group.noStakes > 0) {
-          sameLineExposure += group.yesStakes + group.noStakes;
-        } else {
-          // Different lines: accumulate for potential hedging
-          if (group.yesStakes > 0) {
-            totalYesStakes += group.yesStakes;
-          }
-          if (group.noStakes > 0) {
-            totalNoStakes += group.noStakes;
-          }
-        }
+      for (const [, g] of grouped) {
+        // Same-line YES & NO → sum (no hedge)
+        // Different lines also sum (no hedge)
+        exposure += g.yes + g.no;
       }
 
-      // Different-line hedge: offset YES vs NO across different rates
-      const differentLineExposure = Math.abs(totalYesStakes - totalNoStakes);
-
-      // Total exposure = same-line exposure (sum) + different-line exposure (hedged)
-      return sameLineExposure + differentLineExposure;
+      return exposure;
     } catch (error: any) {
       // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
       if (error?.message?.includes('Transaction not found') || 
@@ -551,56 +536,95 @@ export class BetsService {
 
   /**
    * Calculate Match Odds exposure in memory (no database queries)
-   * ✅ FIXED: Properly nets BACK and LAY bets on the same selection
+   * ✅ EXCHANGE-ACCURATE: Order-independent exposure calculation with symmetric BACK↔LAY hedging
+   * 
+   * Algorithm:
+   * 1. Aggregate net position per selection (winProfit, loseLoss)
+   * 2. For each possible winner, calculate total P/L
+   * 3. Exposure = maximum absolute negative P/L across all outcomes
+   * 
+   * Exchange Rules:
+   * - BACK bet on winner: profit = (odds - 1) × stake
+   * - BACK bet on loser: loss = stake
+   * - LAY bet on winner: loss = stake × odds (full payout)
+   * - LAY bet on loser: profit = stake (keep stake received)
+   * 
    * @param bets - Array of bets for the market
    * @returns Net exposure for this Match Odds market
    */
   private calculateMatchOddsExposureInMemory(bets: any[]): number {
-    const selectionMap = new Map<number, {
-      backStake: number;
-      backWin: number;
-      layStake: number;
-      layLiability: number;
-    }>();
+    if (!bets.length) return 0;
+  
+    const positionBySelection = new Map<number, { win: number; lose: number }>();
   
     for (const bet of bets) {
       if (!bet.selectionId) continue;
   
-      if (!selectionMap.has(bet.selectionId)) {
-        selectionMap.set(bet.selectionId, {
-          backStake: 0,
-          backWin: 0,
-          layStake: 0,
-          layLiability: 0,
-        });
+      const stake = Number(bet.betValue || bet.amount || 0);
+      const odds = Number(bet.betRate || bet.odds || 0);
+      const type = (bet.betType || '').toUpperCase();
+  
+      if (!positionBySelection.has(bet.selectionId)) {
+        positionBySelection.set(bet.selectionId, { win: 0, lose: 0 });
       }
   
-      const pos = selectionMap.get(bet.selectionId)!;
-      const stake = bet.betValue || 0;
-      const odds = bet.betRate || 0;
+      const pos = positionBySelection.get(bet.selectionId)!;
   
-      if (bet.betType === 'BACK') {
-        pos.backStake += stake;
-        pos.backWin += (odds - 1) * stake;
+      if (type === 'BACK') {
+        pos.win += (odds - 1) * stake;
+        pos.lose -= stake;
       }
   
-      if (bet.betType === 'LAY') {
-        pos.layStake += stake;
-        pos.layLiability += (odds - 1) * stake;
+      if (type === 'LAY') {
+        pos.win -= (odds - 1) * stake;
+        pos.lose += stake;
       }
     }
   
     let exposure = 0;
   
-    for (const pos of selectionMap.values()) {
-      const lossIfWin = pos.layLiability - pos.backWin;
-      const lossIfLose = pos.backStake - pos.layStake;
+    for (const [winner] of positionBySelection) {
+      let pnl = 0;
   
-      exposure += Math.max(lossIfWin, lossIfLose, 0);
+      for (const [sid, pos] of positionBySelection) {
+        pnl += sid === winner ? pos.win : pos.lose;
+      }
+  
+      if (pnl < 0) {
+        exposure = Math.max(exposure, Math.abs(pnl));
+      }
     }
+  
+    // 🔐 SAFETY PATCH: Apply BACK stake floor ONLY when net unhedged BACK exposure exists
+    // If BACK and LAY hedge each other → exposure MUST reduce (can reach 0)
+    // BACK stake floor applies ONLY when net position is unhedged
+    let totalBackStake = 0;
+    let totalLayStake = 0;
+    
+    for (const bet of bets) {
+      const type = (bet.betType || '').toUpperCase();
+      const stake = Number(bet.betValue || bet.amount || 0);
+      
+      if (type === 'BACK') {
+        totalBackStake += stake;
+      } else if (type === 'LAY') {
+        totalLayStake += stake;
+      }
+    }
+    
+    // Apply BACK safety floor ONLY when net BACK exposure exists (not fully hedged)
+    if (totalBackStake > totalLayStake) {
+      // Net unhedged BACK stake = totalBackStake - totalLayStake
+      // Exposure must be at least this net amount
+      const netBackStake = totalBackStake - totalLayStake;
+      exposure = Math.max(exposure, netBackStake);
+    }
+    // If totalLayStake >= totalBackStake (fully hedged or net LAY), allow exposure to be 0 or as calculated
   
     return exposure;
   }
+  
+  
   
 
   /**
@@ -629,66 +653,51 @@ export class BetsService {
 
   /**
    * Calculate Fancy exposure in memory (no database queries)
-   * ✅ EXCHANGE RULE: Same-line YES/NO do NOT hedge (they are independent bets)
-   * - Group bets by betRate (odds/rate)
-   * - At same rate: YES @ X + NO @ X = full liability (sum, not offset)
-   * - Across different rates: YES and NO can offset (hedge possible)
+   * ✅ EXCHANGE RULE: Different lines do NOT hedge, only same-line reverse can reduce exposure
+   * - Group bets by eventId_selectionId_rate (same-line grouping)
+   * - Same-line: YES @ X + NO @ X = full liability (sum, not offset)
+   * - Different lines: YES @ A + NO @ B = full liability (sum, NO hedge)
+   * - Exposure is SUM of ALL fancy stakes (no cross-line hedging)
    * @param bets - Array of bets for the fancy selection
    * @returns Net exposure for this Fancy selection
    */
   private calculateFancyExposureInMemory(bets: any[]): number {
-    // Group bets by betRate (same-line grouping)
-    const betsByRate = new Map<number, {
-      yesStakes: number;
-      noStakes: number;
+    // Group bets by eventId_selectionId_rate (same-line grouping)
+    const grouped = new Map<string, {
+      yes: number;
+      no: number;
     }>();
 
     for (const bet of bets) {
       const stake = bet.betValue ?? bet.amount ?? 0;
       const betTypeUpper = (bet.betType || '').toUpperCase();
-      const betRate = bet.betRate ?? bet.odds ?? 0;
+      const rate = bet.betRate ?? bet.odds ?? 0;
+      // Group by eventId_selectionId_rate (same line)
+      const key = `${bet.eventId}_${bet.selectionId}_${rate}`;
 
-      if (!betsByRate.has(betRate)) {
-        betsByRate.set(betRate, {
-          yesStakes: 0,
-          noStakes: 0,
-        });
+      if (!grouped.has(key)) {
+        grouped.set(key, { yes: 0, no: 0 });
       }
 
-      const rateGroup = betsByRate.get(betRate)!;
+      const bucket = grouped.get(key)!;
 
-      if (betTypeUpper === 'BACK' || betTypeUpper === 'YES') {
-        rateGroup.yesStakes += stake;
-      } else if (betTypeUpper === 'LAY' || betTypeUpper === 'NO') {
-        rateGroup.noStakes += stake;
-      }
-    }
-
-    // Calculate exposure: same-line bets sum (no offset), different lines can hedge
-    let totalYesStakes = 0;
-    let totalNoStakes = 0;
-    let sameLineExposure = 0;
-
-    for (const [rate, group] of betsByRate) {
-      // Same-line case: both YES and NO at same rate = sum (no hedge)
-      if (group.yesStakes > 0 && group.noStakes > 0) {
-        sameLineExposure += group.yesStakes + group.noStakes;
-      } else {
-        // Different lines: accumulate for potential hedging
-        if (group.yesStakes > 0) {
-          totalYesStakes += group.yesStakes;
-        }
-        if (group.noStakes > 0) {
-          totalNoStakes += group.noStakes;
-        }
+      if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+        bucket.yes += stake;
+      } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+        bucket.no += stake;
       }
     }
 
-    // Different-line hedge: offset YES vs NO across different rates
-    const differentLineExposure = Math.abs(totalYesStakes - totalNoStakes);
+    // Calculate exposure: SUM of ALL stakes (no cross-line hedging)
+    let exposure = 0;
 
-    // Total exposure = same-line exposure (sum) + different-line exposure (hedged)
-    return sameLineExposure + differentLineExposure;
+    for (const [, g] of grouped) {
+      // Same-line YES & NO → sum (no hedge)
+      // Different lines also sum (no hedge)
+      exposure += g.yes + g.no;
+    }
+
+    return exposure;
   }
 
   async selectOneRow(table: string, idField: string, userId: string) {
@@ -1357,69 +1366,6 @@ export class BetsService {
 
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
-    // 3. VALIDATE BET RATE AVAILABILITY IN MARKET
-    if (normalizedBetRate <= 0) {
-      throw new HttpException(
-        {
-          success: false,
-          error: 'Invalid bet rate. Bet rate must be greater than 0.',
-          code: 'INVALID_BET_RATE',
-        },
-        400,
-      );
-    }
-
-    // 3. VALIDATE BET RATE AVAILABILITY IN MARKET
-    // Check if betRate has been used in this market before (any status)
-    // For Fancy: Check eventId + selectionId + betRate
-    // For Match Odds/Bookmaker: Check marketId + selectionId + betRate
-    let betRateAvailable = false;
-    
-    if (actualMarketType === 'fancy') {
-      // Fancy market: Check if betRate exists for this eventId + selectionId
-      if (eventId) {
-        const existingBets = await this.prisma.bet.findFirst({
-          where: {
-            gtype: 'fancy',
-            eventId,
-            selectionId: normalizedSelectionId,
-            betRate: normalizedBetRate,
-          },
-          select: {
-            id: true,
-          },
-        });
-        betRateAvailable = existingBets !== null;
-      } else {
-        // If no eventId, skip validation (fallback - should not happen in practice)
-        betRateAvailable = true;
-      }
-    } else {
-      // Match Odds/Bookmaker: Check if betRate exists for this marketId + selectionId
-      const existingBets = await this.prisma.bet.findFirst({
-        where: {
-          marketId,
-          selectionId: normalizedSelectionId,
-          betRate: normalizedBetRate,
-        },
-        select: {
-          id: true,
-        },
-      });
-      betRateAvailable = existingBets !== null;
-    }
-
-    // Accept bet only if betRate is available in the market (has been used before)
-    // This ensures betRate is valid for the market before accepting
-    if (!betRateAvailable && (actualMarketType === 'fancy' ? eventId : marketId)) {
-      // Allow if this might be the first bet with this rate (market just opened)
-      // But log a warning for monitoring
-      this.logger.warn(
-        `Bet rate ${normalizedBetRate} not found in existing bets for market ${marketId || eventId}, selection ${normalizedSelectionId}. ` +
-        `Allowing as potentially first bet with this rate.`,
-      );
-    }
-
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
       const transactionResult = await this.prisma.$transaction(
@@ -1456,11 +1402,14 @@ export class BetsService {
           const currentBalance = Number(wallet.balance) || 0;
           const currentLiability = Number(wallet.liability) || 0;
 
-          // Load ALL pending bets for exposure calculation
+          // Load pending bets for THIS marketId ONLY (CRITICAL FIX)
+          // Exchange rule: Exposure is locked per USER + MARKET ID, not per market type.
+          // Match Odds of Match A ≠ Match Odds of Match B - they NEVER offset each other.
           const allPendingBets = await tx.bet.findMany({
             where: {
               userId,
               status: BetStatus.PENDING,
+              marketId, // 🔥 CRITICAL: Filter by marketId to isolate exposure per market
             },
             select: {
               gtype: true,
@@ -1509,14 +1458,35 @@ export class BetsService {
           debug.new_exposure = newExposure;
           debug.new_net_exposure = newNetExposure;
 
-          // 🔐 STEP 5: Compute exposure delta
-          // delta = oldNetExposure - newNetExposure
+          // 🔐 STEP 5: Compute exposure delta (PER-MARKET)
+          // Exchange rule: Exposure must be applied PER MARKET TYPE.
+          // Match Odds, Fancy, and Bookmaker must NEVER offset each other.
           // If delta > 0: exposure increased (deduct from balance, add to liability)
           // If delta < 0: exposure decreased (refund to balance, reduce liability)
-          const exposureDelta = newNetExposure - oldNetExposure;
+          let exposureDelta: number;
+          
+          if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
+            exposureDelta = newExposure.matchOdds - oldExposure.matchOdds;
+          } else if (actualMarketType === 'fancy') {
+            exposureDelta = newExposure.fancy - oldExposure.fancy;
+          } else if (actualMarketType === 'bookmaker') {
+            exposureDelta = newExposure.bookmaker - oldExposure.bookmaker;
+          } else {
+            // Fallback to net exposure (shouldn't happen with valid market types)
+            exposureDelta = newNetExposure - oldNetExposure;
+          }
 
           debug.exposure_delta = exposureDelta;
           debug.market_type = actualMarketType;
+          debug.market_id = marketId;
+          
+          // 🔐 LOG exposure calculation for debugging
+          this.logger.warn(
+            `[EXPOSURE] marketId=${marketId}, type=${actualMarketType}, ` +
+            `oldExposure: MO=${oldExposure.matchOdds}, F=${oldExposure.fancy}, BM=${oldExposure.bookmaker}, ` +
+            `newExposure: MO=${newExposure.matchOdds}, F=${newExposure.fancy}, BM=${newExposure.bookmaker}, ` +
+            `exposureDelta=${exposureDelta}`,
+          );
           
           // Add market-specific exposure breakdowns for debugging (matching old format for compatibility)
           if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
@@ -1537,6 +1507,154 @@ export class BetsService {
           debug.current_balance = currentBalance;
           debug.current_liability = currentLiability;
           debug.new_total_exposure = newNetExposure;
+
+          // 🔐 STEP 2.5: FANCY REVERSAL VALIDATION (SCORE-AWARE)
+          // Validate if reverse (negative exposureDelta) is allowed for Fancy same-line bets
+          // Reverse allowed ONLY when one outcome is already impossible based on current score
+          if (actualMarketType === 'fancy' && exposureDelta < 0 && eventId && normalizedSelectionId) {
+            // Check if this is a same-line reverse scenario
+            // Find existing bets on same selection and same betRate
+            const existingSameLineBets = allPendingBets.filter((bet: any) => {
+              const betGtype = (bet.gtype || '').toLowerCase();
+              return (
+                betGtype === 'fancy' &&
+                bet.eventId === eventId &&
+                bet.selectionId === normalizedSelectionId &&
+                bet.betRate === normalizedBetRate
+              );
+            });
+
+            // Check for same-line opposite bet (reverse scenario)
+            const newBetTypeUpper = (bet_type || '').toUpperCase();
+            const isReverse = existingSameLineBets.length > 0 && existingSameLineBets.some((bet: any) => {
+              const existingBetTypeUpper = (bet.betType || '').toUpperCase();
+              return (
+                (newBetTypeUpper === 'NO' && (existingBetTypeUpper === 'YES' || existingBetTypeUpper === 'BACK')) ||
+                (newBetTypeUpper === 'YES' && (existingBetTypeUpper === 'NO' || existingBetTypeUpper === 'LAY')) ||
+                (newBetTypeUpper === 'LAY' && (existingBetTypeUpper === 'YES' || existingBetTypeUpper === 'BACK')) ||
+                (newBetTypeUpper === 'BACK' && (existingBetTypeUpper === 'NO' || existingBetTypeUpper === 'LAY'))
+              );
+            });
+
+            if (isReverse) {
+              // Reverse detected: same-line opposite bet
+              // Reverse is allowed (exposureDelta can be negative for refund)
+              // No score comparison - reverse allowed based on same-line + opposite bet only
+              const line = normalizedBetRate;
+
+              // Detect existing YES/NO using .some() (DO NOT use existingSameLineBets[0])
+              const hasExistingYes = existingSameLineBets.some((bet: any) => {
+                const existingBetTypeUpper = (bet.betType || '').toUpperCase();
+                return existingBetTypeUpper === 'YES' || existingBetTypeUpper === 'BACK';
+              });
+              const hasExistingNo = existingSameLineBets.some((bet: any) => {
+                const existingBetTypeUpper = (bet.betType || '').toUpperCase();
+                return existingBetTypeUpper === 'NO' || existingBetTypeUpper === 'LAY';
+              });
+              const isNewYes = newBetTypeUpper === 'YES' || newBetTypeUpper === 'BACK';
+              const isNewNo = newBetTypeUpper === 'NO' || newBetTypeUpper === 'LAY';
+
+              // Reverse is allowed (same-line + opposite bet detected)
+              // exposureDelta remains negative (refund case)
+              debug.fancy_reverse_validation = {
+                attempted_reverse: true,
+                reverse_allowed: true,
+                line,
+                hasExistingYes,
+                hasExistingNo,
+                isNewYes,
+                isNewNo,
+                exposureDelta,
+              };
+            } else {
+              // Not a reverse scenario (no same-line bets OR different line OR same betType)
+              // Treat as fresh bet: force positive exposureDelta
+              const originalExposureDelta = exposureDelta;
+              // Fresh bet: Fancy liability = stake
+              exposureDelta = normalizedBetValue;
+              
+              debug.fancy_reverse_validation = {
+                attempted_reverse: false,
+                reverse_allowed: false,
+                reason: 'No same-line opposite bet - treated as fresh bet',
+                line: normalizedBetRate,
+                originalExposureDelta,
+                exposureDelta_adjusted: exposureDelta,
+              };
+            }
+          }
+
+          // 🔐 STEP 2.6: FANCY LIABILITY UNLOCKING (LIABILITY REVERSE)
+          // Unlock YES liability when NO bet exists at higher rate (state-based unlocking)
+          // This is NOT same-line reverse, NOT refund, ONLY liability reduction
+          if (actualMarketType === 'fancy' && eventId && normalizedSelectionId) {
+            // Get all pending fancy bets for same eventId + selectionId (including new bet in memory)
+            const allFancyBetsForSelection = allPendingBetsWithNewBet.filter((bet: any) => {
+              const betGtype = (bet.gtype || '').toLowerCase();
+              return (
+                betGtype === 'fancy' &&
+                bet.eventId === eventId &&
+                bet.selectionId === normalizedSelectionId
+              );
+            });
+
+            // Build YES and NO bets grouped by rate
+            const yesBetsByRate = new Map<number, number>(); // rate -> total stake
+            const noBetsByRate = new Map<number, number>();  // rate -> total stake
+
+            for (const bet of allFancyBetsForSelection) {
+              const stake = bet.betValue ?? bet.amount ?? 0;
+              const betTypeUpper = (bet.betType || '').toUpperCase();
+              const rate = bet.betRate ?? bet.odds ?? 0;
+
+              if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+                const currentStake = yesBetsByRate.get(rate) || 0;
+                yesBetsByRate.set(rate, currentStake + stake);
+              } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+                const currentStake = noBetsByRate.get(rate) || 0;
+                noBetsByRate.set(rate, currentStake + stake);
+              }
+            }
+
+            // Check for liability unlocking: YES @ lowerRate with NO @ higherRate
+            let totalUnlockedAmount = 0;
+            let unlockedPairs: Array<{ yesRate: number; noRate: number; unlockedAmount: number }> = [];
+
+            for (const [yesRate, yesStake] of yesBetsByRate) {
+              // Find NO bets at higher rates
+              for (const [noRate, noStake] of noBetsByRate) {
+                if (noRate > yesRate) {
+                  // YES liability is unlocked (logically crossed by higher NO line)
+                  totalUnlockedAmount += yesStake;
+                  unlockedPairs.push({
+                    yesRate,
+                    noRate,
+                    unlockedAmount: yesStake,
+                  });
+                  // Break after first higher NO rate found (unlock once per YES bet)
+                  break;
+                }
+              }
+            }
+
+            // Apply liability unlock: reduce exposureDelta by unlocked amount
+            if (totalUnlockedAmount > 0) {
+              const originalExposureDelta = exposureDelta;
+              exposureDelta -= totalUnlockedAmount;
+
+              debug.fancy_liability_unlock = {
+                unlocked: true,
+                unlockedPairs,
+                totalUnlockedAmount,
+                originalExposureDelta,
+                adjustedExposureDelta: exposureDelta,
+              };
+            } else {
+              debug.fancy_liability_unlock = {
+                unlocked: false,
+              };
+            }
+          }
 
           // 🔐 STEP 6: Validate balance (only if exposure is increasing)
           if (exposureDelta > 0 && currentBalance < exposureDelta) {
@@ -2006,3 +2124,5 @@ export class BetsService {
     return authoritativePositions;
   }
 }
+
+

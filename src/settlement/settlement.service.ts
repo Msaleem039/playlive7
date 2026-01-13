@@ -710,7 +710,15 @@ export class SettlementService {
           // ✅ CRITICAL FIX: Calculate net exposure BEFORE settlement (for this market)
           const exposureBefore = await this.calculateMatchOddsExposure(tx, userId, marketId);
 
-          let balanceDelta = 0;
+          // 🔐 SETTLEMENT FIX: Calculate FULL net P/L per bet (exchange-accurate)
+          // Settlement IGNORES exposure completely
+          // Settlement applies FULL net P/L per bet:
+          //   BACK win  → +winAmount (stake * odds)
+          //   BACK loss → -stake
+          //   LAY win   → +stake
+          //   LAY loss  → -(odds-1)*stake
+          // Exposure release does NOT change wallet balance
+          let netPnl = 0;
 
           // 3️⃣ Process each bet and mark as settled
           for (const bet of userBets) {
@@ -719,7 +727,7 @@ export class SettlementService {
 
             // CANCEL/TIE: Refund stake
             if (isCancel) {
-              balanceDelta += stake; // refund stake
+              netPnl += stake; // refund stake
 
               await tx.bet.update({
                 where: { id: bet.id },
@@ -771,23 +779,27 @@ export class SettlementService {
             // BACK BET
             if (bet.betType?.toUpperCase() === 'BACK') {
               if (isWinner) {
-                const profit = this.backProfit(stake, odds);
-                balanceDelta += stake + profit; // credit stake back + profit (stake was deducted at placement)
+                // BACK WIN: +winAmount (stake * odds)
+                const winAmount = stake * odds;
+                netPnl += winAmount;
 
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
                     status: BetStatus.WON,
                     // @ts-ignore
-                    pnl: profit,
+                    pnl: winAmount - stake, // Reporting: profit only
                     settledAt: new Date(),
                     updatedAt: new Date(),
                   },
                 });
                 this.logger.debug(
-                  `BACK bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, stake returned: ${stake}, profit: ${profit}, total credited: ${stake + profit}`,
+                  `BACK bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, winAmount: ${winAmount}`,
                 );
               } else {
+                // BACK LOSS: -stake (FULL loss applied)
+                netPnl -= stake;
+
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
@@ -801,38 +813,39 @@ export class SettlementService {
                 this.logger.debug(
                   `BACK bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, loss: ${stake}`,
                 );
-                // NO balance change for loss - stake was already deducted at placement
               }
             }
 
             // LAY BET
             if (bet.betType?.toUpperCase() === 'LAY') {
               if (!isWinner) {
-                // LAY wins when selection loses
-                const profit = this.layProfit(stake);
-                balanceDelta += profit; // credit profit only
+                // LAY WIN: +stake (profit)
+                netPnl += stake;
 
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
                     status: BetStatus.WON,
                     // @ts-ignore
-                    pnl: profit,
+                    pnl: stake, // Reporting: profit
                     settledAt: new Date(),
                     updatedAt: new Date(),
                   },
                 });
                 this.logger.debug(
-                  `LAY bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, profit: ${profit}`,
+                  `LAY bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, profit: ${stake}`,
                 );
               } else {
+                // LAY LOSS: -(odds-1)*stake (FULL loss applied)
                 const liab = this.layLiability(stake, odds);
+                netPnl -= liab;
+
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
                     status: BetStatus.LOST,
                     // @ts-ignore
-                    pnl: -liab, // Reporting: loss amount (liability was locked)
+                    pnl: -liab, // Reporting: loss amount
                     settledAt: new Date(),
                     updatedAt: new Date(),
                   },
@@ -840,7 +853,6 @@ export class SettlementService {
                 this.logger.debug(
                   `LAY bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, loss: ${liab}`,
                 );
-                // NO balance change for loss - liability was already deducted at placement
               }
             }
           }
@@ -849,29 +861,41 @@ export class SettlementService {
           // After marking bets as WON/LOST, they're no longer PENDING, so exposure calculation excludes them
           const exposureAfter = await this.calculateMatchOddsExposure(tx, userId, marketId);
           
-          // Release liability = difference in net exposure (not per-bet liability)
-          const liabilityDelta = exposureBefore - exposureAfter;
+          // 🔐 SETTLEMENT FIX: Release liability = exposureBefore (all exposure for this market is released)
+          // After settlement, exposure for this market should be 0
+          // Liability release = exposureBefore (the amount that was locked for this market)
+          const liabilityRelease = exposureBefore;
+          
+          // 🔐 SAFETY: Ensure liability never goes negative
+          const currentLiability = wallet.liability ?? 0;
+          const newLiability = Math.max(0, currentLiability - liabilityRelease);
 
           // 4️⃣ Apply wallet changes ONCE per user
-          if (balanceDelta !== 0 || liabilityDelta !== 0) {
+          if (netPnl !== 0 || liabilityRelease !== 0) {
             await tx.wallet.update({
               where: { userId },
               data: {
-                balance: wallet.balance + balanceDelta,
-                liability: wallet.liability - liabilityDelta, // Subtract because we're releasing liability
+                balance: wallet.balance + netPnl,
+                liability: newLiability, // Release liability (clamped to prevent negative)
               },
             });
 
             // Create transaction record
-            if (balanceDelta > 0) {
+            if (netPnl !== 0) {
               await tx.transaction.create({
                 data: {
                   walletId: wallet.id,
-                  amount: balanceDelta,
-                  type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+                  amount: Math.abs(netPnl),
+                  type: isCancel 
+                    ? TransactionType.REFUND 
+                    : netPnl > 0 
+                      ? TransactionType.BET_WON 
+                      : TransactionType.BET_PLACED, // Use BET_PLACED for losses
                   description: isCancel
-                    ? `Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
-                    : `Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+                    ? `Settlement CANCEL: Refunded ${Math.abs(netPnl)} - ${settlementId}`
+                    : netPnl > 0
+                      ? `Settlement: Profit credited ${netPnl} - ${settlementId}`
+                      : `Settlement: Loss deducted ${Math.abs(netPnl)} - ${settlementId}`,
                 },
               });
             }
@@ -5158,6 +5182,32 @@ export class SettlementService {
       }
     }
 
+    // OPTIMIZED: Batch fetch all matches for settlements without bets
+    const eventIds = settlements.map((s) => s.eventId).filter((id) => id);
+    const uniqueEventIds = [...new Set(eventIds)];
+    const matchesByEventId = new Map<string, any>();
+    
+    if (uniqueEventIds.length > 0) {
+      const matches = await this.prisma.match.findMany({
+        where: {
+          eventId: { in: uniqueEventIds },
+        },
+        select: {
+          id: true,
+          eventId: true,
+          eventName: true,
+          homeTeam: true,
+          awayTeam: true,
+        },
+      });
+      
+      for (const match of matches) {
+        if (match.eventId) {
+          matchesByEventId.set(match.eventId, match);
+        }
+      }
+    }
+
     // Get detailed information for each settlement (now using pre-fetched bets)
     const settlementsWithDetails = settlements.map((settlement) => {
         // Get all bets for this settlement from pre-fetched map
@@ -5182,8 +5232,11 @@ export class SettlementService {
             .reduce((sum, bet) => sum + (bet.pnl || 0), 0),
         );
 
-        // Get match info from first bet (they should all have same match)
-        const matchInfo = bets[0]?.match || null;
+        // Get match info from first bet, or fetch from Match table if no bets
+        let matchInfo = bets[0]?.match || null;
+        if (!matchInfo && settlement.eventId) {
+          matchInfo = matchesByEventId.get(settlement.eventId) || null;
+        }
 
         return {
           id: settlement.id,
@@ -5227,9 +5280,9 @@ export class SettlementService {
             pnl: bet.pnl,
             settledAt: bet.settledAt,
             rollbackAt: bet.rollbackAt,
-          createdAt: bet.createdAt,
-        })),
-      };
+            createdAt: bet.createdAt,
+          })),
+        };
     });
 
     // Get total count for pagination
