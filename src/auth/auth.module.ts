@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, Logger } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { ConfigService } from '@nestjs/config';
@@ -14,12 +14,34 @@ import { JwtStrategy } from './jwt.strategy';
     PrismaModule, // Import PrismaModule to access PrismaService
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
-      useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET') || 'your-super-secret-jwt-key-change-this-in-production-12345',
-        signOptions: {
-          expiresIn: '7d',
-        },
-      }),
+      useFactory: (configService: ConfigService) => {
+        const jwtSecret = configService.get<string>('JWT_SECRET');
+        const logger = new Logger('AuthModule');
+
+        // Validate JWT_SECRET on startup
+        if (!jwtSecret) {
+          const errorMsg = 'JWT_SECRET is not set in environment variables. Authentication will fail.';
+          logger.error(errorMsg);
+          if (process.env.NODE_ENV === 'production') {
+            throw new Error(errorMsg);
+          }
+          logger.warn('⚠️  Using fallback JWT_SECRET (NOT SECURE - set JWT_SECRET in production!)');
+        } else {
+          // Validate JWT_SECRET is not the default insecure value
+          if (jwtSecret === 'your-super-secret-jwt-key-change-this-in-production-12345') {
+            logger.warn('⚠️  JWT_SECRET is set to default insecure value. Change it in production!');
+          } else {
+            logger.log('✅ JWT_SECRET validated');
+          }
+        }
+
+        return {
+          secret: jwtSecret || 'your-super-secret-jwt-key-change-this-in-production-12345',
+          signOptions: {
+            expiresIn: '7d',
+          },
+        };
+      },
       inject: [ConfigService],
     }),
   ],

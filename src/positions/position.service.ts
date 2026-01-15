@@ -68,7 +68,7 @@ export interface FancyPosition {
  */
 export interface BookmakerPosition {
   marketId: string;
-  positions: Record<string, number>; // selectionId -> net position
+  positions: Record<string, { profit: number; loss: number }>; // selectionId -> { profit, loss }
 }
 
 /**
@@ -195,18 +195,22 @@ export function calculateMatchOddsPosition(
       } else {
         // Bet is on another outcome
         // If THIS outcome wins (bet outcome loses): we lose lossAmount (negative)
-        // If THIS outcome loses (bet outcome wins): we don't get winAmount (but this goes to profit calculation for bet outcome)
-        // Actually: if THIS loses, the bet wins, so we profit winAmount - but that's for the bet's outcome, not this one
-        // For this outcome's loss scenario: if we lose, the bet wins = we get winAmount = positive for loss calculation
-        // For this outcome's profit scenario: if we win, the bet loses = we lose lossAmount = negative for profit
+        // If THIS outcome loses (bet outcome wins): we get winAmount (positive)
         totalProfit -= betLossAmount;
         totalLoss += betWinAmount;
       }
     }
 
+    // ✅ UI FIX: Collapse to net exposure for proper hedging display
+    // net = profit + loss (profit is positive, loss is negative, so net = profit - |loss|)
+    const net = totalProfit + totalLoss;
+    
+    // Return win/lose format for UI preview
+    // win = net > 0 ? net : 0 (if net positive, show as win)
+    // lose = net < 0 ? abs(net) : 0 (if net negative, show as loss)
     positions[outcomeSelection] = {
-      profit: totalProfit,
-      loss: totalLoss,
+      profit: net > 0 ? net : 0,
+      loss: net < 0 ? Math.abs(net) : 0,
     };
   }
 
@@ -319,15 +323,22 @@ export function calculateFancyPosition(bets: BetForPosition[] | Bet[]): FancyPos
 }
 
 /**
- * ✅ PURE FUNCTION: Calculate Bookmaker Position
+ * ✅ PURE FUNCTION: Calculate Bookmaker Position (UI FIX)
  * 
- * Bookmaker Position Rules:
+ * Bookmaker Position Rules (same as Match Odds):
  * - Aggregates ONLY bets with gtype='bookmaker' or gtype starts with 'match' (match1, match2, etc.) but NOT 'matchodds' or 'match'
- * - Position per selection: number (net position)
- *   - Positive = net BACK position (profit if selection wins)
- *   - Negative = net LAY position (loss if selection wins)
- * - BACK bet: liability = stake
- * - LAY bet: liability = (odds - 1) * stake
+ * - For EACH runner: Calculate P/L if this runner wins
+ * - Apply BACK and LAY impact
+ * - Apply opposite impact for other runners
+ * - Collapse to net exposure
+ * - Return per selection: { profit, loss }
+ * 
+ * Exchange-standard calculation:
+ * - For each outcome: Calculate total P/L if that outcome wins
+ * - BACK bet on winning selection: + (odds - 1) * stake
+ * - BACK bet on losing selection: - stake
+ * - LAY bet on winning selection: - (odds - 1) * stake
+ * - LAY bet on losing selection: + stake
  * 
  * @param bets - Array of ALL bets (will be filtered to Bookmaker only)
  * @param marketId - Market ID to filter bets (optional, if provided only includes bets for this market)
@@ -376,37 +387,72 @@ export function calculateBookmakerPosition(
   }
 
   // Initialize positions for all selections
-  const positions: Record<string, number> = {};
-  for (const selectionId of selectionIds) {
-    positions[selectionId] = 0;
-  }
+  const positions: Record<string, { profit: number; loss: number }> = {};
 
-  // Calculate net position per selection
-  for (const bet of bookmakerBets) {
-    if (!bet.selectionId && bet.selectionId !== 0) continue;
+  // ✅ Calculate P/L per outcome (same logic as Match Odds)
+  for (const outcomeSelection of selectionIds) {
+    let totalProfit = 0; // Sum of all winAmount when this selection wins
+    let totalLoss = 0;   // Sum of all lossAmount when this selection loses
 
-    const betSelectionId = String(bet.selectionId);
-    const betType = bet.betType?.toUpperCase();
-    const odds = bet.betRate ?? bet.odds ?? 0;
-    const stake = bet.betValue ?? bet.amount ?? 0;
+    for (const bet of bookmakerBets) {
+      // Skip bets with invalid selectionId
+      if (bet.selectionId === null || bet.selectionId === undefined) {
+        continue;
+      }
 
-    // Skip invalid bets
-    if (!betType || (betType !== 'BACK' && betType !== 'LAY') || odds <= 0 || stake <= 0) {
-      continue;
+      const betSelection = String(bet.selectionId);
+      const betType = bet.betType?.toUpperCase();
+      const winAmount = bet.winAmount ?? 0;
+      const lossAmount = bet.lossAmount ?? 0;
+
+      // Skip invalid bets
+      if (!betType || (betType !== 'BACK' && betType !== 'LAY')) {
+        continue;
+      }
+
+      // Use pre-calculated winAmount/lossAmount if available, otherwise calculate from odds
+      let betWinAmount = winAmount;
+      let betLossAmount = lossAmount;
+
+      // Fallback to calculation only if winAmount/lossAmount not provided
+      if (betWinAmount === 0 && betLossAmount === 0) {
+        const odds = bet.betRate ?? bet.odds ?? 0;
+        const stake = bet.betValue ?? bet.amount ?? 0;
+        
+        if (odds > 0 && stake > 0) {
+          if (betType === 'BACK') {
+            betWinAmount = (odds - 1) * stake;
+            betLossAmount = stake;
+          } else if (betType === 'LAY') {
+            betWinAmount = stake;
+            betLossAmount = (odds - 1) * stake;
+          }
+        }
+      }
+
+      if (betSelection === outcomeSelection) {
+        // Bet is on this outcome
+        // If this outcome wins: we get winAmount (positive)
+        // If this outcome loses: we lose lossAmount (negative)
+        totalProfit += betWinAmount;
+        totalLoss -= betLossAmount; // Negative because we lose money
+      } else {
+        // Bet is on another outcome
+        // If THIS outcome wins (bet outcome loses): we lose lossAmount (negative)
+        // If THIS outcome loses (bet outcome wins): we get winAmount (positive)
+        totalProfit -= betLossAmount;
+        totalLoss += betWinAmount;
+      }
     }
 
-    if (!positions.hasOwnProperty(betSelectionId)) {
-      positions[betSelectionId] = 0;
-    }
-
-    if (betType === 'BACK') {
-      // BACK bet: adds to position (positive = profit if wins)
-      positions[betSelectionId] += stake;
-    } else if (betType === 'LAY') {
-      // LAY bet: subtracts from position (negative = loss if wins)
-      // LAY liability = (odds - 1) * stake
-      positions[betSelectionId] -= (odds - 1) * stake;
-    }
+    // ✅ UI FIX: Collapse to net exposure for proper hedging display
+    const net = totalProfit + totalLoss;
+    
+    // Return win/lose format for UI preview
+    positions[outcomeSelection] = {
+      profit: net > 0 ? net : 0,
+      loss: net < 0 ? Math.abs(net) : 0,
+    };
   }
 
   return {

@@ -5280,9 +5280,9 @@ export class SettlementService {
             pnl: bet.pnl,
             settledAt: bet.settledAt,
             rollbackAt: bet.rollbackAt,
-            createdAt: bet.createdAt,
-          })),
-        };
+          createdAt: bet.createdAt,
+        })),
+      };
     });
 
     // Get total count for pagination

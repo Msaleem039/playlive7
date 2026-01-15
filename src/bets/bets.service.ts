@@ -8,6 +8,7 @@ import {
   calculateBookmakerPosition,
   calculateFancyPosition,
 } from '../positions/position.service';
+import { CricketIdService } from '../cricketid/cricketid.service';
 
 @Injectable()
 export class BetsService {
@@ -15,6 +16,7 @@ export class BetsService {
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly cricketIdService: CricketIdService,
   ) {}
 
   /**
@@ -67,112 +69,112 @@ export class BetsService {
    * @param marketId - Market ID
    * @returns Net exposure for this Match Odds market
    */
-  private async calculateMatchOddsExposure(
-    tx: any,
-    userId: string,
-    marketId: string,
-  ): Promise<number> {
-    try {
-      const bets = await tx.bet.findMany({
-        where: {
-          userId,
-          marketId,
-          status: BetStatus.PENDING,
-          gtype: { in: ['matchodds', 'match'] },
-        },
-        select: {
-          betType: true,
-          winAmount: true,
-          lossAmount: true,
-          betValue: true,
-          amount: true,
-          betRate: true,
-          odds: true,
-          selectionId: true,
-        },
-      });
+  // private async calculateMatchOddsExposure(
+  //   tx: any,
+  //   userId: string,
+  //   marketId: string,
+  // ): Promise<number> {
+  //   try {
+  //     const bets = await tx.bet.findMany({
+  //       where: {
+  //         userId,
+  //         marketId,
+  //         status: BetStatus.PENDING,
+  //         gtype: { in: ['matchodds', 'match'] },
+  //       },
+  //       select: {
+  //         betType: true,
+  //         winAmount: true,
+  //         lossAmount: true,
+  //         betValue: true,
+  //         amount: true,
+  //         betRate: true,
+  //         odds: true,
+  //         selectionId: true,
+  //       },
+  //     });
     
-      // Group by selection (runner) to properly net BACK and LAY bets on same selection
-      const selectionMap = new Map<
-        number,
-        {
-          totalBackStake: number;
-          totalBackWinAmount: number;
-          totalLayLiability: number;
-          totalLayStake: number;
-        }
-      >();
+  //     // Group by selection (runner) to properly net BACK and LAY bets on same selection
+  //     const selectionMap = new Map<
+  //       number,
+  //       {
+  //         totalBackStake: number;
+  //         totalBackWinAmount: number;
+  //         totalLayLiability: number;
+  //         totalLayStake: number;
+  //       }
+  //     >();
 
-      // Aggregate all bets per selection to enable proper netting
-      for (const bet of bets) {
-        if (!bet.selectionId) continue;
+  //     // Aggregate all bets per selection to enable proper netting
+  //     for (const bet of bets) {
+  //       if (!bet.selectionId) continue;
         
-        if (!selectionMap.has(bet.selectionId)) {
-          selectionMap.set(bet.selectionId, {
-            totalBackStake: 0,
-            totalBackWinAmount: 0,
-            totalLayLiability: 0,
-            totalLayStake: 0,
-          });
-        }
+  //       if (!selectionMap.has(bet.selectionId)) {
+  //         selectionMap.set(bet.selectionId, {
+  //           totalBackStake: 0,
+  //           totalBackWinAmount: 0,
+  //           totalLayLiability: 0,
+  //           totalLayStake: 0,
+  //         });
+  //       }
 
-        const position = selectionMap.get(bet.selectionId)!;
-        const stake = bet.betValue || bet.amount || 0;
-        const odds = bet.betRate || bet.odds || 0;
+  //       const position = selectionMap.get(bet.selectionId)!;
+  //       const stake = bet.betValue || bet.amount || 0;
+  //       const odds = bet.betRate || bet.odds || 0;
 
-        if (bet.betType === 'BACK') {
-          // BACK bet: liability = stake, winAmount = stake * odds
-          position.totalBackStake += stake;
-          position.totalBackWinAmount += bet.winAmount || stake * odds || 0;
-        } else if (bet.betType === 'LAY') {
-          // LAY bet: liability = (odds - 1) * stake, stake kept if wins
-          const layLiability = (odds - 1) * stake;
-          position.totalLayLiability += layLiability;
-          position.totalLayStake += stake;
-        }
-      }
+  //       if (bet.betType === 'BACK') {
+  //         // BACK bet: liability = stake, winAmount = stake * odds
+  //         position.totalBackStake += stake;
+  //         position.totalBackWinAmount += bet.winAmount || stake * odds || 0;
+  //       } else if (bet.betType === 'LAY') {
+  //         // LAY bet: liability = (odds - 1) * stake, stake kept if wins
+  //         const layLiability = (odds - 1) * stake;
+  //         position.totalLayLiability += layLiability;
+  //         position.totalLayStake += stake;
+  //       }
+  //     }
     
-      // Calculate net exposure per selection, then sum for market
-      let marketExposure = 0;
+  //     // Calculate net exposure per selection, then sum for market
+  //     let marketExposure = 0;
 
-      for (const [selectionId, position] of selectionMap) {
-        // Net the BACK and LAY positions on this selection
-        // If BACK 100 @ 2.0 and LAY 100 @ 2.0 on same selection:
-        // - Net stake: 100 - 100 = 0 → Exposure = 0 (properly offset)
+  //     for (const [selectionId, position] of selectionMap) {
+  //       // Net the BACK and LAY positions on this selection
+  //       // If BACK 100 @ 2.0 and LAY 100 @ 2.0 on same selection:
+  //       // - Net stake: 100 - 100 = 0 → Exposure = 0 (properly offset)
         
-        const netStake = position.totalBackStake - position.totalLayStake;
+  //       const netStake = position.totalBackStake - position.totalLayStake;
 
-        // Calculate exposure based on net position
-        if (netStake > 0) {
-          // Net BACK position: exposure = net stake (BACK liability = stake)
-          marketExposure += netStake;
-        } else if (netStake < 0) {
-          // Net LAY position: calculate average odds for remaining LAY bets
-          // exposure = (avg odds - 1) * |net stake|
-          const avgOdds = position.totalLayStake > 0
-            ? (position.totalLayLiability / position.totalLayStake) + 1
-            : 1;
-          const netLayLiability = (avgOdds - 1) * Math.abs(netStake);
-          marketExposure += netLayLiability;
-        }
-        // If netStake === 0, exposure = 0 (fully offset)
-      }
+  //       // Calculate exposure based on net position
+  //       if (netStake > 0) {
+  //         // Net BACK position: exposure = net stake (BACK liability = stake)
+  //         marketExposure += netStake;
+  //       } else if (netStake < 0) {
+  //         // Net LAY position: calculate average odds for remaining LAY bets
+  //         // exposure = (avg odds - 1) * |net stake|
+  //         const avgOdds = position.totalLayStake > 0
+  //           ? (position.totalLayLiability / position.totalLayStake) + 1
+  //           : 1;
+  //         const netLayLiability = (avgOdds - 1) * Math.abs(netStake);
+  //         marketExposure += netLayLiability;
+  //       }
+  //       // If netStake === 0, exposure = 0 (fully offset)
+  //     }
     
-      return marketExposure;
-    } catch (error: any) {
-      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
-      if (error?.message?.includes('Transaction not found') || 
-          error?.message?.includes('Transaction ID is invalid') ||
-          error?.message?.includes('Transaction already closed')) {
-        this.logger.warn(
-          `Transaction invalid in calculateMatchOddsExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
-        );
-        return 0;
-      }
-      // Re-throw other errors
-      throw error;
-    }
-  }
+  //     return marketExposure;
+  //   } catch (error: any) {
+  //     // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+  //     if (error?.message?.includes('Transaction not found') || 
+  //         error?.message?.includes('Transaction ID is invalid') ||
+  //         error?.message?.includes('Transaction already closed')) {
+  //       this.logger.warn(
+  //         `Transaction invalid in calculateMatchOddsExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
+  //       );
+  //       return 0;
+  //     }
+  //     // Re-throw other errors
+  //     throw error;
+  //   }
+  // }
   
 
   /**
@@ -191,82 +193,82 @@ export class BetsService {
    * @param selectionId - Selection ID
    * @returns Net exposure for this Fancy selection
    */
-  private async calculateFancyExposure(
-    tx: any,
-    userId: string,
-    eventId: string,
-    selectionId: number,
-  ): Promise<number> {
-    try {
-      const bets = await tx.bet.findMany({
-        where: {
-          userId,
-          status: BetStatus.PENDING,
-          gtype: 'fancy',
-          eventId,
-          selectionId,
-        },
-        select: {
-          betType: true,
-          betValue: true,
-          amount: true,
-          betRate: true,
-          odds: true,
-        },
-      });
+  // private async calculateFancyExposure(
+  //   tx: any,
+  //   userId: string,
+  //   eventId: string,
+  //   selectionId: number,
+  // ): Promise<number> {
+  //   try {
+  //     const bets = await tx.bet.findMany({
+  //       where: {
+  //         userId,
+  //         status: BetStatus.PENDING,
+  //         gtype: 'fancy',
+  //         eventId,
+  //         selectionId,
+  //       },
+  //       select: {
+  //         betType: true,
+  //         betValue: true,
+  //         amount: true,
+  //         betRate: true,
+  //         odds: true,
+  //       },
+  //     });
 
-      // Group bets by eventId_selectionId_rate (same-line grouping)
-      // Note: eventId and selectionId are fixed in this function (from parameters)
-      const grouped = new Map<number, {
-        yes: number;
-        no: number;
-      }>();
+  //     // Group bets by eventId_selectionId_rate (same-line grouping)
+  //     // Note: eventId and selectionId are fixed in this function (from parameters)
+  //     const grouped = new Map<number, {
+  //       yes: number;
+  //       no: number;
+  //     }>();
 
-      for (const bet of bets) {
-        const stake = bet.betValue ?? bet.amount ?? 0;
-        const betTypeUpper = (bet.betType || '').toUpperCase();
-        const rate = bet.betRate ?? bet.odds ?? 0;
-        // Group by rate (eventId and selectionId are already filtered in query)
+  //     for (const bet of bets) {
+  //       const stake = bet.betValue ?? bet.amount ?? 0;
+  //       const betTypeUpper = (bet.betType || '').toUpperCase();
+  //       const rate = bet.betRate ?? bet.odds ?? 0;
+  //       // Group by rate (eventId and selectionId are already filtered in query)
 
-        if (!grouped.has(rate)) {
-          grouped.set(rate, { yes: 0, no: 0 });
-        }
+  //       if (!grouped.has(rate)) {
+  //         grouped.set(rate, { yes: 0, no: 0 });
+  //       }
 
-        const bucket = grouped.get(rate)!;
+  //       const bucket = grouped.get(rate)!;
 
-        // FANCY: liability = stake (for both BACK and LAY)
-        // YES/NO are treated the same as BACK/LAY
-        if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
-          bucket.yes += stake;
-        } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
-          bucket.no += stake;
-        }
-      }
+  //       // FANCY: liability = stake (for both BACK and LAY)
+  //       // YES/NO are treated the same as BACK/LAY
+  //       if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+  //         bucket.yes += stake;
+  //       } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+  //         bucket.no += stake;
+  //       }
+  //     }
 
-      // Calculate exposure: SUM of ALL stakes (no cross-line hedging)
-      let exposure = 0;
+  //     // Calculate exposure: SUM of ALL stakes (no cross-line hedging)
+  //     let exposure = 0;
 
-      for (const [, g] of grouped) {
-        // Same-line YES & NO → sum (no hedge)
-        // Different lines also sum (no hedge)
-        exposure += g.yes + g.no;
-      }
+  //     for (const [, g] of grouped) {
+  //       // Same-line YES & NO → sum (no hedge)
+  //       // Different lines also sum (no hedge)
+  //       exposure += g.yes + g.no;
+  //     }
 
-      return exposure;
-    } catch (error: any) {
-      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
-      if (error?.message?.includes('Transaction not found') || 
-          error?.message?.includes('Transaction ID is invalid') ||
-          error?.message?.includes('Transaction already closed')) {
-        this.logger.warn(
-          `Transaction invalid in calculateFancyExposure for userId: ${userId}, eventId: ${eventId}, selectionId: ${selectionId}. Returning 0 exposure.`,
-        );
-        return 0;
-      }
-      // Re-throw other errors
-      throw error;
-    }
-  }
+  //     return exposure;
+  //   } catch (error: any) {
+  //     // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+  //     if (error?.message?.includes('Transaction not found') || 
+  //         error?.message?.includes('Transaction ID is invalid') ||
+  //         error?.message?.includes('Transaction already closed')) {
+  //       this.logger.warn(
+  //         `Transaction invalid in calculateFancyExposure for userId: ${userId}, eventId: ${eventId}, selectionId: ${selectionId}. Returning 0 exposure.`,
+  //       );
+  //       return 0;
+  //     }
+  //     // Re-throw other errors
+  //     throw error;
+  //   }
+  // }
 
   /**
    * ✅ BOOKMAKER EXPOSURE CALCULATION (MARKET-SPECIFIC)
@@ -281,70 +283,70 @@ export class BetsService {
    * @param marketId - Market ID
    * @returns Net exposure for this Bookmaker market
    */
-  private async calculateBookmakerExposure(
-    tx: any,
-    userId: string,
-    marketId: string,
-  ): Promise<number> {
-    try {
-      // Query for bookmaker bets: includes 'bookmaker' and numbered match variants (match1, match2, etc.)
-      // First, find all bets for this marketId to check gtype patterns
-      const allBets = await tx.bet.findMany({
-        where: {
-          userId,
-          status: BetStatus.PENDING,
-          marketId,
-        },
-        select: {
-          gtype: true,
-          betType: true,
-          betValue: true,
-          amount: true,
-          betRate: true,
-          odds: true,
-        },
-      });
+  // private async calculateBookmakerExposure(
+  //   tx: any,
+  //   userId: string,
+  //   marketId: string,
+  // ): Promise<number> {
+  //   try {
+  //     // Query for bookmaker bets: includes 'bookmaker' and numbered match variants (match1, match2, etc.)
+  //     // First, find all bets for this marketId to check gtype patterns
+  //     const allBets = await tx.bet.findMany({
+  //       where: {
+  //         userId,
+  //         status: BetStatus.PENDING,
+  //         marketId,
+  //       },
+  //       select: {
+  //         gtype: true,
+  //         betType: true,
+  //         betValue: true,
+  //         amount: true,
+  //         betRate: true,
+  //         odds: true,
+  //       },
+  //     });
 
-      // Filter for bookmaker bets: 'bookmaker' or numbered match variants (match1, match2, etc.)
-      const bets = allBets.filter((bet: any) => {
-        const betGtype = (bet.gtype || '').toLowerCase();
-        return betGtype === 'bookmaker' || 
-               (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds');
-      });
+  //     // Filter for bookmaker bets: 'bookmaker' or numbered match variants (match1, match2, etc.)
+  //     const bets = allBets.filter((bet: any) => {
+  //       const betGtype = (bet.gtype || '').toLowerCase();
+  //       return betGtype === 'bookmaker' || 
+  //              (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds');
+  //     });
 
-      let totalBackStake = 0;
-      let totalLayLiability = 0;
+  //     let totalBackStake = 0;
+  //     let totalLayLiability = 0;
 
-      for (const bet of bets) {
-        const stake = bet.betValue ?? bet.amount ?? 0;
-        const odds = bet.betRate ?? bet.odds ?? 0;
-        const betTypeUpper = (bet.betType || '').toUpperCase();
+  //     for (const bet of bets) {
+  //       const stake = bet.betValue ?? bet.amount ?? 0;
+  //       const odds = bet.betRate ?? bet.odds ?? 0;
+  //       const betTypeUpper = (bet.betType || '').toUpperCase();
 
-        if (betTypeUpper === 'BACK') {
-          // BOOKMAKER BACK: liability = stake
-          totalBackStake += stake;
-        } else if (betTypeUpper === 'LAY') {
-          // BOOKMAKER LAY: liability = (odds - 1) × stake
-          totalLayLiability += (odds - 1) * stake;
-        }
-      }
+  //       if (betTypeUpper === 'BACK') {
+  //         // BOOKMAKER BACK: liability = stake
+  //         totalBackStake += stake;
+  //       } else if (betTypeUpper === 'LAY') {
+  //         // BOOKMAKER LAY: liability = (odds - 1) × stake
+  //         totalLayLiability += (odds - 1) * stake;
+  //       }
+  //     }
 
-      // Exposure = abs(totalBackStake - totalLayLiability)
-      return Math.abs(totalBackStake - totalLayLiability);
-    } catch (error: any) {
-      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
-      if (error?.message?.includes('Transaction not found') || 
-          error?.message?.includes('Transaction ID is invalid') ||
-          error?.message?.includes('Transaction already closed')) {
-        this.logger.warn(
-          `Transaction invalid in calculateBookmakerExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
-        );
-        return 0;
-      }
-      // Re-throw other errors
-      throw error;
-    }
-  }
+  //     // Exposure = abs(totalBackStake - totalLayLiability)
+  //     return Math.abs(totalBackStake - totalLayLiability);
+  //   } catch (error: any) {
+  //     // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
+  //     if (error?.message?.includes('Transaction not found') || 
+  //         error?.message?.includes('Transaction ID is invalid') ||
+  //         error?.message?.includes('Transaction already closed')) {
+  //       this.logger.warn(
+  //         `Transaction invalid in calculateBookmakerExposure for userId: ${userId}, marketId: ${marketId}. Returning 0 exposure.`,
+  //       );
+  //       return 0;
+  //     }
+  //     // Re-throw other errors
+  //     throw error;
+  //   }
+  // }
 
   /**
    * ✅ EXPOSURE BY MARKET TYPE (PURE IN-MEMORY)
@@ -560,8 +562,8 @@ export class BetsService {
     for (const bet of bets) {
       if (!bet.selectionId) continue;
   
-      const stake = Number(bet.betValue || bet.amount || 0);
-      const odds = Number(bet.betRate || bet.odds || 0);
+        const stake = Number(bet.betValue || bet.amount || 0);
+        const odds = Number(bet.betRate || bet.odds || 0);
       const type = (bet.betType || '').toUpperCase();
   
       if (!positionBySelection.has(bet.selectionId)) {
@@ -573,13 +575,13 @@ export class BetsService {
       if (type === 'BACK') {
         pos.win += (odds - 1) * stake;
         pos.lose -= stake;
-      }
+        }
   
       if (type === 'LAY') {
         pos.win -= (odds - 1) * stake;
         pos.lose += stake;
-      }
-    }
+          }
+        }
   
     let exposure = 0;
   
@@ -588,7 +590,7 @@ export class BetsService {
   
       for (const [sid, pos] of positionBySelection) {
         pnl += sid === winner ? pos.win : pos.lose;
-      }
+    }
   
       if (pnl < 0) {
         exposure = Math.max(exposure, Math.abs(pnl));
@@ -655,49 +657,228 @@ export class BetsService {
    * Calculate Fancy exposure in memory (no database queries)
    * ✅ EXCHANGE RULE: Different lines do NOT hedge, only same-line reverse can reduce exposure
    * - Group bets by eventId_selectionId_rate (same-line grouping)
-   * - Same-line: YES @ X + NO @ X = full liability (sum, not offset)
+   * - Same-line: YES @ X and NO @ X hedge each other (exposure = |YES - NO|)
    * - Different lines: YES @ A + NO @ B = full liability (sum, NO hedge)
-   * - Exposure is SUM of ALL fancy stakes (no cross-line hedging)
+   * - Exposure is net per line, then summed across all lines
+   * 
+   * ✅ GOLA FANCY SUPPORT:
+   * - Multiple fancy lines belong to ONE gola group (identified by metadata.golaGroupId)
+   * - Only ONE line can win, all other lines lose
+   * - Exposure = worst-case loss across all possible outcomes
+   * 
    * @param bets - Array of bets for the fancy selection
    * @returns Net exposure for this Fancy selection
    */
   private calculateFancyExposureInMemory(bets: any[]): number {
-    // Group bets by eventId_selectionId_rate (same-line grouping)
-    const grouped = new Map<string, {
-      yes: number;
-      no: number;
-    }>();
+    // 1️⃣ Split bets into normal fancy and gola fancy
+    const normalFancyBets: any[] = [];
+    const golaFancyBets: any[] = [];
 
     for (const bet of bets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
-      const rate = bet.betRate ?? bet.odds ?? 0;
-      // Group by eventId_selectionId_rate (same line)
-      const key = `${bet.eventId}_${bet.selectionId}_${rate}`;
-
-      if (!grouped.has(key)) {
-        grouped.set(key, { yes: 0, no: 0 });
-      }
-
-      const bucket = grouped.get(key)!;
-
-      if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
-        bucket.yes += stake;
-      } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
-        bucket.no += stake;
+      const metadata = bet.metadata || {};
+      const golaGroupId = metadata.golaGroupId;
+      
+      if (golaGroupId) {
+        golaFancyBets.push(bet);
+      } else {
+        normalFancyBets.push(bet);
       }
     }
 
-    // Calculate exposure: SUM of ALL stakes (no cross-line hedging)
-    let exposure = 0;
+    // 2️⃣ NORMAL FANCY: Use existing same-line reverse logic (UNCHANGED)
+    const normalExposure = this.calculateNormalFancyExposure(normalFancyBets);
 
-    for (const [, g] of grouped) {
-      // Same-line YES & NO → sum (no hedge)
-      // Different lines also sum (no hedge)
-      exposure += g.yes + g.no;
+    // 3️⃣ GOLA FANCY: Calculate worst-case exposure across all outcomes
+    const golaExposure = this.calculateGolaFancyExposure(golaFancyBets);
+
+    // 4️⃣ FINAL RESULT: Sum of normal fancy exposure + gola fancy exposure
+    return normalExposure + golaExposure;
+  }
+
+  /**
+   * Calculate normal fancy exposure
+   * ✅ EXCHANGE-CORRECT: Worst-case loss across all outcomes
+   * 
+   * Rules:
+   * - Group bets by (eventId + selectionId) = fancy market
+   * - Same-line YES/NO → hedge: exposure = |YES - NO|
+   * - Multiple different rates → worst-case: exposure = total YES stake + total NO stake
+   * - No unlocking or risk-free assumptions at placement time
+   * - Exposure must always represent worst-case loss
+   */
+  private calculateNormalFancyExposure(bets: any[]): number {
+    if (bets.length === 0) {
+      return 0;
     }
 
-    return exposure;
+    // Group bets by eventId_selectionId (same fancy market)
+    const betsByFancy = new Map<string, any[]>();
+    
+    for (const bet of bets) {
+      const eventId = bet.eventId || '';
+      const selectionId = bet.selectionId || 0;
+      const fancyKey = `${eventId}_${selectionId}`;
+      
+      if (!betsByFancy.has(fancyKey)) {
+        betsByFancy.set(fancyKey, []);
+      }
+      
+      betsByFancy.get(fancyKey)!.push(bet);
+    }
+
+    let totalExposure = 0;
+
+    // Process each fancy market separately
+    for (const [fancyKey, fancyBets] of betsByFancy) {
+      // Group bets by rate (line) for this fancy market
+      const grouped = new Map<number, {
+        yes: number;
+        no: number;
+      }>();
+
+      for (const bet of fancyBets) {
+        const stake = bet.betValue ?? bet.amount ?? 0;
+        const betTypeUpper = (bet.betType || '').toUpperCase();
+        const rate = bet.betRate ?? bet.odds ?? 0;
+
+        if (!grouped.has(rate)) {
+          grouped.set(rate, { yes: 0, no: 0 });
+        }
+
+        const bucket = grouped.get(rate)!;
+
+        if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+          bucket.yes += stake;
+        } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+          bucket.no += stake;
+        }
+      }
+
+      // ✅ EXCHANGE-CORRECT FANCY EXPOSURE RULE
+      // For each rate: Apply same-line hedging |YES - NO|
+      // Sum exposure across all rates (no cross-rate hedging)
+      // This preserves same-line hedging while preventing over-locking in mixed scenarios
+      const rates = Array.from(grouped.keys());
+      
+      // Calculate exposure per rate (same-line hedge), then sum
+      for (const rate of rates) {
+        const g = grouped.get(rate)!;
+        // Same-line hedging: |YES - NO|
+        const lineExposure = Math.max(
+          g.yes - g.no,
+          g.no - g.yes,
+          0
+        );
+        totalExposure += lineExposure;
+      }
+    }
+
+    return totalExposure;
+  }
+
+  /**
+   * Calculate gola fancy exposure (worst-case loss across all outcomes)
+   * GOLA RULE: Only ONE line can win, all others lose
+   * - Group bets by golaGroupId, then by line (eventId + selectionId + rate)
+   * - For each possible outcome (one line wins):
+   *   - Winning line: YES wins, NO loses
+   *   - All other lines: Both YES and NO lose
+   * - Exposure = MAX(net loss across all outcomes)
+   */
+  private calculateGolaFancyExposure(bets: any[]): number {
+    if (bets.length === 0) {
+      return 0;
+    }
+
+    // Group bets by golaGroupId
+    const golaGroups = new Map<string, any[]>();
+
+    for (const bet of bets) {
+      const metadata = bet.metadata || {};
+      const golaGroupId = metadata.golaGroupId;
+      
+      if (!golaGroupId) {
+        continue; // Skip if no golaGroupId (shouldn't happen, but safety check)
+      }
+
+      if (!golaGroups.has(golaGroupId)) {
+        golaGroups.set(golaGroupId, []);
+      }
+
+      golaGroups.get(golaGroupId)!.push(bet);
+    }
+
+    let totalGolaExposure = 0;
+
+    // Process each gola group independently
+    for (const [golaGroupId, groupBets] of golaGroups) {
+      // Group bets by line (eventId + selectionId + rate)
+      const linesByKey = new Map<string, {
+        yes: number;
+        no: number;
+        eventId: string;
+        selectionId: number;
+        rate: number;
+      }>();
+
+      for (const bet of groupBets) {
+        const stake = bet.betValue ?? bet.amount ?? 0;
+        const betTypeUpper = (bet.betType || '').toUpperCase();
+        const rate = bet.betRate ?? bet.odds ?? 0;
+        const eventId = bet.eventId || '';
+        const selectionId = bet.selectionId || 0;
+        
+        // Group by eventId_selectionId_rate (same line)
+        const lineKey = `${eventId}_${selectionId}_${rate}`;
+
+        if (!linesByKey.has(lineKey)) {
+          linesByKey.set(lineKey, {
+            yes: 0,
+            no: 0,
+            eventId,
+            selectionId,
+            rate,
+          });
+        }
+
+        const line = linesByKey.get(lineKey)!;
+
+        if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
+          line.yes += stake;
+        } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
+          line.no += stake;
+        }
+      }
+
+      // Enumerate all possible outcomes (one line wins at a time)
+      const lines = Array.from(linesByKey.values());
+      let maxLoss = 0;
+
+      for (const winningLine of lines) {
+        // Calculate net loss for this outcome
+        let netLoss = 0;
+
+        for (const line of lines) {
+          if (line === winningLine) {
+            // Winning line: YES wins, NO loses
+            // Loss = NO stake (we pay out YES, but NO loses)
+            netLoss += line.no;
+          } else {
+            // All other lines: Both YES and NO lose
+            // Loss = YES stake + NO stake (we pay out both)
+            netLoss += line.yes + line.no;
+          }
+        }
+
+        // Track worst-case loss
+        maxLoss = Math.max(maxLoss, netLoss);
+      }
+
+      // Gola exposure must NEVER be negative
+      totalGolaExposure += Math.max(0, maxLoss);
+    }
+
+    return totalGolaExposure;
   }
 
   async selectOneRow(table: string, idField: string, userId: string) {
@@ -745,480 +926,621 @@ export class BetsService {
   /**
    * @deprecated Use placeBet() instead - All bet placement is now centralized
    */
-  private async placeMatchOddsBet(
-    input: PlaceBetDto,
-    normalizedBetValue: number,
-    normalizedBetRate: number,
-    normalizedSelectionId: number,
-    normalizedWinAmount: number,
-    normalizedLossAmount: number,
-    userId: string,
-    marketId: string,
-    debug: Record<string, unknown>,
-  ) {
-    const {
-      bet_type,
-      bet_name,
-      match_id,
-      market_name,
-      market_type,
-      eventId,
-      runner_name_2,
-      selection_id,
-    } = input;
+  // private async placeMatchOddsBet(
+  //   input: PlaceBetDto,
+  //   normalizedBetValue: number,
+  //   normalizedBetRate: number,
+  //   normalizedSelectionId: number,
+  //   normalizedWinAmount: number,
+  //   normalizedLossAmount: number,
+  //   userId: string,
+  //   marketId: string,
+  //   debug: Record<string, unknown>,
+  // ) {
+  //   const {
+  //     bet_type,
+  //     bet_name,
+  //     match_id,
+  //     market_name,
+  //     market_type,
+  //     eventId,
+  //     runner_name_2,
+  //     selection_id,
+  //   } = input;
 
-    const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    const settlement_id = `${match_id}_${selection_id}`;
-    const to_return = normalizedWinAmount + normalizedLossAmount;
+  //   const selid = Math.floor(Math.random() * 90000000) + 10000000;
+  //   const settlement_id = `${match_id}_${selection_id}`;
+  //   const to_return = normalizedWinAmount + normalizedLossAmount;
 
-    return await this.prisma.$transaction(
-      async (tx) => {
-        // Step 1: Ensure match exists
-        await tx.match.upsert({
-          where: { id: String(match_id) },
-          update: {
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-          create: {
-            id: String(match_id),
-            homeTeam: bet_name ?? 'Unknown',
-            awayTeam: market_name ?? 'Unknown',
-            startTime: new Date(),
-            status: MatchStatus.LIVE,
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-        });
+  //   return await this.prisma.$transaction(
+  //     async (tx) => {
+  //       // Step 1: Ensure match exists
+  //       await tx.match.upsert({
+  //         where: { id: String(match_id) },
+  //         update: {
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //         create: {
+  //           id: String(match_id),
+  //           homeTeam: bet_name ?? 'Unknown',
+  //           awayTeam: market_name ?? 'Unknown',
+  //           startTime: new Date(),
+  //           status: MatchStatus.LIVE,
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //       });
 
-        // Step 2: Get current wallet state
-        const currentWallet = await tx.wallet.upsert({
-          where: { userId },
-          update: {},
-          create: {
-            userId,
-            balance: 0,
-            liability: 0,
-          },
-        });
+  //       // Step 2: Get current wallet state
+  //       const currentWallet = await tx.wallet.upsert({
+  //         where: { userId },
+  //         update: {},
+  //         create: {
+  //           userId,
+  //           balance: 0,
+  //           liability: 0,
+  //         },
+  //       });
 
-        const currentBalance = Number(currentWallet.balance) || 0;
-        const currentLiability = Number(currentWallet.liability) || 0;
+  //       const currentBalance = Number(currentWallet.balance) || 0;
+  //       const currentLiability = Number(currentWallet.liability) || 0;
 
-        // Step 3: Calculate total exposure BEFORE bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
-        // This ensures wallet.liability always matches calculated total exposure across all markets
-        // Prevents liability jumps when switching between Match Odds, Fancy, and Bookmaker markets
-        const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
+  //       // Step 3: Calculate total exposure BEFORE bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
+  //       // This ensures wallet.liability always matches calculated total exposure across all markets
+  //       // Prevents liability jumps when switching between Match Odds, Fancy, and Bookmaker markets
+  //       const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
 
-        // Step 4: Create the bet FIRST
-        const betData: any = {
-          userId,
-          matchId: String(match_id),
-          amount: normalizedBetValue,
-          odds: normalizedBetRate,
-          selectionId: normalizedSelectionId,
-          betType: bet_type,
-          betName: bet_name,
-          marketName: market_name,
-          marketType: market_type,
-          betValue: normalizedBetValue,
-          betRate: normalizedBetRate,
-          winAmount: normalizedWinAmount,
-          lossAmount: normalizedLossAmount,
-          gtype: 'matchodds',
-          settlementId: settlement_id,
-          toReturn: to_return,
-          status: BetStatus.PENDING,
-          marketId,
-          ...(eventId && { eventId }),
-          metadata: runner_name_2 ? { runner_name_2 } : undefined,
-        };
+  //       // Step 4: Create the bet FIRST
+  //       const betData: any = {
+  //         userId,
+  //         matchId: String(match_id),
+  //         amount: normalizedBetValue,
+  //         odds: normalizedBetRate,
+  //         selectionId: normalizedSelectionId,
+  //         betType: bet_type,
+  //         betName: bet_name,
+  //         marketName: market_name,
+  //         marketType: market_type,
+  //         betValue: normalizedBetValue,
+  //         betRate: normalizedBetRate,
+  //         winAmount: normalizedWinAmount,
+  //         lossAmount: normalizedLossAmount,
+  //         gtype: 'matchodds',
+  //         settlementId: settlement_id,
+  //         toReturn: to_return,
+  //         status: BetStatus.PENDING,
+  //         marketId,
+  //         ...(eventId && { eventId }),
+  //         metadata: runner_name_2 ? { runner_name_2 } : undefined,
+  //       };
 
-        if (selid) {
-          betData.selId = selid;
-        }
+  //       if (selid) {
+  //         betData.selId = selid;
+  //       }
 
-        const bet = await tx.bet.create({ data: betData });
+  //       const bet = await tx.bet.create({ data: betData });
 
-        // Step 5: Calculate total exposure AFTER bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (preserves Fancy, Bookmaker, other Match Odds liability)
-        const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
-        const exposureDelta = totalExposureAfter - totalExposureBefore;
+  //       // Step 5: Calculate total exposure AFTER bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (preserves Fancy, Bookmaker, other Match Odds liability)
+  //       const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
+  //       const exposureDelta = totalExposureAfter - totalExposureBefore;
 
-        // Step 6: Validate balance before updating wallet
-        if (exposureDelta > 0 && currentBalance < exposureDelta) {
-          throw new Error(
-            `Insufficient available balance. ` +
-            `Balance: ${currentBalance}, Required: ${exposureDelta}`,
-          );
-        }
+  //       // Step 6: Validate balance before updating wallet
+  //       if (exposureDelta > 0 && currentBalance < exposureDelta) {
+  //         throw new Error(
+  //           `Insufficient available balance. ` +
+  //           `Balance: ${currentBalance}, Required: ${exposureDelta}`,
+  //         );
+  //       }
 
-        // Step 7: Update wallet using exposure delta (CRITICAL INVARIANT)
-        // 🔐 TOTAL EXPOSURE DELTA MODEL:
-        // balance -= exposureDelta (if exposure increases) or += |exposureDelta| (if decreases)
-        // liability += exposureDelta (can be positive or negative)
-        // Wallet invariant: wallet.liability === calculateTotalExposure(userId)
-        // This ensures liability always matches calculated total exposure across all markets
+  //       // Step 7: Update wallet using exposure delta (CRITICAL INVARIANT)
+  //       // 🔐 TOTAL EXPOSURE DELTA MODEL:
+  //       // balance -= exposureDelta (if exposure increases) or += |exposureDelta| (if decreases)
+  //       // liability += exposureDelta (can be positive or negative)
+  //       // Wallet invariant: wallet.liability === calculateTotalExposure(userId)
+  //       // This ensures liability always matches calculated total exposure across all markets
         
-        await tx.wallet.update({
-          where: { userId },
-          data: {
-            balance:
-              exposureDelta > 0
-                ? currentBalance - exposureDelta
-                : currentBalance + Math.abs(exposureDelta),
-            liability: currentLiability + exposureDelta,
-          },
-        });
+  //       await tx.wallet.update({
+  //         where: { userId },
+  //         data: {
+  //           balance:
+  //             exposureDelta > 0
+  //               ? currentBalance - exposureDelta
+  //               : currentBalance + Math.abs(exposureDelta),
+  //           liability: currentLiability + exposureDelta,
+  //         },
+  //       });
 
-        // Step 8: Create transaction log using exposureDelta
-        await tx.transaction.create({
-          data: {
-            walletId: currentWallet.id,
-            amount: Math.abs(exposureDelta),
-            type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
-            description: `Match Odds bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
-          },
-        });
+  //       // Step 8: Create transaction log using exposureDelta
+  //       await tx.transaction.create({
+  //         data: {
+  //           walletId: currentWallet.id,
+  //           amount: Math.abs(exposureDelta),
+  //           type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
+  //           description: `Match Odds bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
+  //         },
+  //       });
 
-        debug.matchodds_exposure_delta = exposureDelta;
-        debug.matchodds_total_exposure_before = totalExposureBefore;
-        debug.matchodds_total_exposure_after = totalExposureAfter;
-        debug.matchodds_old_balance = currentBalance;
-        debug.matchodds_new_balance = exposureDelta > 0
-          ? currentBalance - exposureDelta
-          : currentBalance + Math.abs(exposureDelta);
-        debug.matchodds_old_liability = currentLiability;
-        debug.matchodds_new_liability = currentLiability + exposureDelta;
+  //       debug.matchodds_exposure_delta = exposureDelta;
+  //       debug.matchodds_total_exposure_before = totalExposureBefore;
+  //       debug.matchodds_total_exposure_after = totalExposureAfter;
+  //       debug.matchodds_old_balance = currentBalance;
+  //       debug.matchodds_new_balance = exposureDelta > 0
+  //         ? currentBalance - exposureDelta
+  //         : currentBalance + Math.abs(exposureDelta);
+  //       debug.matchodds_old_liability = currentLiability;
+  //       debug.matchodds_new_liability = currentLiability + exposureDelta;
 
-        return { betId: bet.id };
-      },
-      {
-        maxWait: 10000,
-        timeout: 20000,
-      },
-    );
-  }
+  //       return { betId: bet.id };
+  //     },
+  //     {
+  //       maxWait: 10000,
+  //       timeout: 20000,
+  //     },
+  //   );
+  // }
 
   /**
    * @deprecated Use placeBet() instead - All bet placement is now centralized
    */
-  private async placeFancyBet(
-    input: PlaceBetDto,
-    normalizedBetValue: number,
-    normalizedBetRate: number,
-    normalizedSelectionId: number,
-    normalizedWinAmount: number,
-    normalizedLossAmount: number,
-    userId: string,
-    marketId: string,
-    debug: Record<string, unknown>,
-  ) {
-    const {
-      bet_type,
-      bet_name,
-      match_id,
-      market_name,
-      market_type,
-      eventId,
-      runner_name_2,
-      selection_id,
-    } = input;
+  // private async placeFancyBet(
+  //   input: PlaceBetDto,
+  //   normalizedBetValue: number,
+  //   normalizedBetRate: number,
+  //   normalizedSelectionId: number,
+  //   normalizedWinAmount: number,
+  //   normalizedLossAmount: number,
+  //   userId: string,
+  //   marketId: string,
+  //   debug: Record<string, unknown>,
+  // ) {
+  //   const {
+  //     bet_type,
+  //     bet_name,
+  //     match_id,
+  //     market_name,
+  //     market_type,
+  //     eventId,
+  //     runner_name_2,
+  //     selection_id,
+  //   } = input;
 
-    const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    const settlement_id = `${match_id}_${selection_id}`;
-    const to_return = normalizedWinAmount + normalizedLossAmount;
+  //   const selid = Math.floor(Math.random() * 90000000) + 10000000;
+  //   const settlement_id = `${match_id}_${selection_id}`;
+  //   const to_return = normalizedWinAmount + normalizedLossAmount;
 
-    return await this.prisma.$transaction(
-      async (tx) => {
-        // Step 1: Ensure match exists
-        await tx.match.upsert({
-          where: { id: String(match_id) },
-          update: {
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-          create: {
-            id: String(match_id),
-            homeTeam: bet_name ?? 'Unknown',
-            awayTeam: market_name ?? 'Unknown',
-            startTime: new Date(),
-            status: MatchStatus.LIVE,
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-        });
+  //   return await this.prisma.$transaction(
+  //     async (tx) => {
+  //       // Step 1: Ensure match exists
+  //       await tx.match.upsert({
+  //         where: { id: String(match_id) },
+  //         update: {
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //         create: {
+  //           id: String(match_id),
+  //           homeTeam: bet_name ?? 'Unknown',
+  //           awayTeam: market_name ?? 'Unknown',
+  //           startTime: new Date(),
+  //           status: MatchStatus.LIVE,
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //       });
 
-        // Step 2: Get current wallet state
-        const currentWallet = await tx.wallet.upsert({
-          where: { userId },
-          update: {},
-          create: {
-            userId,
-            balance: 0,
-            liability: 0,
-          },
-        });
+  //       // Step 2: Get current wallet state
+  //       const currentWallet = await tx.wallet.upsert({
+  //         where: { userId },
+  //         update: {},
+  //         create: {
+  //           userId,
+  //           balance: 0,
+  //           liability: 0,
+  //         },
+  //       });
 
-        const currentBalance = Number(currentWallet.balance) || 0;
-        const currentLiability = Number(currentWallet.liability) || 0;
+  //       const currentBalance = Number(currentWallet.balance) || 0;
+  //       const currentLiability = Number(currentWallet.liability) || 0;
 
-        // Step 3: Calculate total exposure BEFORE bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
-        // This ensures wallet.liability always matches calculated total exposure across all markets
-        // Prevents liability jumps when switching between Match Odds, Fancy, and Bookmaker markets
-        // Fancy exposure is calculated per (eventId, selectionId) and includes netting
-        const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
+  //       // Step 3: Calculate total exposure BEFORE bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
+  //       // This ensures wallet.liability always matches calculated total exposure across all markets
+  //       // Prevents liability jumps when switching between Match Odds, Fancy, and Bookmaker markets
+  //       // Fancy exposure is calculated per (eventId, selectionId) and includes netting
+  //       const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
 
-        // Step 4: Create the bet FIRST
-        const betData: any = {
-          userId,
-          matchId: String(match_id),
-          amount: normalizedBetValue,
-          odds: normalizedBetRate,
-          selectionId: normalizedSelectionId,
-          betType: bet_type,
-          betName: bet_name,
-          marketName: market_name,
-          marketType: market_type,
-          betValue: normalizedBetValue,
-          betRate: normalizedBetRate,
-          winAmount: normalizedWinAmount,
-          lossAmount: normalizedLossAmount,
-          gtype: 'fancy',
-          settlementId: settlement_id,
-          toReturn: to_return,
-          status: BetStatus.PENDING,
-          marketId,
-          ...(eventId && { eventId }),
-          metadata: runner_name_2 ? { runner_name_2 } : undefined,
-        };
+  //       // Step 4: Create the bet FIRST
+  //       const betData: any = {
+  //         userId,
+  //         matchId: String(match_id),
+  //         amount: normalizedBetValue,
+  //         odds: normalizedBetRate,
+  //         selectionId: normalizedSelectionId,
+  //         betType: bet_type,
+  //         betName: bet_name,
+  //         marketName: market_name,
+  //         marketType: market_type,
+  //         betValue: normalizedBetValue,
+  //         betRate: normalizedBetRate,
+  //         winAmount: normalizedWinAmount,
+  //         lossAmount: normalizedLossAmount,
+  //         gtype: 'fancy',
+  //         settlementId: settlement_id,
+  //         toReturn: to_return,
+  //         status: BetStatus.PENDING,
+  //         marketId,
+  //         ...(eventId && { eventId }),
+  //         metadata: runner_name_2 ? { runner_name_2 } : undefined,
+  //       };
 
-        if (selid) {
-          betData.selId = selid;
-        }
+  //       if (selid) {
+  //         betData.selId = selid;
+  //       }
 
-        const bet = await tx.bet.create({ data: betData });
+  //       const bet = await tx.bet.create({ data: betData });
 
-        // Step 5: Calculate total exposure AFTER bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (preserves Match Odds, Bookmaker, other Fancy liability)
-        // Fancy exposure calculation includes netting: BACK 100 + LAY 100 = 0 net exposure
-        const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
-        const exposureDelta = totalExposureAfter - totalExposureBefore;
+  //       // Step 5: Calculate total exposure AFTER bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (preserves Match Odds, Bookmaker, other Fancy liability)
+  //       // Fancy exposure calculation includes netting: BACK 100 + LAY 100 = 0 net exposure
+  //       const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
+  //       const exposureDelta = totalExposureAfter - totalExposureBefore;
 
-        // Step 6: Validate balance before updating wallet
-        if (exposureDelta > 0 && currentBalance < exposureDelta) {
-          throw new Error(
-            `Insufficient available balance. ` +
-            `Balance: ${currentBalance}, Required: ${exposureDelta}`,
-          );
-        }
+  //       // Step 6: Validate balance before updating wallet
+  //       if (exposureDelta > 0 && currentBalance < exposureDelta) {
+  //         throw new Error(
+  //           `Insufficient available balance. ` +
+  //           `Balance: ${currentBalance}, Required: ${exposureDelta}`,
+  //         );
+  //       }
 
-        // Step 7: Update wallet using exposure delta (CRITICAL INVARIANT)
-        // 🔐 TOTAL EXPOSURE DELTA MODEL:
-        // balance -= exposureDelta (if exposure increases) or += |exposureDelta| (if decreases)
-        // liability += exposureDelta (can be positive or negative due to netting)
-        // Wallet invariant: wallet.liability === calculateTotalExposure(userId)
-        // This ensures liability always matches calculated total exposure across all markets
-        // Fancy bets can have negative exposureDelta when netting reduces total exposure
+  //       // Step 7: Update wallet using exposure delta (CRITICAL INVARIANT)
+  //       // 🔐 TOTAL EXPOSURE DELTA MODEL:
+  //       // balance -= exposureDelta (if exposure increases) or += |exposureDelta| (if decreases)
+  //       // liability += exposureDelta (can be positive or negative due to netting)
+  //       // Wallet invariant: wallet.liability === calculateTotalExposure(userId)
+  //       // This ensures liability always matches calculated total exposure across all markets
+  //       // Fancy bets can have negative exposureDelta when netting reduces total exposure
         
-        await tx.wallet.update({
-          where: { userId },
-          data: {
-            balance:
-              exposureDelta > 0
-                ? currentBalance - exposureDelta
-                : currentBalance + Math.abs(exposureDelta),
-            liability: currentLiability + exposureDelta,
-          },
-        });
+  //       await tx.wallet.update({
+  //         where: { userId },
+  //         data: {
+  //           balance:
+  //             exposureDelta > 0
+  //               ? currentBalance - exposureDelta
+  //               : currentBalance + Math.abs(exposureDelta),
+  //           liability: currentLiability + exposureDelta,
+  //         },
+  //       });
 
-        // Step 8: Create transaction log using exposureDelta
-        await tx.transaction.create({
-          data: {
-            walletId: currentWallet.id,
-            amount: Math.abs(exposureDelta),
-            type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
-            description: `Fancy bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
-          },
-        });
+  //       // Step 8: Create transaction log using exposureDelta
+  //       await tx.transaction.create({
+  //         data: {
+  //           walletId: currentWallet.id,
+  //           amount: Math.abs(exposureDelta),
+  //           type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
+  //           description: `Fancy bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
+  //         },
+  //       });
 
-        debug.fancy_exposure_delta = exposureDelta;
-        debug.fancy_total_exposure_before = totalExposureBefore;
-        debug.fancy_total_exposure_after = totalExposureAfter;
-        debug.fancy_old_balance = currentBalance;
-        debug.fancy_new_balance = exposureDelta > 0
-          ? currentBalance - exposureDelta
-          : currentBalance + Math.abs(exposureDelta);
-        debug.fancy_old_liability = currentLiability;
-        debug.fancy_new_liability = currentLiability + exposureDelta;
+  //       debug.fancy_exposure_delta = exposureDelta;
+  //       debug.fancy_total_exposure_before = totalExposureBefore;
+  //       debug.fancy_total_exposure_after = totalExposureAfter;
+  //       debug.fancy_old_balance = currentBalance;
+  //       debug.fancy_new_balance = exposureDelta > 0
+  //         ? currentBalance - exposureDelta
+  //         : currentBalance + Math.abs(exposureDelta);
+  //       debug.fancy_old_liability = currentLiability;
+  //       debug.fancy_new_liability = currentLiability + exposureDelta;
 
-        return { betId: bet.id };
-      },
-      {
-        maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
-        timeout: 30000, // Increased from 20000 to prevent transaction timeouts
-      },
-    );
-  }
+  //       return { betId: bet.id };
+  //     },
+  //     {
+  //       maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
+  //       timeout: 30000, // Increased from 20000 to prevent transaction timeouts
+  //     },
+  //   );
+  // }
 
   /**
    * @deprecated Use placeBet() instead - All bet placement is now centralized
    */
-  private async placeBookmakerBet(
-    input: PlaceBetDto,
-    normalizedBetValue: number,
-    normalizedBetRate: number,
-    normalizedSelectionId: number,
-    normalizedWinAmount: number,
-    normalizedLossAmount: number,
-    userId: string,
-    marketId: string,
-    debug: Record<string, unknown>,
-  ) {
-    const {
-      bet_type,
-      bet_name,
-      match_id,
-      market_name,
-      market_type,
-      eventId,
-      runner_name_2,
-      selection_id,
-    } = input;
+  // private async placeBookmakerBet(
+  //   input: PlaceBetDto,
+  //   normalizedBetValue: number,
+  //   normalizedBetRate: number,
+  //   normalizedSelectionId: number,
+  //   normalizedWinAmount: number,
+  //   normalizedLossAmount: number,
+  //   userId: string,
+  //   marketId: string,
+  //   debug: Record<string, unknown>,
+  // ) {
+  //   const {
+  //     bet_type,
+  //     bet_name,
+  //     match_id,
+  //     market_name,
+  //     market_type,
+  //     eventId,
+  //     runner_name_2,
+  //     selection_id,
+  //   } = input;
 
-    const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    const settlement_id = `${match_id}_${selection_id}`;
-    const to_return = normalizedWinAmount + normalizedLossAmount;
+  //   const selid = Math.floor(Math.random() * 90000000) + 10000000;
+  //   const settlement_id = `${match_id}_${selection_id}`;
+  //   const to_return = normalizedWinAmount + normalizedLossAmount;
 
-    return await this.prisma.$transaction(
-      async (tx) => {
-        // Step 1: Ensure match exists
-        await tx.match.upsert({
-          where: { id: String(match_id) },
-          update: {
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-          create: {
-            id: String(match_id),
-            homeTeam: bet_name ?? 'Unknown',
-            awayTeam: market_name ?? 'Unknown',
-            startTime: new Date(),
-            status: MatchStatus.LIVE,
-            ...(eventId && { eventId }),
-            ...(marketId && { marketId }),
-          },
-        });
+  //   return await this.prisma.$transaction(
+  //     async (tx) => {
+  //       // Step 1: Ensure match exists
+  //       await tx.match.upsert({
+  //         where: { id: String(match_id) },
+  //         update: {
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //         create: {
+  //           id: String(match_id),
+  //           homeTeam: bet_name ?? 'Unknown',
+  //           awayTeam: market_name ?? 'Unknown',
+  //           startTime: new Date(),
+  //           status: MatchStatus.LIVE,
+  //           ...(eventId && { eventId }),
+  //           ...(marketId && { marketId }),
+  //         },
+  //       });
 
-        // Step 2: Get current wallet state
-        const currentWallet = await tx.wallet.upsert({
-          where: { userId },
-          update: {},
-          create: {
-            userId,
-            balance: 0,
-            liability: 0,
-          },
-        });
+  //       // Step 2: Get current wallet state
+  //       const currentWallet = await tx.wallet.upsert({
+  //         where: { userId },
+  //         update: {},
+  //         create: {
+  //           userId,
+  //           balance: 0,
+  //           liability: 0,
+  //         },
+  //       });
 
-        const currentBalance = Number(currentWallet.balance) || 0;
-        const currentLiability = Number(currentWallet.liability) || 0;
+  //       const currentBalance = Number(currentWallet.balance) || 0;
+  //       const currentLiability = Number(currentWallet.liability) || 0;
 
-        // Step 3: Calculate total exposure BEFORE bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
-        const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
+  //       // Step 3: Calculate total exposure BEFORE bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (not direct stake/liability updates)
+  //       const totalExposureBefore = await this.calculateTotalExposure(tx, userId);
 
-        // Step 4: Create the bet FIRST
-        const betData: any = {
-          userId,
-          matchId: String(match_id),
-          amount: normalizedBetValue,
-          odds: normalizedBetRate,
-          selectionId: normalizedSelectionId,
-          betType: bet_type,
-          betName: bet_name,
-          marketName: market_name,
-          marketType: market_type,
-          betValue: normalizedBetValue,
-          betRate: normalizedBetRate,
-          winAmount: normalizedWinAmount,
-          lossAmount: normalizedLossAmount,
-          gtype: 'bookmaker',
-          settlementId: settlement_id,
-          toReturn: to_return,
-          status: BetStatus.PENDING,
-          marketId,
-          ...(eventId && { eventId }),
-          metadata: runner_name_2 ? { runner_name_2 } : undefined,
-        };
+  //       // Step 4: Create the bet FIRST
+  //       const betData: any = {
+  //         userId,
+  //         matchId: String(match_id),
+  //         amount: normalizedBetValue,
+  //         odds: normalizedBetRate,
+  //         selectionId: normalizedSelectionId,
+  //         betType: bet_type,
+  //         betName: bet_name,
+  //         marketName: market_name,
+  //         marketType: market_type,
+  //         betValue: normalizedBetValue,
+  //         betRate: normalizedBetRate,
+  //         winAmount: normalizedWinAmount,
+  //         lossAmount: normalizedLossAmount,
+  //         gtype: 'bookmaker',
+  //         settlementId: settlement_id,
+  //         toReturn: to_return,
+  //         status: BetStatus.PENDING,
+  //         marketId,
+  //         ...(eventId && { eventId }),
+  //         metadata: runner_name_2 ? { runner_name_2 } : undefined,
+  //       };
 
-        if (selid) {
-          betData.selId = selid;
-        }
+  //       if (selid) {
+  //         betData.selId = selid;
+  //       }
 
-        const bet = await tx.bet.create({ data: betData });
+  //       const bet = await tx.bet.create({ data: betData });
 
-        // Step 5: Calculate total exposure AFTER bet (across all markets)
-        // ✅ CRITICAL: Use total exposure delta model (preserves Match Odds, Fancy, other Bookmaker bets)
-        const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
-        const exposureDelta = totalExposureAfter - totalExposureBefore;
+  //       // Step 5: Calculate total exposure AFTER bet (across all markets)
+  //       // ✅ CRITICAL: Use total exposure delta model (preserves Match Odds, Fancy, other Bookmaker bets)
+  //       const totalExposureAfter = await this.calculateTotalExposure(tx, userId);
+  //       const exposureDelta = totalExposureAfter - totalExposureBefore;
 
-        // Deduct only if exposure increases
-        if (exposureDelta > 0 && currentBalance < exposureDelta) {
-          throw new Error(
-            `Insufficient available balance. ` +
-            `Balance: ${currentBalance}, Required: ${exposureDelta}`,
-          );
-        }
+  //       // Deduct only if exposure increases
+  //       if (exposureDelta > 0 && currentBalance < exposureDelta) {
+  //         throw new Error(
+  //           `Insufficient available balance. ` +
+  //           `Balance: ${currentBalance}, Required: ${exposureDelta}`,
+  //         );
+  //       }
 
-        await tx.wallet.update({
-          where: { userId },
-          data: {
-            balance:
-              exposureDelta > 0
-                ? currentBalance - exposureDelta
-                : currentBalance + Math.abs(exposureDelta),
-            liability: currentLiability + exposureDelta,
-          },
-        });
+  //       await tx.wallet.update({
+  //         where: { userId },
+  //         data: {
+  //           balance:
+  //             exposureDelta > 0
+  //               ? currentBalance - exposureDelta
+  //               : currentBalance + Math.abs(exposureDelta),
+  //           liability: currentLiability + exposureDelta,
+  //         },
+  //       });
 
-        // Step 6: Create transaction log using exposureDelta
-        await tx.transaction.create({
-          data: {
-            walletId: currentWallet.id,
-            amount: Math.abs(exposureDelta),
-            type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
-            description: `Bookmaker bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
-          },
-        });
+  //       // Step 6: Create transaction log using exposureDelta
+  //       await tx.transaction.create({
+  //         data: {
+  //           walletId: currentWallet.id,
+  //           amount: Math.abs(exposureDelta),
+  //           type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
+  //           description: `Bookmaker bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Change: ${exposureDelta}`,
+  //         },
+  //       });
 
-        debug.bookmaker_exposure_delta = exposureDelta;
-        debug.bookmaker_total_exposure_before = totalExposureBefore;
-        debug.bookmaker_total_exposure_after = totalExposureAfter;
-        debug.bookmaker_old_balance = currentBalance;
-        debug.bookmaker_new_balance = exposureDelta > 0
-          ? currentBalance - exposureDelta
-          : currentBalance + Math.abs(exposureDelta);
-        debug.bookmaker_old_liability = currentLiability;
-        debug.bookmaker_new_liability = currentLiability + exposureDelta;
+  //       debug.bookmaker_exposure_delta = exposureDelta;
+  //       debug.bookmaker_total_exposure_before = totalExposureBefore;
+  //       debug.bookmaker_total_exposure_after = totalExposureAfter;
+  //       debug.bookmaker_old_balance = currentBalance;
+  //       debug.bookmaker_new_balance = exposureDelta > 0
+  //         ? currentBalance - exposureDelta
+  //         : currentBalance + Math.abs(exposureDelta);
+  //       debug.bookmaker_old_liability = currentLiability;
+  //       debug.bookmaker_new_liability = currentLiability + exposureDelta;
 
-        debug.bookmaker_stake = normalizedBetValue;
-        debug.bookmaker_odds = normalizedBetRate;
-        debug.bookmaker_bet_type = bet_type;
-        debug.bookmaker_exposure_delta = exposureDelta;
+  //       debug.bookmaker_stake = normalizedBetValue;
+  //       debug.bookmaker_odds = normalizedBetRate;
+  //       debug.bookmaker_bet_type = bet_type;
+  //       debug.bookmaker_exposure_delta = exposureDelta;
 
-        return { betId: bet.id };
-      },
-      {
-        maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
-        timeout: 30000, // Increased from 20000 to prevent transaction timeouts
-      },
-    );
-  }
+  //       return { betId: bet.id };
+  //     },
+  //     {
+  //       maxWait: 15000, // Increased from 10000 to handle complex exposure calculations
+  //       timeout: 30000, // Increased from 20000 to prevent transaction timeouts
+  //     },
+  //   );
+  // }
 
   // ---------------------------------- MAIN LOGIC (CENTRALIZED MASTER FUNCTION) ---------------------------------- //
+
+  /**
+   * ✅ VALIDATE RATE AVAILABILITY
+   * Checks if the requested rate/odds is currently available in the market
+   * 
+   * @param eventId - Event ID
+   * @param marketId - Market ID
+   * @param marketType - Market type: 'matchodds' | 'fancy' | 'bookmaker'
+   * @param requestedRate - The rate/odds being requested
+   * @param selectionId - Selection ID (for match odds and fancy)
+   * @param betType - Bet type: 'BACK' | 'LAY' (to match otype)
+   * @throws HttpException if rate is not available
+   */
+  private async validateRateAvailability(
+    eventId: string,
+    marketId: string,
+    marketType: string,
+    requestedRate: number,
+    selectionId: number,
+    betType?: string,
+  ): Promise<void> {
+    try {
+      // Both match odds and fancy are in getBookmakerFancy response
+      const marketData = await this.cricketIdService.getBookmakerFancy(eventId);
+      
+      if (!marketData?.data || !Array.isArray(marketData.data)) {
+        throw new HttpException(
+          {
+            success: false,
+            error: 'Rate not matched',
+            code: 'RATE_NOT_MATCHED',
+          },
+          400,
+        );
+      }
+
+      // Determine expected market name and bet type
+      const expectedMname = marketType === 'matchodds' ? 'MATCH_ODDS' : null;
+      const expectedOtype = betType?.toUpperCase() === 'LAY' ? 'lay' : 'back';
+      
+      let rateFound = false;
+      let marketFound = false;
+
+      // Search through all markets
+      for (const market of marketData.data) {
+        const mname = (market.mname || '').toUpperCase();
+        
+        // For match odds: only check MATCH_ODDS market
+        if (marketType === 'matchodds' && mname !== 'MATCH_ODDS') {
+          continue;
+        }
+        
+        // For fancy: skip MATCH_ODDS, Bookmaker, TIED_MATCH (only check Normal fancy)
+        if (marketType === 'fancy') {
+          if (mname === 'MATCH_ODDS' || mname === 'BOOKMAKER' || mname === 'TIED_MATCH') {
+            continue;
+          }
+        }
+
+        marketFound = true;
+
+        // Check sections array
+        if (market.section && Array.isArray(market.section)) {
+          for (const section of market.section) {
+            const sectionSid = Number(section.sid || 0);
+            
+            // For match odds and fancy: match by selectionId (sid)
+            if (selectionId > 0 && sectionSid !== selectionId) {
+              continue;
+            }
+
+            // Check odds array in this section
+            if (section.odds && Array.isArray(section.odds)) {
+              for (const odd of section.odds) {
+                const availableRate = Number(odd.odds || 0);
+                const oddOtype = (odd.otype || '').toLowerCase();
+                
+                // Check if rate matches and otype matches bet type
+                if (availableRate > 0 && Math.abs(availableRate - requestedRate) < 0.01) {
+                  // If betType is specified, also check otype matches
+                  if (betType) {
+                    if (oddOtype === expectedOtype) {
+                      rateFound = true;
+                      break;
+                    }
+                  } else {
+                    // If betType not specified, accept any otype
+                    rateFound = true;
+                    break;
+                  }
+                }
+              }
+            }
+            
+            if (rateFound) break;
+          }
+        }
+        
+        if (rateFound) break;
+      }
+
+      if (!marketFound) {
+        throw new HttpException(
+          {
+            success: false,
+            error: `Rate not matched `,
+            code: 'RATE_NOT_MATCHED',
+          },
+          400,
+        );
+      }
+
+      if (!rateFound) {
+        throw new HttpException(
+          {
+            success: false,
+            error: `Rate not matched `,
+            code: 'RATE_NOT_MATCHED',
+          },
+          400,
+        );
+      }
+      // Note: Bookmaker markets validation can be added similarly if needed
+    } catch (error) {
+      // If it's already an HttpException, re-throw it
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      
+      // Log and wrap other errors
+      this.logger.error(`Error validating rate availability:`, error);
+      throw new HttpException(
+        {
+          success: false,
+          error: 'Rate not matched ',
+          code: 'RATE_VALIDATION_ERROR',
+        },
+        400,
+      );
+    }
+  }
 
   /**
    * ✅ MASTER BET PLACEMENT FUNCTION (SINGLE SOURCE OF TRUTH)
@@ -1366,6 +1688,18 @@ export class BetsService {
 
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
+    // 3. VALIDATE RATE AVAILABILITY (before placing bet)
+    if (eventId && normalizedBetRate > 0) {
+      await this.validateRateAvailability(
+        eventId,
+        marketId,
+        actualMarketType,
+        normalizedBetRate,
+        normalizedSelectionId,
+        bet_type,
+      );
+    }
+
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
       const transactionResult = await this.prisma.$transaction(
@@ -1511,7 +1845,12 @@ export class BetsService {
           // 🔐 STEP 2.5: FANCY REVERSAL VALIDATION (SCORE-AWARE)
           // Validate if reverse (negative exposureDelta) is allowed for Fancy same-line bets
           // Reverse allowed ONLY when one outcome is already impossible based on current score
+          // NOTE: This logic handles same-line reverse (YES @ X + NO @ X) - kept unchanged per requirements
           if (actualMarketType === 'fancy' && exposureDelta < 0 && eventId && normalizedSelectionId) {
+            // First check: Is this a double fancy? (YES @ X + NO @ X+1)
+            // Double fancy detection is already done above, so if we reach here and exposureDelta < 0,
+            // it means double fancy was NOT detected, so we need to check for same-line reverse
+            
             // Check if this is a same-line reverse scenario
             // Find existing bets on same selection and same betRate
             const existingSameLineBets = allPendingBets.filter((bet: any) => {
@@ -1568,90 +1907,18 @@ export class BetsService {
               };
             } else {
               // Not a reverse scenario (no same-line bets OR different line OR same betType)
-              // Treat as fresh bet: force positive exposureDelta
+              // AND not a double fancy (already checked above)
+              // Block negative exposureDelta - no refund allowed
               const originalExposureDelta = exposureDelta;
-              // Fresh bet: Fancy liability = stake
-              exposureDelta = normalizedBetValue;
+              exposureDelta = 0;
               
               debug.fancy_reverse_validation = {
                 attempted_reverse: false,
                 reverse_allowed: false,
-                reason: 'No same-line opposite bet - treated as fresh bet',
+                reason: 'No same-line opposite bet and not double fancy - refund blocked',
                 line: normalizedBetRate,
                 originalExposureDelta,
                 exposureDelta_adjusted: exposureDelta,
-              };
-            }
-          }
-
-          // 🔐 STEP 2.6: FANCY LIABILITY UNLOCKING (LIABILITY REVERSE)
-          // Unlock YES liability when NO bet exists at higher rate (state-based unlocking)
-          // This is NOT same-line reverse, NOT refund, ONLY liability reduction
-          if (actualMarketType === 'fancy' && eventId && normalizedSelectionId) {
-            // Get all pending fancy bets for same eventId + selectionId (including new bet in memory)
-            const allFancyBetsForSelection = allPendingBetsWithNewBet.filter((bet: any) => {
-              const betGtype = (bet.gtype || '').toLowerCase();
-              return (
-                betGtype === 'fancy' &&
-                bet.eventId === eventId &&
-                bet.selectionId === normalizedSelectionId
-              );
-            });
-
-            // Build YES and NO bets grouped by rate
-            const yesBetsByRate = new Map<number, number>(); // rate -> total stake
-            const noBetsByRate = new Map<number, number>();  // rate -> total stake
-
-            for (const bet of allFancyBetsForSelection) {
-              const stake = bet.betValue ?? bet.amount ?? 0;
-              const betTypeUpper = (bet.betType || '').toUpperCase();
-              const rate = bet.betRate ?? bet.odds ?? 0;
-
-              if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
-                const currentStake = yesBetsByRate.get(rate) || 0;
-                yesBetsByRate.set(rate, currentStake + stake);
-              } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
-                const currentStake = noBetsByRate.get(rate) || 0;
-                noBetsByRate.set(rate, currentStake + stake);
-              }
-            }
-
-            // Check for liability unlocking: YES @ lowerRate with NO @ higherRate
-            let totalUnlockedAmount = 0;
-            let unlockedPairs: Array<{ yesRate: number; noRate: number; unlockedAmount: number }> = [];
-
-            for (const [yesRate, yesStake] of yesBetsByRate) {
-              // Find NO bets at higher rates
-              for (const [noRate, noStake] of noBetsByRate) {
-                if (noRate > yesRate) {
-                  // YES liability is unlocked (logically crossed by higher NO line)
-                  totalUnlockedAmount += yesStake;
-                  unlockedPairs.push({
-                    yesRate,
-                    noRate,
-                    unlockedAmount: yesStake,
-                  });
-                  // Break after first higher NO rate found (unlock once per YES bet)
-                  break;
-                }
-              }
-            }
-
-            // Apply liability unlock: reduce exposureDelta by unlocked amount
-            if (totalUnlockedAmount > 0) {
-              const originalExposureDelta = exposureDelta;
-              exposureDelta -= totalUnlockedAmount;
-
-              debug.fancy_liability_unlock = {
-                unlocked: true,
-                unlockedPairs,
-                totalUnlockedAmount,
-                originalExposureDelta,
-                adjustedExposureDelta: exposureDelta,
-              };
-            } else {
-              debug.fancy_liability_unlock = {
-                unlocked: false,
               };
             }
           }
@@ -1801,11 +2068,11 @@ export class BetsService {
           const bookmakerPosition = calculateBookmakerPosition(pendingBets as Bet[], marketId);
           if (bookmakerPosition) {
             // Convert to backward-compatible format
-            // Bookmaker position is net position per selection
-            for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+            // Bookmaker position now returns { profit, loss } per selection
+            for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
               positions[selectionId] = {
-                win: netPosition > 0 ? netPosition : 0,
-                lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+                win: position.profit,
+                lose: position.loss,
               };
             }
             this.logger.debug(
@@ -2042,10 +2309,11 @@ export class BetsService {
       // Bookmaker position
       const bookmakerPosition = calculateBookmakerPosition(pendingBets, bet.marketId);
       if (bookmakerPosition) {
-        for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+        // Bookmaker position now returns { profit, loss } per selection
+        for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
           authoritativePositions[selectionId] = {
-            win: netPosition > 0 ? netPosition : 0,
-            lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+            win: position.profit,
+            lose: position.loss,
           };
         }
       }
@@ -2105,10 +2373,11 @@ export class BetsService {
       // Bookmaker position (isolated)
       const bookmakerPosition = calculateBookmakerPosition(pendingBets, marketId);
       if (bookmakerPosition) {
-        for (const [selectionId, netPosition] of Object.entries(bookmakerPosition.positions)) {
+        // Bookmaker position now returns { profit, loss } per selection
+        for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
           authoritativePositions[selectionId] = {
-            win: netPosition > 0 ? netPosition : 0,
-            lose: netPosition < 0 ? Math.abs(netPosition) : 0,
+            win: position.profit,
+            lose: position.loss,
           };
         }
       }
