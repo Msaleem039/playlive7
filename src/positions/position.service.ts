@@ -145,10 +145,13 @@ export function calculateMatchOddsPosition(
   const positions: Record<string, { profit: number; loss: number }> = {};
 
   // ✅ Calculate P/L per outcome using pre-calculated winAmount/lossAmount
-  // For each outcome: sum all winAmount (if this outcome wins) and lossAmount (if this outcome loses)
+  // winAmount = profit if bet wins, lossAmount = liability if bet loses
+  // For each outcome: calculate BOTH scenarios:
+  // 1. If THIS outcome wins → profit
+  // 2. If THIS outcome loses → loss
   for (const outcomeSelection of selectionIds) {
-    let totalProfit = 0; // Sum of all winAmount when this selection wins
-    let totalLoss = 0;   // Sum of all lossAmount when this selection loses
+    let profitIfWins = 0; // Net profit if this selection wins
+    let lossIfLoses = 0;  // Net loss if this selection loses
 
     for (const bet of matchOddsBets) {
       // Skip bets with invalid selectionId
@@ -177,40 +180,36 @@ export function calculateMatchOddsPosition(
         
         if (odds > 0 && stake > 0) {
           if (betType === 'BACK') {
-            betWinAmount = (odds - 1) * stake;
-            betLossAmount = stake;
+            betWinAmount = (odds - 1) * stake; // profit
+            betLossAmount = stake; // liability
           } else if (betType === 'LAY') {
-            betWinAmount = stake;
-            betLossAmount = (odds - 1) * stake;
+            betWinAmount = stake; // profit
+            betLossAmount = (odds - 1) * stake; // liability
           }
         }
       }
 
       if (betSelection === outcomeSelection) {
-        // Bet is on this outcome
-        // If this outcome wins: we get winAmount (positive)
-        // If this outcome loses: we lose lossAmount (negative)
-        totalProfit += betWinAmount;
-        totalLoss -= betLossAmount; // Negative because we lose money
+        // Bet is on THIS outcome
+        // If THIS outcome wins: we get profit (winAmount)
+        profitIfWins += betWinAmount;
+        // If THIS outcome loses: we lose liability (lossAmount)
+        lossIfLoses += betLossAmount;
       } else {
-        // Bet is on another outcome
-        // If THIS outcome wins (bet outcome loses): we lose lossAmount (negative)
-        // If THIS outcome loses (bet outcome wins): we get winAmount (positive)
-        totalProfit -= betLossAmount;
-        totalLoss += betWinAmount;
+        // Bet is on ANOTHER outcome
+        // If THIS outcome wins (bet outcome loses): we lose liability of the bet
+        profitIfWins -= betLossAmount;
+        // If THIS outcome loses (bet outcome wins): we get profit of the bet
+        lossIfLoses -= betWinAmount;
       }
     }
 
-    // ✅ UI FIX: Collapse to net exposure for proper hedging display
-    // net = profit + loss (profit is positive, loss is negative, so net = profit - |loss|)
-    const net = totalProfit + totalLoss;
-    
-    // Return win/lose format for UI preview
-    // win = net > 0 ? net : 0 (if net positive, show as win)
-    // lose = net < 0 ? abs(net) : 0 (if net negative, show as loss)
+    // ✅ UI FIX: Return profit and loss separately
+    // profit: what we gain if this selection wins (can be negative if hedged)
+    // loss: what we lose if this selection loses (can be negative if hedged)
     positions[outcomeSelection] = {
-      profit: net > 0 ? net : 0,
-      loss: net < 0 ? Math.abs(net) : 0,
+      profit: profitIfWins > 0 ? profitIfWins : 0,
+      loss: lossIfLoses > 0 ? lossIfLoses : 0,
     };
   }
 
@@ -390,9 +389,13 @@ export function calculateBookmakerPosition(
   const positions: Record<string, { profit: number; loss: number }> = {};
 
   // ✅ Calculate P/L per outcome (same logic as Match Odds)
+  // winAmount = profit if bet wins, lossAmount = liability if bet loses
+  // For each outcome: calculate BOTH scenarios:
+  // 1. If THIS outcome wins → profit
+  // 2. If THIS outcome loses → loss
   for (const outcomeSelection of selectionIds) {
-    let totalProfit = 0; // Sum of all winAmount when this selection wins
-    let totalLoss = 0;   // Sum of all lossAmount when this selection loses
+    let profitIfWins = 0; // Net profit if this selection wins
+    let lossIfLoses = 0;  // Net loss if this selection loses
 
     for (const bet of bookmakerBets) {
       // Skip bets with invalid selectionId
@@ -421,37 +424,36 @@ export function calculateBookmakerPosition(
         
         if (odds > 0 && stake > 0) {
           if (betType === 'BACK') {
-            betWinAmount = (odds - 1) * stake;
-            betLossAmount = stake;
+            betWinAmount = (odds - 1) * stake; // profit
+            betLossAmount = stake; // liability
           } else if (betType === 'LAY') {
-            betWinAmount = stake;
-            betLossAmount = (odds - 1) * stake;
+            betWinAmount = stake; // profit
+            betLossAmount = (odds - 1) * stake; // liability
           }
         }
       }
 
       if (betSelection === outcomeSelection) {
-        // Bet is on this outcome
-        // If this outcome wins: we get winAmount (positive)
-        // If this outcome loses: we lose lossAmount (negative)
-        totalProfit += betWinAmount;
-        totalLoss -= betLossAmount; // Negative because we lose money
+        // Bet is on THIS outcome
+        // If THIS outcome wins: we get profit (winAmount)
+        profitIfWins += betWinAmount;
+        // If THIS outcome loses: we lose liability (lossAmount)
+        lossIfLoses += betLossAmount;
       } else {
-        // Bet is on another outcome
-        // If THIS outcome wins (bet outcome loses): we lose lossAmount (negative)
-        // If THIS outcome loses (bet outcome wins): we get winAmount (positive)
-        totalProfit -= betLossAmount;
-        totalLoss += betWinAmount;
+        // Bet is on ANOTHER outcome
+        // If THIS outcome wins (bet outcome loses): we lose liability of the bet
+        profitIfWins -= betLossAmount;
+        // If THIS outcome loses (bet outcome wins): we get profit of the bet
+        lossIfLoses -= betWinAmount;
       }
     }
 
-    // ✅ UI FIX: Collapse to net exposure for proper hedging display
-    const net = totalProfit + totalLoss;
-    
-    // Return win/lose format for UI preview
+    // ✅ UI FIX: Return profit and loss separately
+    // profit: what we gain if this selection wins (can be negative if hedged)
+    // loss: what we lose if this selection loses (can be negative if hedged)
     positions[outcomeSelection] = {
-      profit: net > 0 ? net : 0,
-      loss: net < 0 ? Math.abs(net) : 0,
+      profit: profitIfWins > 0 ? profitIfWins : 0,
+      loss: lossIfLoses > 0 ? lossIfLoses : 0,
     };
   }
 
