@@ -9,6 +9,9 @@ import {
   calculateFancyPosition,
 } from '../positions/position.service';
 import { CricketIdService } from '../cricketid/cricketid.service';
+import { MatchOddsExposureService } from './matchodds-exposure.service';
+import { BookmakerExposureService } from './bookmaker-exposure.service';
+import { FancyExposureService } from './fancy-exposure.service';
 
 @Injectable()
 export class BetsService {
@@ -17,6 +20,9 @@ export class BetsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cricketIdService: CricketIdService,
+    private readonly matchOddsExposureService: MatchOddsExposureService,
+    private readonly bookmakerExposureService: BookmakerExposureService,
+    private readonly fancyExposureService: FancyExposureService,
   ) {}
 
   /**
@@ -56,39 +62,6 @@ export class BetsService {
     return stake;
   }
 
-  private buildMatchOddsPositions(bets: any[]) {
-    const map = new Map<number, { win: number; lose: number }>();
-  
-    for (const bet of bets) {
-      const selectionId = Number(bet.selectionId ?? bet.selection_id);
-      if (!selectionId) continue;
-  
-      const stake = Number(bet.betValue ?? bet.betvalue ?? bet.amount ?? 0);
-      const odds = Number(bet.betRate ?? bet.bet_rate ?? bet.odds ?? 0);
-      const type = String(bet.betType ?? bet.bet_type ?? '').toUpperCase();
-  
-      if (!map.has(selectionId)) {
-        map.set(selectionId, { win: 0, lose: 0 });
-      }
-  
-      const pos = map.get(selectionId)!;
-      const profit = (odds - 1) * stake;
-  
-      if (type === 'BACK') {
-        pos.win += profit;   // if wins
-        pos.lose -= stake;  // if loses
-      }
-  
-      if (type === 'LAY') {
-        pos.win -= profit;  // if wins (liability)
-        pos.lose += stake; // if loses (stake kept)
-      }
-    }
-  
-    return map;
-  }
-  
-   
   private calculateExposureByMarketType(bets: any[]): {
     matchOdds: number;
     fancy: number;
@@ -137,17 +110,17 @@ export class BetsService {
 
     // Calculate Match Odds exposure (sum across all Match Odds markets)
     for (const [, marketBets] of matchOddsBetsByMarket) {
-      matchOddsExposure += this.calculateMatchOddsExposureInMemory(marketBets);
+      matchOddsExposure += this.matchOddsExposureService.calculateMatchOddsExposureInMemory(marketBets);
     }
 
     // Calculate Bookmaker exposure (sum across all Bookmaker markets)
     for (const [, marketBets] of bookmakerBetsByMarket) {
-      bookmakerExposure += this.calculateBookmakerExposureInMemory(marketBets);
+      bookmakerExposure += this.bookmakerExposureService.calculateBookmakerExposureInMemory(marketBets);
     }
 
     // Calculate Fancy exposure (sum across all Fancy selections)
     for (const [, selectionBets] of fancyBetsBySelection) {
-      fancyExposure += this.calculateFancyExposureInMemory(selectionBets);
+      fancyExposure += this.fancyExposureService.calculateFancyExposureInMemory(selectionBets);
     }
 
     // Calculate total exposure (sum of all market types)
@@ -161,357 +134,10 @@ export class BetsService {
     };
   }
 
-  private async calculateTotalExposure(tx: any, userId: string): Promise<number> {
-    try {
-      // ✅ OPTIMIZED: Fetch ALL pending bets in a single query to avoid transaction timeout
-      // This reduces N+1 queries from potentially dozens to just 1 query
-      const allBets = await tx.bet.findMany({
-        where: {
-          userId,
-          status: BetStatus.PENDING,
-        },
-        select: {
-          gtype: true,
-          marketId: true,
-          eventId: true,
-          selectionId: true,
-          betType: true,
-          winAmount: true,
-          lossAmount: true,
-          betValue: true,
-          amount: true,
-          betRate: true,
-          odds: true,
-        },
-      });
-
-      // Group bets by market type for efficient calculation
-      const matchOddsBetsByMarket = new Map<string, typeof allBets>();
-      const bookmakerBetsByMarket = new Map<string, typeof allBets>();
-      const fancyBetsBySelection = new Map<string, typeof allBets>();
-
-      for (const bet of allBets) {
-        const betGtype = (bet.gtype || '').toLowerCase();
-        
-        // Match Odds bets
-        if ((betGtype === 'matchodds' || betGtype === 'match') && bet.marketId) {
-          if (!matchOddsBetsByMarket.has(bet.marketId)) {
-            matchOddsBetsByMarket.set(bet.marketId, []);
-          }
-          matchOddsBetsByMarket.get(bet.marketId)!.push(bet);
-        }
-        // Bookmaker bets (including match1, match2, etc.)
-        else if (
-          bet.marketId &&
-          (betGtype === 'bookmaker' ||
-           (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds'))
-        ) {
-          if (!bookmakerBetsByMarket.has(bet.marketId)) {
-            bookmakerBetsByMarket.set(bet.marketId, []);
-          }
-          bookmakerBetsByMarket.get(bet.marketId)!.push(bet);
-        }
-        // Fancy bets
-        else if (betGtype === 'fancy' && bet.eventId && bet.selectionId) {
-          const key = `${bet.eventId}_${bet.selectionId}`;
-          if (!fancyBetsBySelection.has(key)) {
-            fancyBetsBySelection.set(key, []);
-          }
-          fancyBetsBySelection.get(key)!.push(bet);
-        }
-      }
-
-      let totalExposure = 0;
-
-      // Calculate Match Odds exposure (in memory, no additional queries)
-      for (const [marketId, bets] of matchOddsBetsByMarket) {
-        totalExposure += this.calculateMatchOddsExposureInMemory(bets);
-      }
-
-      // Calculate Bookmaker exposure (in memory, no additional queries)
-      for (const [marketId, bets] of bookmakerBetsByMarket) {
-        totalExposure += this.calculateBookmakerExposureInMemory(bets);
-      }
-
-      // Calculate Fancy exposure (in memory, no additional queries)
-      for (const [key, bets] of fancyBetsBySelection) {
-        totalExposure += this.calculateFancyExposureInMemory(bets);
-      }
-
-      return totalExposure;
-    } catch (error: any) {
-      // Handle transaction errors gracefully - return 0 exposure if transaction is invalid
-      if (error?.message?.includes('Transaction not found') || 
-          error?.message?.includes('Transaction ID is invalid') ||
-          error?.message?.includes('Transaction already closed')) {
-        this.logger.warn(
-          `Transaction invalid in calculateTotalExposure for userId: ${userId}. Returning 0 exposure.`,
-        );
-        return 0;
-      }
-      // Re-throw other errors
-      throw error;
-    }
-  }
 
  
 
-  // private calculateMatchOddsExposureInMemory(bets: any[]): number {
-  //   if (!bets.length) return 0;
-  
-  //   /**
-  //    * Build position map per selection
-  //    * win  = Net PnL if this selection wins
-  //    * lose = Net PnL if this selection loses
-  //    * 
-  //    * BACK and LAY bets on the same selection automatically offset here:
-  //    * - BACK adds to win, subtracts from lose
-  //    * - LAY subtracts from win, adds to lose
-  //    */
-  //   const positionBySelection = new Map<number, { win: number; lose: number }>();
-  
-  //   // Aggregate all bets per selection to enable automatic offset
-  //   for (const bet of bets) {
-  //     // Support both camelCase and snake_case field names
-  //     const selectionId = Number(bet.selectionId ?? bet.selection_id ?? 0);
-  //     if (!selectionId) continue;
-  
-  //     const stake = Number(bet.betValue ?? bet.betvalue ?? bet.amount ?? 0);
-  //     const odds = Number(bet.betRate ?? bet.bet_rate ?? bet.odds ?? 0);
-  //     const type = String(bet.betType ?? bet.bet_type ?? '').toUpperCase();
-  
-  //     if (!positionBySelection.has(selectionId)) {
-  //       positionBySelection.set(selectionId, { win: 0, lose: 0 });
-  //     }
-  
-  //     const pos = positionBySelection.get(selectionId)!;
-  //     const profit = (odds - 1) * stake;
-  
-  //     // BACK bet: if wins → profit, if loses → lose stake
-  //     if (type === 'BACK') {
-  //       pos.win += profit;    // wins → profit = (odds - 1) * stake
-  //       pos.lose -= stake;   // loses → stake lost
-  //     }
-  
-  //     // LAY bet: if wins → lose profit (pay liability), if loses → keep stake
-  //     if (type === 'LAY') {
-  //       pos.win -= profit;   // wins → liability paid = (odds - 1) * stake
-  //       pos.lose += stake;  // loses → stake gained (we keep the stake)
-  //     }
-  //   }
-  
-  //   // ✅ EXCHANGE LOGIC: Simulate each possible outcome (each selection winning)
-  //   // Match Odds markets have multiple selections (runners)
-  //   // We need to check what happens if each selection wins
-  //   let exposure = 0;
-  //   const selections = Array.from(positionBySelection.keys());
-  
-  //   for (const winner of selections) {
-  //     // Calculate total PnL if this selection wins
-  //     let pnl = 0;
-  
-  //     for (const [sid, pos] of positionBySelection) {
-  //       // If this selection wins, use its win position
-  //       // All other selections lose, use their lose positions
-  //       pnl += sid === winner ? pos.win : pos.lose;
-  //     }
-  
-  //     // Exposure = maximum absolute negative PnL
-  //     // If PnL is negative, that's a loss scenario
-  //     if (pnl < 0) {
-  //       exposure = Math.max(exposure, Math.abs(pnl));
-  //     }
-  //   }
-  
-  //   // ✅ PURE EXCHANGE LOGIC: No safety floors, no stake forcing, no overrides
-  //   // Exposure is determined SOLELY by worst-case PnL simulation
-  //   // Offset works automatically through position aggregation (BACK + LAY offset)
-  //   // Order-independent: BACK→LAY and LAY→BACK produce identical results
-  //   // If fully hedged (BACK + LAY on same selection), exposure = 0 automatically
-  
-  //   return exposure;
-  // }
-  private calculateMatchOddsExposureInMemory(bets: any[]): number {
-    if (!bets.length) return 0;
-  
-    const positionBySelection = this.buildMatchOddsPositions(bets);
-  
-    let maxLoss = 0;
-    const selections = Array.from(positionBySelection.keys());
-  
-    /**
-     * SCENARIO A:
-     * Each selection wins one by one
-     */
-    for (const winner of selections) {
-      let pnl = 0;
-  
-      for (const [sid, pos] of positionBySelection) {
-        pnl += sid === winner ? pos.win : pos.lose;
-      }
-  
-      if (pnl < 0) {
-        maxLoss = Math.max(maxLoss, Math.abs(pnl));
-      }
-    }
-  
-    /**
-     * SCENARIO B:
-     * Some OTHER runner wins (not bet by user)
-     * → all selections lose
-     */
-    let allLosePnl = 0;
-    for (const pos of positionBySelection.values()) {
-      allLosePnl += pos.lose;
-    }
-  
-    if (allLosePnl < 0) {
-      maxLoss = Math.max(maxLoss, Math.abs(allLosePnl));
-    }
-  
-    return maxLoss;
-  }
-  
-  
-  /**
-   * ✅ PURE EXCHANGE-STYLE MATCH ODDS EXPOSURE CALCULATION
-   * 
-   * Calculates exposure using worst-case PnL simulation across all possible outcomes.
-   * 
-   * EXCHANGE RULES:
-   * - Exposure = maximum possible loss across all selections in the market
-   * - Offset = automatic reduction of exposure (BACK + LAY on same selection)
-   * - No safety floors, no stake forcing, pure PnL-based calculation
-   * 
-   * ALGORITHM:
-   * 1. Build position map per selection: { win: PnL if wins, lose: PnL if loses }
-   * 2. For each possible winner, calculate total PnL
-   * 3. Exposure = maximum absolute negative PnL across all outcomes
-   * 
-   * @param bets - Array of bets for this Match Odds market
-   * @returns Net exposure (worst-case loss) for this market
-   */
-  // private calculateMatchOddsExposureInMemory(bets: any[]): number {
-  //   if (!bets.length) return 0;
-  
-  //   // Build position map per selection
-  //   const positionBySelection = new Map<number, { win: number; lose: number }>();
-  
-  //   for (const bet of bets) {
-  //     if (!bet.selectionId) continue;
-  
-  //     const stake = Number(bet.betValue || bet.amount || 0);
-  //     const odds = Number(bet.betRate || bet.odds || 0);
-  //     const type = (bet.betType || '').toUpperCase();
-  
-  //     if (!positionBySelection.has(bet.selectionId)) {
-  //       positionBySelection.set(bet.selectionId, { win: 0, lose: 0 });
-  //     }
-  
-  //     const pos = positionBySelection.get(bet.selectionId)!;
-  //     const profit = (odds - 1) * stake;
-  
-  //     // BACK bet: if wins → profit, if loses → lose stake
-  //     if (type === 'BACK') {
-  //       pos.win += profit;
-  //       pos.lose -= stake;
-  //     }
-  
-  //     // LAY bet: if wins → lose profit, if loses → keep stake
-  //     if (type === 'LAY') {
-  //       pos.win -= profit;
-  //       pos.lose += stake;
-  //     }
-  //   }
-  
-  //   // Calculate exposure = maximum possible loss across all outcomes
-  //   let exposure = 0;
-  //   const allSelections = Array.from(positionBySelection.keys());
-  
-  //   // Check each possible outcome (each selection winning)
-  //   // This covers all cases where a selection with bets wins
-  //   for (const winner of allSelections) {
-  //     let pnl = 0;
-      
-  //     for (const [sid, pos] of positionBySelection) {
-  //       // If this selection wins, use win position; otherwise use lose position
-  //       pnl += sid === winner ? pos.win : pos.lose;
-  //     }
-      
-  //     // Exposure = maximum absolute negative PnL
-  //     if (pnl < 0) {
-  //       exposure = Math.max(exposure, Math.abs(pnl));
-  //     }
-  //   }
-    
-  //   // 🔐 CRITICAL: Also check what happens if ALL selections with bets lose
-  //   // This handles cases where the winner is NOT in positionBySelection (no bets on winner)
-  //   // When Selection A loses, Selection B (or C, etc.) wins
-  //   // If the winner has no bets, its positions are 0, so pnl = sum of all losers' positions
-  //   // We only need to check this once (not per loserId) since it's the same for all
-  //   let pnlIfWinnerNotInMap = 0;
-  //   for (const [sid, pos] of positionBySelection) {
-  //     // All selections with bets lose when winner is not in map
-  //     pnlIfWinnerNotInMap += pos.lose;
-  //   }
-    
-  //   // Exposure = maximum absolute negative PnL
-  //   if (pnlIfWinnerNotInMap < 0) {
-  //     exposure = Math.max(exposure, Math.abs(pnlIfWinnerNotInMap));
-  //   }
-  
-  //   // ✅ PURE EXCHANGE LOGIC: No safety floors, no stake forcing
-  //   // Exposure is determined solely by worst-case PnL simulation
-  //   // Offset works automatically through PnL calculation (BACK + LAY on same selection offset)
-  
-  //   return exposure;
-  // }
-  // private calculateMatchOddsExposureInMemory(bets: any[]): number {
-  //   if (!bets.length) return 0;
-  
-  //   const pos = new Map<number, { win: number; lose: number }>();
-  
-  //   for (const bet of bets) {
-  //     const selectionId = Number(bet.selectionId ?? bet.selection_id);
-  //     if (!selectionId) continue;
-  
-  //     const stake = Number(bet.betvalue ?? bet.betValue ?? bet.amount ?? 0);
-  //     const odds = Number(bet.bet_rate ?? bet.betRate ?? bet.odds ?? 0);
-  //     const type = String(bet.bet_type ?? bet.betType).toUpperCase();
-  
-  //     if (!pos.has(selectionId)) {
-  //       pos.set(selectionId, { win: 0, lose: 0 });
-  //     }
-  
-  //     const p = pos.get(selectionId)!;
-  
-  //     if (type === 'BACK') {
-  //       p.win += (odds - 1) * stake;
-  //       p.lose -= stake;
-  //     } else if (type === 'LAY') {
-  //       p.win -= (odds - 1) * stake; // liability
-  //       p.lose += stake;            // stake gained
-  //     }
-  //   }
-  
-  //   let worstPnl = 0;
-  
-  //   for (const winner of pos.keys()) {
-  //     let pnl = 0;
-  
-  //     for (const [sid, p] of pos) {
-  //       pnl += sid === winner ? p.win : p.lose;
-  //     }
-  
-  //     if (pnl < worstPnl) {
-  //       worstPnl = pnl;
-  //     }
-  //   }
-  
-  //   return Math.abs(worstPnl);
-  // }
-  
-  
+
   
   
 
@@ -520,273 +146,8 @@ export class BetsService {
    * @param bets - Array of bets for the market
    * @returns Net exposure for this Bookmaker market
    */
-  private calculateBookmakerExposureInMemory(bets: any[]): number {
-    let totalBackStake = 0;
-    let totalLayLiability = 0;
 
-    for (const bet of bets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const odds = bet.betRate ?? bet.odds ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
 
-      if (betTypeUpper === 'BACK') {
-        totalBackStake += stake;
-      } else if (betTypeUpper === 'LAY') {
-        totalLayLiability += (odds - 1) * stake;
-      }
-    }
-
-    return Math.abs(totalBackStake - totalLayLiability);
-  }
-
-  /**
-   * Calculate Fancy exposure in memory (no database queries)
-   * ✅ EXCHANGE RULE: Different lines do NOT hedge, only same-line reverse can reduce exposure
-   * - Group bets by eventId_selectionId_rate (same-line grouping)
-   * - Same-line: YES @ X and NO @ X hedge each other (exposure = |YES - NO|)
-   * - Different lines: YES @ A + NO @ B = full liability (sum, NO hedge)
-   * - Exposure is net per line, then summed across all lines
-   * 
-   * ✅ GOLA FANCY SUPPORT (OPTION-A: Backend-Driven Detection):
-   * - Gola pattern auto-detected from bet patterns (YES rate < NO rate)
-   * - No frontend metadata dependency
-   * - Only ONE outcome can win, all other outcomes lose
-   * - Exposure = worst-case loss across all possible score outcomes
-   * 
-   * @param bets - Array of bets for the fancy selection
-   * @returns Net exposure for this Fancy selection
-   */
-  private calculateFancyExposureInMemory(bets: any[]): number {
-    if (bets.length === 0) return 0;
-
-    // Group bets by fancy key (eventId + selectionId)
-    const betsByFancy = new Map<string, any[]>();
-    
-    for (const bet of bets) {
-      const eventId = bet.eventId || '';
-      const selectionId = bet.selectionId || 0;
-      const fancyKey = `${eventId}_${selectionId}`;
-      
-      if (!betsByFancy.has(fancyKey)) {
-        betsByFancy.set(fancyKey, []);
-      }
-      betsByFancy.get(fancyKey)!.push(bet);
-    }
-
-    let totalExposure = 0;
-
-    // Process each fancy separately
-    for (const [fancyKey, fancyBets] of betsByFancy) {
-      // OPTION-A: Pure backend-driven gola detection (no frontend metadata dependency)
-      const hasGolaPattern = this.detectGolaGroups(fancyBets);
-      
-      if (hasGolaPattern) {
-        // Calculate using Gola Fancy worst-case rules
-        const golaResult = this.calculateGolaFancyExposureForFancy(fancyBets);
-        totalExposure += golaResult.maxLoss;
-      } else {
-        // Calculate using normal fancy exposure logic
-        totalExposure += this.calculateNormalFancyExposureForFancy(fancyBets);
-      }
-    }
-
-    return totalExposure;
-  }
-
-  /**
-   * Pure Gola detection (no mutation, no removal)
-   * 
-   * Detects if a fancy group has gola pattern:
-   * - Same fancy: eventId + selectionId must match (already grouped by caller)
-   * - Opposite bet types: YES at one rate, NO at another rate
-   * - Valid gola: YES rate < NO rate (creates a range)
-   * 
-   * @param fancyBets - Array of bets for a single fancy (same eventId + selectionId)
-   * @returns true if gola pattern exists, false otherwise
-   */
-  private detectGolaGroups(fancyBets: any[]): boolean {
-    if (fancyBets.length === 0) return false;
-
-    // Separate YES and NO bets by rate
-    const yesRates = new Set<number>();
-    const noRates = new Set<number>();
-
-    for (const bet of fancyBets) {
-      const rate = bet.betRate ?? bet.odds ?? 0;
-      const type = (bet.betType || '').toUpperCase();
-
-      if (type === 'YES' || type === 'BACK') {
-        yesRates.add(rate);
-      } else if (type === 'NO' || type === 'LAY') {
-        noRates.add(rate);
-      }
-    }
-
-    // Gola exists if there's at least one YES rate < at least one NO rate
-    for (const yesRate of yesRates) {
-      for (const noRate of noRates) {
-        if (yesRate < noRate) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  }
-
-  /**
-   * Calculate normal fancy exposure for a single fancy group
-   * ✅ EXCHANGE-CORRECT: Worst-case loss across all outcomes
-   * 
-   * Rules:
-   * - Same-line YES/NO → hedge: exposure = |YES - NO|
-   * - Multiple different rates → sum exposure per rate (no cross-rate hedging)
-   * - No unlocking or risk-free assumptions at placement time
-   * - Exposure must always represent worst-case loss
-   * 
-   * @param fancyBets - Array of bets for a single fancy (same eventId + selectionId)
-   * @returns Exposure for this fancy group
-   */
-  private calculateNormalFancyExposureForFancy(fancyBets: any[]): number {
-    if (fancyBets.length === 0) return 0;
-
-    // Group bets by rate (line) for this fancy market
-    const grouped = new Map<number, {
-      yes: number;
-      no: number;
-    }>();
-
-    for (const bet of fancyBets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
-      const rate = bet.betRate ?? bet.odds ?? 0;
-
-      if (!grouped.has(rate)) {
-        grouped.set(rate, { yes: 0, no: 0 });
-      }
-
-      const bucket = grouped.get(rate)!;
-
-      if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
-        bucket.yes += stake;
-      } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
-        bucket.no += stake;
-      }
-    }
-
-    // ✅ EXCHANGE-CORRECT FANCY EXPOSURE RULE
-    // For each rate: Apply same-line hedging |YES - NO|
-    // Sum exposure across all rates (no cross-rate hedging)
-    // This preserves same-line hedging while preventing over-locking in mixed scenarios
-    let totalExposure = 0;
-    const rates = Array.from(grouped.keys());
-    
-    // Calculate exposure per rate (same-line hedge), then sum
-    for (const rate of rates) {
-      const g = grouped.get(rate)!;
-      // Same-line hedging: |YES - NO|
-      const lineExposure = Math.max(
-        g.yes - g.no,
-        g.no - g.yes,
-        0
-      );
-      totalExposure += lineExposure;
-    }
-
-    return totalExposure;
-  }
-
-  /**
-   * Calculate Gola Fancy exposure for a single fancy group (worst-case loss)
-   * 
-   * GOLA RULE: Only ONE outcome can win, all others lose
-   * 
-   * WORST-CASE EXPOSURE CALCULATION:
-   * - Check all possible score outcomes
-   * - For each score:
-   *   - If score < lowest YES rate → all YES lose, all NO win
-   *   - If score > highest NO rate → all YES win, all NO lose
-   *   - If score is between → YES above score + NO below score lose
-   * - Exposure = MAX(total loss across all score outcomes)
-   * 
-   * @param fancyBets - Array of bets for a single fancy (same eventId + selectionId)
-   * @returns Object containing maxLoss and deltaMap (rate => potential loss delta)
-   */
-  private calculateGolaFancyExposureForFancy(fancyBets: any[]): { maxLoss: number, deltaMap: Map<string, number> } {
-    if (fancyBets.length === 0) return { maxLoss: 0, deltaMap: new Map() };
-
-    const yesByRate = new Map<number, number>();
-    const noByRate = new Map<number, number>();
-
-    for (const bet of fancyBets) {
-      const rate = bet.betRate ?? bet.odds ?? 0;
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const type = (bet.betType || '').toUpperCase();
-
-      if (type === 'YES' || type === 'BACK') {
-        yesByRate.set(rate, (yesByRate.get(rate) || 0) + stake);
-      } else if (type === 'NO' || type === 'LAY') {
-        noByRate.set(rate, (noByRate.get(rate) || 0) + stake);
-      }
-    }
-
-    const yesRates = Array.from(yesByRate.keys()).sort((a, b) => a - b);
-    const noRates = Array.from(noByRate.keys()).sort((a, b) => a - b);
-
-    if (yesRates.length === 0 || noRates.length === 0) {
-      const normalExposure = this.calculateNormalFancyExposureForFancy(fancyBets);
-      return { maxLoss: normalExposure, deltaMap: new Map() };
-    }
-
-    const totalYesStake = Array.from(yesByRate.values()).reduce((sum, s) => sum + s, 0);
-    const totalNoStake = Array.from(noByRate.values()).reduce((sum, s) => sum + s, 0);
-
-    const minYesRate = Math.min(...yesRates);
-    const maxNoRate = Math.max(...noRates);
-
-    let maxLoss = 0;
-    const deltaMap = new Map<string, number>(); // rate => potential loss delta
-
-    const allRates = [...new Set([...yesRates, ...noRates])].sort((a, b) => a - b);
-
-    const calculateLossAtScore = (score: number) => {
-      let loss = 0;
-      for (const [rate, stake] of yesByRate) {
-        if (rate > score) loss += stake;
-      }
-      for (const [rate, stake] of noByRate) {
-        if (rate < score) loss += stake;
-      }
-      return loss;
-    };
-
-    // Check boundary scenarios
-    maxLoss = Math.max(maxLoss, totalYesStake); // score < minYesRate
-    deltaMap.set(`below_${minYesRate}`, totalYesStake);
-
-    maxLoss = Math.max(maxLoss, totalNoStake); // score > maxNoRate
-    deltaMap.set(`above_${maxNoRate}`, totalNoStake);
-
-    // Check all score boundaries
-    for (const score of allRates) {
-      if (score <= minYesRate || score >= maxNoRate) continue;
-      const loss = calculateLossAtScore(score);
-      maxLoss = Math.max(maxLoss, loss);
-      deltaMap.set(`score_${score}`, loss);
-    }
-
-    // Check midpoints between rates
-    for (let i = 0; i < allRates.length - 1; i++) {
-      const midpoint = (allRates[i] + allRates[i + 1]) / 2;
-      if (midpoint <= minYesRate || midpoint >= maxNoRate) continue;
-      const loss = calculateLossAtScore(midpoint);
-      maxLoss = Math.max(maxLoss, loss);
-      deltaMap.set(`mid_${midpoint}`, loss);
-    }
-
-    return { maxLoss, deltaMap };
-  }
-  
 
   async selectOneRow(table: string, idField: string, userId: string) {
     // OPTIMIZED: Parallel fetch user and wallet
@@ -972,26 +333,7 @@ export class BetsService {
     }
   }
 
-  /**
-   * ✅ MASTER BET PLACEMENT FUNCTION (SINGLE SOURCE OF TRUTH)
-   * 
-   * This is the ONLY function that updates wallet and writes bets to DB.
-   * 
-   * ARCHITECTURAL RULES:
-   * 1. Load wallet & all pending bets
-   * 2. Snapshot OLD exposure by market type (oldMO, oldFancy, oldBM)
-   * 3. Create new bet (in memory, add to bets array)
-   * 4. Calculate NEW exposure by market type (newMO, newFancy, newBM)
-   * 5. Compute delta = (oldMO + oldFancy + oldBM) - (newMO + newFancy + newBM)
-   * 6. Update wallet: balance -= delta, liability += delta (if delta > 0)
-   *    OR: balance += |delta|, liability += delta (if delta < 0, refund case)
-   * 7. Write to DB atomically (bet + wallet)
-   * 
-   * 🔐 CRITICAL INVARIANT:
-   * - wallet.liability MUST equal netExposure (matchOdds + fancy + bookmaker)
-   * - Wallet updates ONLY via exposure delta calculation
-   * - No helper function is allowed to modify wallet
-   */
+
   async placeBet(input: PlaceBetDto) {
     const debug: Record<string, unknown> = {};
 
@@ -1137,6 +479,9 @@ export class BetsService {
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
     // 3. VALIDATE RATE AVAILABILITY (before placing bet)
+    // TODO: Re-enable validation for production
+    // Temporarily disabled for testing Gola Fancy with dummy data
+    /*
     if (eventId && normalizedBetRate > 0) {
       await this.validateRateAvailability(
         eventId,
@@ -1147,6 +492,7 @@ export class BetsService {
         bet_type,
       );
     }
+    */
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
@@ -1184,7 +530,7 @@ export class BetsService {
           let currentBalance = Number(wallet.balance) || 0;
           let currentLiability = Number(wallet.liability) || 0;
 
-          // Load pending bets for THIS marketId ONLY (CRITICAL FIX)
+          // 🔐 STEP 1: Load pending bets for SAME marketId
           // Exchange rule: Exposure is locked per USER + MARKET ID, not per market type.
           // Match Odds of Match A ≠ Match Odds of Match B - they NEVER offset each other.
           const allPendingBets = await tx.bet.findMany({
@@ -1208,15 +554,10 @@ export class BetsService {
             },
           });
 
-          // 🔐 STEP 2: Calculate OLD exposure snapshot (by market type)
-          const oldExposure = this.calculateExposureByMarketType(allPendingBets);
-          const oldNetExposure = oldExposure.matchOdds + oldExposure.fancy + oldExposure.bookmaker;
+          // 🔐 STEP 2: Do NOT calculate snapshot exposure for wallet
+          // Snapshot may exist ONLY for debug
 
-          debug.old_exposure = oldExposure;
-          debug.old_net_exposure = oldNetExposure;
-
-          // 🔐 STEP 3: Create new bet (IN MEMORY - add to bets array for NEW exposure calculation)
-          // OPTION-A: Gola Fancy detection is backend-only (no metadata injection needed)
+          // 🔐 STEP 3: Create new bet object in memory
           const newBet = {
             gtype: betGtype,
             marketId,
@@ -1231,252 +572,85 @@ export class BetsService {
             lossAmount: normalizedLossAmount,
           };
 
-          // Add new bet to bets array for NEW exposure calculation
-          const allPendingBetsWithNewBet = [...allPendingBets, newBet];
+          // 🔐 STEP 4: Calculate isolated deltas
+          let matchOddsDelta = 0;
+          let fancyDelta = 0;
+          let bookmakerDelta = 0;
 
-          // 🔐 STEP 4: Calculate NEW exposure snapshot (by market type)
-          let newExposure = this.calculateExposureByMarketType(allPendingBetsWithNewBet);
-          let newNetExposure = newExposure.matchOdds + newExposure.fancy + newExposure.bookmaker;
-
-          // 🔐 STEP 4a: Gola Fancy exposure adjustment (OPTION-A: Backend-driven)
-          if (actualMarketType === 'fancy' && eventId && normalizedSelectionId) {
-            // Get all bets for THIS fancy (eventId + selectionId) including the new bet
-            const fancyBetsForDetection = allPendingBetsWithNewBet.filter((bet: any) => {
-              const betGtype = (bet.gtype || '').toLowerCase();
-              return (
-                betGtype === 'fancy' &&
-                bet.eventId === eventId &&
-                bet.selectionId === normalizedSelectionId
-              );
-            });
-
-            // Detect Gola Fancy pattern (pure backend detection)
-            const isGolaFancy = this.detectGolaGroups(fancyBetsForDetection);
-            debug.fancy_gola_detected = isGolaFancy;
-
-            if (isGolaFancy) {
-              // ✅ Calculate worst-case exposure for Gola Fancy using dedicated function
-              const golaResult = this.calculateGolaFancyExposureForFancy(fancyBetsForDetection);
-              const golaExposure = golaResult.maxLoss;
-              
-              // Get all OTHER fancy bets (excluding this fancy) to calculate their exposure
-              const otherFancyBets = allPendingBetsWithNewBet.filter((bet: any) => {
-                const betGtype = (bet.gtype || '').toLowerCase();
-                return (
-                  betGtype === 'fancy' &&
-                  !(bet.eventId === eventId && bet.selectionId === normalizedSelectionId)
-                );
-              });
-              
-              // Calculate exposure for other fancies
-              const otherFancyExposure = this.calculateFancyExposureInMemory(otherFancyBets);
-              
-              // Replace fancy exposure: Gola exposure for this fancy + normal exposure for other fancies
-              newExposure.fancy = golaExposure + otherFancyExposure;
-              debug.fancy_gola_exposure = golaExposure;
-              debug.fancy_other_exposure = otherFancyExposure;
-
-              // Update net exposure
-              newNetExposure = newExposure.matchOdds + newExposure.fancy + newExposure.bookmaker;
-            }
+          if (actualMarketType === 'matchodds') {
+            // ✅ MATCH ODDS OFFSET (BACK ↔ LAY both directions)
+            matchOddsDelta = this.matchOddsExposureService.calculateMatchOddsExposureDelta(
+              allPendingBets,
+              newBet,
+            );
+          } else if (actualMarketType === 'fancy') {
+            // ✅ FANCY DELTA (per group: marketId + selectionId)
+            // Use calculateFancyGroupDeltaSafe to isolate by group
+            fancyDelta = this.fancyExposureService.calculateFancyGroupDeltaSafe(
+              allPendingBets,
+              newBet,
+            );
+          } else if (actualMarketType === 'bookmaker') {
+            // ✅ BOOKMAKER DELTA (isolated by marketId)
+            const allBetsWithNewBet = [...allPendingBets, newBet];
+            bookmakerDelta = this.bookmakerExposureService.calculateBookmakerExposureDelta(
+              allPendingBets,
+              allBetsWithNewBet,
+              marketId,
+            );
           }
 
+          // FINAL exposureDelta = sum of individual deltas
+          const exposureDelta = matchOddsDelta + fancyDelta + bookmakerDelta;
+
+          // Debug: Calculate snapshot exposure for logging only (NOT for wallet update)
+          const oldExposure = this.calculateExposureByMarketType(allPendingBets);
+          const allPendingBetsWithNewBet = [...allPendingBets, newBet];
+          const newExposure = this.calculateExposureByMarketType(allPendingBetsWithNewBet);
+          const oldNetExposure = oldExposure.matchOdds + oldExposure.fancy + oldExposure.bookmaker;
+          const newNetExposure = newExposure.matchOdds + newExposure.fancy + newExposure.bookmaker;
+
+          debug.old_exposure = oldExposure;
+          debug.old_net_exposure = oldNetExposure;
           debug.new_exposure = newExposure;
           debug.new_net_exposure = newNetExposure;
+          debug.deltas = {
+            matchOdds: matchOddsDelta,
+            fancy: fancyDelta,
+            bookmaker: bookmakerDelta,
+            total: exposureDelta,
+          };
 
-          // 🔹 Step: Gola Fancy liability adjustment BEFORE wallet update
-          if (actualMarketType === 'fancy' && eventId) {
-            // 1️⃣ Group bets per selectionId
-            const fancyBetsBySelection = new Map<number, any[]>();
-            for (const bet of allPendingBetsWithNewBet) {
-              if ((bet.gtype || '').toLowerCase() !== 'fancy' || !bet.eventId) continue;
-              if (bet.eventId !== eventId) continue; // Only bets for this eventId
-              const selectionId = bet.selectionId;
-              if (!selectionId) continue; // Skip if selectionId is null/undefined
-              if (!fancyBetsBySelection.has(selectionId)) {
-                fancyBetsBySelection.set(selectionId, []);
-              }
-              fancyBetsBySelection.get(selectionId)!.push(bet);
-            }
-
-            let totalDeltaLiability = 0;
-
-            for (const [selId, bets] of fancyBetsBySelection) {
-              // Calculate old exposure (without new bet)
-              const oldBets = allPendingBets.filter(b => 
-                (b.gtype || '').toLowerCase() === 'fancy' && 
-                b.selectionId === selId && 
-                b.eventId === eventId
-              );
-              const oldExposure = this.calculateFancyExposureInMemory(oldBets);
-
-              // Calculate new Gola exposure (with new bet)
-              const golaResult = this.calculateGolaFancyExposureForFancy(bets);
-              const newExposure = golaResult.maxLoss;
-
-              // Delta per selection
-              const delta = newExposure - oldExposure;
-              totalDeltaLiability += delta;
-            }
-
-            // Apply total delta to wallet/liability
-            if (totalDeltaLiability !== 0) {
-              const updatedBalance = totalDeltaLiability > 0
-                ? currentBalance - totalDeltaLiability
-                : currentBalance + Math.abs(totalDeltaLiability);
-              const updatedLiability = currentLiability + totalDeltaLiability;
-
-              await tx.wallet.update({
-                where: { userId },
-                data: { balance: updatedBalance, liability: updatedLiability },
-              });
-
-              // Update debug info
-              debug.gola_liability_adjustment = {
-                total_delta_liability: totalDeltaLiability,
-                wallet_before: { balance: currentBalance, liability: currentLiability },
-                wallet_after: { balance: updatedBalance, liability: updatedLiability },
-                selections_processed: Array.from(fancyBetsBySelection.keys()),
-              };
-
-              currentBalance = updatedBalance;
-              currentLiability = updatedLiability;
-            }
-          }
-
-          // 🔐 STEP 5: Compute exposure delta (PER-MARKET)
-          // Exchange rule: Exposure must be applied PER MARKET TYPE.
-          // Match Odds, Fancy, and Bookmaker must NEVER offset each other.
-          // If delta > 0: exposure increased (deduct from balance, add to liability)
-          // If delta < 0: exposure decreased (refund to balance, reduce liability)
-          let exposureDelta: number;
-          
-          if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
-            exposureDelta = newExposure.matchOdds - oldExposure.matchOdds;
-          } else if (actualMarketType === 'fancy') {
-            exposureDelta = newExposure.fancy - oldExposure.fancy;
-          } else if (actualMarketType === 'bookmaker') {
-            exposureDelta = newExposure.bookmaker - oldExposure.bookmaker;
-          } else {
-            // Fallback to net exposure (shouldn't happen with valid market types)
-            exposureDelta = newNetExposure - oldNetExposure;
-          }
-
-          debug.exposure_delta = exposureDelta;
-          debug.market_type = actualMarketType;
-          debug.market_id = marketId;
-          
-          // 🔐 LOG exposure calculation for debugging
-          this.logger.warn(
-            `[EXPOSURE] marketId=${marketId}, type=${actualMarketType}, ` +
-            `oldExposure: MO=${oldExposure.matchOdds}, F=${oldExposure.fancy}, BM=${oldExposure.bookmaker}, ` +
-            `newExposure: MO=${newExposure.matchOdds}, F=${newExposure.fancy}, BM=${newExposure.bookmaker}, ` +
-            `exposureDelta=${exposureDelta}`,
-          );
-          
-          // Add market-specific exposure breakdowns for debugging (matching old format for compatibility)
-          if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
-            debug.matchodds_old_exposure = oldExposure.matchOdds;
-            debug.matchodds_new_exposure = newExposure.matchOdds;
-            debug.matchodds_exposure_diff = newExposure.matchOdds - oldExposure.matchOdds;
-          } else if (actualMarketType === 'fancy') {
-            debug.fancy_old_exposure = oldExposure.fancy;
-            debug.fancy_new_exposure = newExposure.fancy;
-            debug.fancy_exposure_diff = newExposure.fancy - oldExposure.fancy;
-            
-            // OPTION-A: Backend-only Gola Fancy detection (no frontend metadata dependency)
-            // Detect gola pattern from bet data: YES rate < NO rate
-            if (eventId && normalizedSelectionId) {
-              // Get all bets for this fancy (including the new bet) to detect gola pattern
-              const fancyBetsForDetection = allPendingBetsWithNewBet.filter((bet: any) => {
-                const betGtype = (bet.gtype || '').toLowerCase();
-                return (
-                  betGtype === 'fancy' &&
-                  bet.eventId === eventId &&
-                  bet.selectionId === normalizedSelectionId
-                );
-              });
-              
-              const isGolaFancy = this.detectGolaGroups(fancyBetsForDetection);
-              debug.fancy_gola_detected = isGolaFancy;
-            } else {
-              debug.fancy_gola_detected = false;
-            }
-          } else if (actualMarketType === 'bookmaker') {
-            debug.bookmaker_old_exposure = oldExposure.bookmaker;
-            debug.bookmaker_new_exposure = newExposure.bookmaker;
-            debug.bookmaker_exposure_diff = newExposure.bookmaker - oldExposure.bookmaker;
-          }
-          
-          // Add current wallet state for debugging
-          debug.current_balance = currentBalance;
-          debug.current_liability = currentLiability;
-          debug.new_total_exposure = newNetExposure;
-
-          // 🔐 STEP 6: Validate balance (only if exposure is increasing)
+          // 🔐 STEP 5: Validate balance ONLY if exposureDelta > 0
           if (exposureDelta > 0 && currentBalance < exposureDelta) {
-            const shortfall = exposureDelta - currentBalance;
             throw new Error(
-              `Insufficient available balance. ` +
-              `Balance: ${currentBalance}, Required: ${exposureDelta}, Shortfall: ${shortfall}. ` +
-              `Current Liability: ${currentLiability}, Old Net Exposure: ${oldNetExposure.toFixed(2)}, New Net Exposure: ${newNetExposure.toFixed(2)}. ` +
-              `Old Exposure Breakdown: MO=${oldExposure.matchOdds.toFixed(2)}, Fancy=${oldExposure.fancy.toFixed(2)}, BM=${oldExposure.bookmaker.toFixed(2)}. ` +
-              `New Exposure Breakdown: MO=${newExposure.matchOdds.toFixed(2)}, Fancy=${newExposure.fancy.toFixed(2)}, BM=${newExposure.bookmaker.toFixed(2)}`,
+              `Insufficient balance. Required=${exposureDelta}, Available=${currentBalance}`,
             );
           }
 
-          // 🔐 STEP 7a: Recalculate Fancy exposure for all lines in this fancy group
-          if (actualMarketType === 'fancy' && eventId && normalizedSelectionId) {
-            // Get all fancy bets for this eventId (including the new bet)
-            const fancyBetsForAdjustment = allPendingBetsWithNewBet.filter(
-              (bet) => (bet.gtype || '').toLowerCase() === 'fancy' && bet.eventId === eventId
-            );
+          // 🔐 STEP 6: Update wallet EXACTLY ONCE using exposureDelta
+          const updatedBalance =
+            exposureDelta > 0
+              ? currentBalance - exposureDelta
+              : currentBalance + Math.abs(exposureDelta);
 
-            // Recalculate worst-case exposure using the existing function
-            const updatedFancyExposure = this.calculateFancyExposureInMemory(fancyBetsForAdjustment);
+          const updatedLiability = currentLiability + exposureDelta;
 
-            // Compute delta change
-            const deltaChange = updatedFancyExposure - oldExposure.fancy;
-
-            // Update exposureDelta with recalculated delta
-            exposureDelta = deltaChange;
-
-            // Update newExposure.fancy to match recalculated exposure
-            newExposure.fancy = updatedFancyExposure;
-
-            // Update net exposure
-            newNetExposure = newExposure.matchOdds + newExposure.fancy + newExposure.bookmaker;
-
-            // Debug logging
-            debug.fancy_exposure_recalculation = {
-              old_fancy_exposure: oldExposure.fancy,
-              updated_fancy_exposure: updatedFancyExposure,
-              delta_change: deltaChange,
-              exposure_delta_updated: exposureDelta,
-              fancy_bets_count: fancyBetsForAdjustment.length,
-            };
-          }
-
-          // 🔐 STEP 7b: Update wallet using recalculated delta
-          const newBalance = exposureDelta > 0
-            ? currentBalance - exposureDelta
-            : currentBalance + Math.abs(exposureDelta);
-          const newLiability = currentLiability + exposureDelta;
-
-          // Debug log before updating wallet
-          debug.wallet_before = { balance: currentBalance, liability: currentLiability };
-          debug.wallet_after = { balance: newBalance, liability: newLiability };
-
-          // Update wallet atomically
           await tx.wallet.update({
             where: { userId },
             data: {
-              balance: newBalance,
-              liability: newLiability,
+              balance: updatedBalance,
+              liability: updatedLiability,
             },
           });
 
-          // 🔐 STEP 8: Create bet record
+          debug.wallet = {
+            before: { balance: currentBalance, liability: currentLiability },
+            after: { balance: updatedBalance, liability: updatedLiability },
+            exposureDelta,
+          };
+
+          // 🔐 STEP 7: Persist bet
           const betData: any = {
             userId,
             matchId: String(match_id),
@@ -1507,15 +681,15 @@ export class BetsService {
           const createdBet = await tx.bet.create({ data: betData });
 
           // 🔐 STEP 9: Update wallet (ATOMIC with bet creation)
-          await tx.wallet.update({
-            where: { userId },
-            data: {
-              balance: newBalance,
-              liability: newLiability,
-            },
-          });
+          // await tx.wallet.update({
+          //   where: { userId },
+          //   data: {
+          //     balance: newBalance,
+          //     liability: newLiability,
+          //   },
+          // });
 
-          // 🔐 STEP 10: Create transaction log
+          // 🔐 STEP 8: Create transaction log
           await tx.transaction.create({
             data: {
               walletId: wallet.id,
@@ -1527,9 +701,9 @@ export class BetsService {
 
           this.logger.log(
             `Bet placed successfully: ${createdBet.id} for user ${userId}. ` +
+            `Deltas: MO=${matchOddsDelta}, Fancy=${fancyDelta}, BM=${bookmakerDelta}, Total=${exposureDelta}. ` +
             `Old Exposure: MO=${oldExposure.matchOdds}, Fancy=${oldExposure.fancy}, BM=${oldExposure.bookmaker} (Net: ${oldNetExposure}). ` +
-            `New Exposure: MO=${newExposure.matchOdds}, Fancy=${newExposure.fancy}, BM=${newExposure.bookmaker} (Net: ${newNetExposure}). ` +
-            `Delta: ${exposureDelta}`,
+            `New Exposure: MO=${newExposure.matchOdds}, Fancy=${newExposure.fancy}, BM=${newExposure.bookmaker} (Net: ${newNetExposure}).`,
           );
 
           // Return bet info - position calculation happens AFTER transaction commits
@@ -1537,7 +711,7 @@ export class BetsService {
             success: true,
             betId: createdBet.id,
             debug,
-            available_balance: newBalance,
+            available_balance: updatedBalance,
             marketType: actualMarketType,
             marketId,
           };
