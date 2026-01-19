@@ -551,7 +551,9 @@ export class BetsService {
               odds: true,
               winAmount: true,
               lossAmount: true,
-            },
+              // @ts-ignore - isRangeConsumed will be available after Prisma client regeneration
+              isRangeConsumed: true,
+            } as any,
           });
 
           // 🔐 STEP 2: Do NOT calculate snapshot exposure for wallet
@@ -584,12 +586,14 @@ export class BetsService {
               newBet,
             );
           } else if (actualMarketType === 'fancy') {
-            // ✅ FANCY DELTA (per group: marketId + selectionId)
-            // Use calculateFancyGroupDeltaSafe to isolate by group
-            fancyDelta = this.fancyExposureService.calculateFancyGroupDeltaSafe(
+            // ✅ FANCY DELTA using Maximum Possible Loss model
+            // Use calculateFancyGroupDeltaSafe to isolate by group (marketId + selectionId)
+            const fancyResult = this.fancyExposureService.calculateFancyGroupDeltaSafe(
               allPendingBets,
               newBet,
             );
+            fancyDelta = fancyResult.delta;
+            // Note: isRangeConsumed is no longer used in Maximum Possible Loss model
           } else if (actualMarketType === 'bookmaker') {
             // ✅ BOOKMAKER DELTA (isolated by marketId)
             const allBetsWithNewBet = [...allPendingBets, newBet];

@@ -13,12 +13,22 @@ export class MatchOddsExposureService {
   /**
    * Build position map per selection for Match Odds bets
    * 
+   * ✅ DRAW HANDLING:
+   * - If marketSelections is provided and contains DRAW selectionId,
+   *   and user has NOT bet on DRAW, inject DRAW with zero PnL
+   * - This ensures DRAW outcome is simulated even if user hasn't bet on it
+   * 
    * @param bets - Array of Match Odds bets
+   * @param marketSelections - Optional array of all valid selectionIds for this market (including DRAW)
    * @returns Map of selectionId to { win: number, lose: number }
    */
-  private buildMatchOddsPositions(bets: any[]): Map<number, { win: number; lose: number }> {
+  private buildMatchOddsPositions(
+    bets: any[],
+    marketSelections?: number[],
+  ): Map<number, { win: number; lose: number }> {
     const map = new Map<number, { win: number; lose: number }>();
 
+    // Build positions from user bets
     for (const bet of bets) {
       const selectionId = Number(bet.selectionId ?? bet.selection_id);
       if (!selectionId) continue;
@@ -45,28 +55,54 @@ export class MatchOddsExposureService {
       }
     }
 
+    // ✅ DRAW INJECTION: Inject DRAW selection if it exists in market but user hasn't bet on it
+    if (marketSelections && marketSelections.length > 0) {
+      for (const selectionId of marketSelections) {
+        // If selection exists in market but user hasn't bet on it, inject with zero PnL
+        if (!map.has(selectionId)) {
+          map.set(selectionId, { win: 0, lose: 0 });
+        }
+      }
+    }
+
     return map;
   }
 
   /**
    * Calculate Match Odds exposure in memory (no database queries)
    * 
-   * Uses worst-case PnL simulation across all possible outcomes.
+   * ✅ MARKET-CORRECT APPROACH:
+   * - Simulates ALL REAL outcomes (each selection wins, including DRAW if applicable)
+   * - Removes imaginary "all lose" scenarios
+   * - Injects DRAW selection if it exists in market but user hasn't bet on it
    * 
    * @param bets - Array of bets for this Match Odds market
+   * @param marketSelections - Optional array of all valid selectionIds for this market (including DRAW)
    * @returns Net exposure (worst-case loss) for this market
    */
-  calculateMatchOddsExposureInMemory(bets: any[]): number {
+  calculateMatchOddsExposureInMemory(
+    bets: any[],
+    marketSelections?: number[],
+  ): number {
     if (!bets.length) return 0;
 
-    const positionBySelection = this.buildMatchOddsPositions(bets);
+    // Build position map (with DRAW injection if applicable)
+    const positionBySelection = this.buildMatchOddsPositions(bets, marketSelections);
 
     let maxLoss = 0;
     const selections = Array.from(positionBySelection.keys());
 
     /**
-     * SCENARIO A:
-     * Each selection wins one by one
+     * ✅ SIMULATE ALL REAL OUTCOMES:
+     * Each selection wins one by one (including DRAW if injected)
+     * 
+     * This covers:
+     * - Home team wins
+     * - Away team wins
+     * - DRAW (if applicable and injected)
+     * 
+     * ❌ REMOVED: Imaginary "all lose" scenario
+     * This was incorrect because in Match Odds, one of the real selections MUST win
      */
     for (const winner of selections) {
       let pnl = 0;
@@ -78,20 +114,6 @@ export class MatchOddsExposureService {
       if (pnl < 0) {
         maxLoss = Math.max(maxLoss, Math.abs(pnl));
       }
-    }
-
-    /**
-     * SCENARIO B:
-     * Some OTHER runner wins (not bet by user)
-     * → all selections lose
-     */
-    let allLosePnl = 0;
-    for (const pos of positionBySelection.values()) {
-      allLosePnl += pos.lose;
-    }
-
-    if (allLosePnl < 0) {
-      maxLoss = Math.max(maxLoss, Math.abs(allLosePnl));
     }
 
     return maxLoss;
@@ -109,14 +131,17 @@ export class MatchOddsExposureService {
    * - Calculates new exposure (with new bet)
    * - Returns delta = newExposure - oldExposure (can be negative)
    * - Supports FULL OFFSET: BACK → LAY reverses, LAY → BACK reverses
+   * - Handles DRAW outcomes if marketSelections is provided
    * 
    * @param existingBets - Existing pending bets for this marketId (without new bet)
    * @param newBet - The new bet being placed
+   * @param marketSelections - Optional array of all valid selectionIds for this market (including DRAW)
    * @returns Exposure delta (positive = liability increases, negative = liability releases)
    */
   calculateMatchOddsExposureDelta(
     existingBets: any[],
     newBet: any,
+    marketSelections?: number[],
   ): number {
     // Filter to only Match Odds bets for this marketId
     const marketId = newBet.marketId;
@@ -129,11 +154,17 @@ export class MatchOddsExposureService {
     });
 
     // Calculate old exposure (without new bet)
-    const oldExposure = this.calculateMatchOddsExposureInMemory(matchOddsExistingBets);
+    const oldExposure = this.calculateMatchOddsExposureInMemory(
+      matchOddsExistingBets,
+      marketSelections,
+    );
 
     // Add new bet and calculate new exposure
     const matchOddsNewBets = [...matchOddsExistingBets, newBet];
-    const newExposure = this.calculateMatchOddsExposureInMemory(matchOddsNewBets);
+    const newExposure = this.calculateMatchOddsExposureInMemory(
+      matchOddsNewBets,
+      marketSelections,
+    );
 
     // Return delta (can be negative for offsets)
     // Positive delta = liability increases (lock funds)

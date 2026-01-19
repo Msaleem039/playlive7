@@ -4,30 +4,54 @@ import { Injectable } from '@nestjs/common';
  * ✅ FANCY EXPOSURE SERVICE
  * 
  * Handles all exposure calculations for Fancy markets.
- * Uses policy-first approach: range policy → normal fancy exposure.
+ * Uses Maximum Possible Loss calculation model (market-correct approach).
  * 
- * DO NOT change existing fancy logic - only return exposure deltas.
+ * Calculates exposure by simulating all possible outcomes and finding
+ * the worst-case loss scenario across all Fancy bets.
  */
 @Injectable()
 export class FancyExposureService {
   /**
-   * Calculate Fancy exposure in memory (no database queries)
-   * ✅ EXCHANGE RULE: Different lines do NOT hedge, only same-line reverse can reduce exposure
-   * - Group bets by eventId_selectionId_rate (same-line grouping)
-   * - Same-line: YES @ X and NO @ X hedge each other (exposure = |YES - NO|)
-   * - Different lines: YES @ A + NO @ B = full liability (sum, NO hedge)
-   * - Exposure is net per line, then summed across all lines
+   * Maximum possible outcome value for Fancy markets
+   * Used to bound the outcome simulation range
+   */
+  private readonly MAX_FANCY_OUTCOME = 1000;
+
+  /**
+   * Minimum possible outcome value for Fancy markets
+   */
+  private readonly MIN_FANCY_OUTCOME = 0;
+  /**
+   * Calculate Fancy exposure in memory using Maximum Possible Loss model
    * 
-   * @param bets - Array of bets for the fancy selection
-   * @returns Net exposure for this Fancy selection
+   * ✅ MARKET-CORRECT APPROACH:
+   * - Simulates all possible outcomes (runs/score values)
+   * - For each outcome, calculates total P/L across all bets
+   * - Returns the maximum possible loss (worst-case scenario)
+   * 
+   * This approach is:
+   * - Deterministic (same bets = same exposure)
+   * - Idempotent (order-independent)
+   * - Free from YES/NO or range heuristics
+   * 
+   * @param bets - Array of bets for Fancy markets (gtype === 'fancy')
+   * @returns Maximum possible loss across all outcomes
    */
   calculateFancyExposureInMemory(bets: any[]): number {
     if (bets.length === 0) return 0;
 
+    // Filter only Fancy bets
+    const fancyBets = bets.filter(
+      (bet) => (bet.gtype || '').toLowerCase() === 'fancy',
+    );
+
+    if (fancyBets.length === 0) return 0;
+
     // Group bets by fancy key (eventId + selectionId)
+    // Each group is evaluated independently
     const betsByFancy = new Map<string, any[]>();
 
-    for (const bet of bets) {
+    for (const bet of fancyBets) {
       const eventId = bet.eventId || '';
       const selectionId = bet.selectionId || 0;
       const fancyKey = `${eventId}_${selectionId}`;
@@ -38,131 +62,127 @@ export class FancyExposureService {
       betsByFancy.get(fancyKey)!.push(bet);
     }
 
+    // Calculate maximum loss per fancy group, then sum
     let totalExposure = 0;
 
-    // Process each fancy separately
     for (const fancyBets of betsByFancy.values()) {
-      // 🟢 FIRST: client range policy
-      const rangeExposure = this.applyRangeFancyPolicyForFancy(fancyBets);
-
-      if (rangeExposure !== null) {
-        totalExposure += rangeExposure;
-        continue;
-      }
-
-      // 🟡 FALLBACK: normal fancy exposure
-      totalExposure += this.calculateNormalFancyExposureForFancy(fancyBets);
+      const maxLoss = this.calculateFancyMaxLoss(fancyBets);
+      totalExposure += maxLoss;
     }
 
     return totalExposure;
   }
 
   /**
-   * Apply range fancy policy for a single fancy group
+   * Calculate Maximum Possible Loss for a group of Fancy bets
    * 
-   * Checks if the fancy has a complete range (YES rates < NO rates).
-   * If range is complete, exposure is 0 (no liability).
+   * Simulates all possible outcomes and finds the worst-case loss.
    * 
-   * @param fancyBets - Array of bets for a single fancy (same eventId + selectionId)
-   * @returns Exposure if range policy applies (0 for complete range), null if no range
+   * @param fancyBets - Array of bets for a single Fancy market (same eventId + selectionId)
+   * @returns Maximum possible loss (always >= 0)
    */
-  private applyRangeFancyPolicyForFancy(fancyBets: any[]): number | null {
-    const yesRates: number[] = [];
-    const noRates: number[] = [];
+  private calculateFancyMaxLoss(fancyBets: any[]): number {
+    if (fancyBets.length === 0) return 0;
 
+    // Determine outcome range based on bet rates
+    // Use bet rates to determine reasonable outcome range
+    const allRates: number[] = [];
     for (const bet of fancyBets) {
       const rate = bet.betRate ?? bet.odds ?? 0;
-      const type = (bet.betType || '').toUpperCase();
-
-      if (type === 'YES' || type === 'BACK') {
-        yesRates.push(rate);
-      } else if (type === 'NO' || type === 'LAY') {
-        noRates.push(rate);
+      if (rate > 0) {
+        allRates.push(rate);
       }
     }
 
-    if (yesRates.length === 0 || noRates.length === 0) {
-      return null; // no range
+    // Determine outcome range: from min(0, minRate - buffer) to max(maxRate + buffer, MAX_FANCY_OUTCOME)
+    const minRate = allRates.length > 0 ? Math.min(...allRates) : 0;
+    const maxRate = allRates.length > 0 ? Math.max(...allRates) : this.MAX_FANCY_OUTCOME;
+    const buffer = Math.max(50, maxRate * 0.2); // 20% buffer or minimum 50
+
+    const minOutcome = Math.max(this.MIN_FANCY_OUTCOME, Math.floor(minRate - buffer));
+    const maxOutcome = Math.min(this.MAX_FANCY_OUTCOME, Math.ceil(maxRate + buffer));
+
+    // Simulate each possible outcome and calculate total P/L
+    let maxLoss = 0;
+
+    for (let actualRuns = minOutcome; actualRuns <= maxOutcome; actualRuns++) {
+      const totalPl = this.calculateTotalPlForOutcome(fancyBets, actualRuns);
+      
+      // Loss is negative P/L, so maximum loss is the absolute value of the most negative P/L
+      if (totalPl < 0) {
+        maxLoss = Math.max(maxLoss, Math.abs(totalPl));
+      }
     }
 
-    const minYes = Math.min(...yesRates);
-    const maxNo = Math.max(...noRates);
+    return maxLoss;
+  }
 
-    if (minYes < maxNo) {
-      return 0; // ✅ RANGE COMPLETE → no exposure
+  /**
+   * Calculate total P/L for a specific outcome (actualRuns value)
+   * 
+   * @param fancyBets - Array of Fancy bets
+   * @param actualRuns - The actual outcome value (runs/score)
+   * @returns Total P/L (positive = profit, negative = loss)
+   */
+  private calculateTotalPlForOutcome(fancyBets: any[], actualRuns: number): number {
+    let totalPl = 0;
+
+    for (const bet of fancyBets) {
+      const betType = (bet.betType || '').toUpperCase();
+      const line = bet.betRate ?? bet.odds ?? 0;
+      const stake = bet.betValue ?? bet.amount ?? 0;
+      const winAmount = bet.winAmount ?? stake;
+      const lossAmount = bet.lossAmount ?? stake;
+
+      const isYes = betType === 'YES' || betType === 'BACK';
+      const isNo = betType === 'NO' || betType === 'LAY';
+
+      let betWins = false;
+
+      if (isYes) {
+        // YES/BACK: Win if actualRuns >= line
+        betWins = actualRuns >= line;
+      } else if (isNo) {
+        // NO/LAY: Win if actualRuns < line
+        betWins = actualRuns < line;
+      }
+
+      // Calculate P/L for this bet
+      if (betWins) {
+        // Bet wins: profit = winAmount
+        totalPl += winAmount;
+      } else {
+        // Bet loses: loss = -lossAmount
+        totalPl -= lossAmount;
+      }
     }
 
+    return totalPl;
+  }
+
+  /**
+   * @deprecated - Replaced by calculateFancyMaxLoss (Maximum Possible Loss model)
+   * Kept for reference only - not used in active code path
+   */
+  private applyRangeFancyPolicyForFancy(fancyBets: any[]): number | null {
+    // DEPRECATED: Range detection logic removed in favor of Maximum Possible Loss calculation
     return null;
   }
 
   /**
-   * Calculate normal fancy exposure for a single fancy group
-   * ✅ EXCHANGE-CORRECT: Worst-case loss across all outcomes
-   * 
-   * Rules:
-   * - Same-line YES/NO → hedge: exposure = |YES - NO|
-   * - Multiple different rates → sum exposure per rate (no cross-rate hedging)
-   * - No unlocking or risk-free assumptions at placement time
-   * - Exposure must always represent worst-case loss
-   * 
-   * @param fancyBets - Array of bets for a single fancy (same eventId + selectionId)
-   * @returns Exposure for this fancy group
+   * @deprecated - Replaced by calculateFancyMaxLoss (Maximum Possible Loss model)
+   * Kept for reference only - not used in active code path
    */
   private calculateNormalFancyExposureForFancy(fancyBets: any[]): number {
-    if (fancyBets.length === 0) return 0;
-
-    // Group bets by rate (line) for this fancy market
-    const grouped = new Map<number, {
-      yes: number;
-      no: number;
-    }>();
-
-    for (const bet of fancyBets) {
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const betTypeUpper = (bet.betType || '').toUpperCase();
-      const rate = bet.betRate ?? bet.odds ?? 0;
-
-      if (!grouped.has(rate)) {
-        grouped.set(rate, { yes: 0, no: 0 });
-      }
-
-      const bucket = grouped.get(rate)!;
-
-      if (betTypeUpper === 'YES' || betTypeUpper === 'BACK') {
-        bucket.yes += stake;
-      } else if (betTypeUpper === 'NO' || betTypeUpper === 'LAY') {
-        bucket.no += stake;
-      }
-    }
-
-    // ✅ EXCHANGE-CORRECT FANCY EXPOSURE RULE
-    // For each rate: Apply same-line hedging |YES - NO|
-    // Sum exposure across all rates (no cross-rate hedging)
-    // This preserves same-line hedging while preventing over-locking in mixed scenarios
-    let totalExposure = 0;
-    const rates = Array.from(grouped.keys());
-
-    // Calculate exposure per rate (same-line hedge), then sum
-    for (const rate of rates) {
-      const g = grouped.get(rate)!;
-      // Same-line hedging: |YES - NO|
-      const lineExposure = Math.max(
-        g.yes - g.no,
-        g.no - g.yes,
-        0
-      );
-      totalExposure += lineExposure;
-    }
-
-    return totalExposure;
+    // DEPRECATED: Normal fancy exposure logic removed in favor of Maximum Possible Loss calculation
+    return 0;
   }
 
 
   /**
    * ✅ FANCY EXPOSURE DELTA CALCULATOR
    * 
-   * Calculates exposure delta for Fancy bets ONLY.
-   * DO NOT change existing fancy logic - only return (newFancyExposure - oldFancyExposure).
+   * Calculates exposure delta for Fancy bets using Maximum Possible Loss model.
    * 
    * @param existingBets - Existing pending bets (without new bet)
    * @param allBetsWithNewBet - All bets including new bet
@@ -187,21 +207,21 @@ export class FancyExposureService {
   }
 
   /**
-   * ✅ FINAL SINGLE FUNCTION for calculating Fancy group delta safely
+   * ✅ Calculate Fancy group delta using Maximum Possible Loss model
    * 
-   * This function handles all the complexity internally:
+   * This function:
    * - Filters bets by same fancy group (gtype + marketId + selectionId)
-   * - Calculates old vs new exposure per group (isolated from other groups)
+   * - Calculates old vs new exposure per group using Maximum Possible Loss
    * - Returns delta for wallet update
    * 
    * @param existingBets - Existing pending bets (without new bet)
    * @param newBet - The new bet being placed
-   * @returns Exposure delta (positive = liability increases, negative = liability releases)
+   * @returns Object with delta (isRangeConsumed is always false in new model)
    */
   calculateFancyGroupDeltaSafe(
     existingBets: any[],
     newBet: any,
-  ): number {
+  ): { delta: number; isRangeConsumed: boolean } {
     // 1️⃣ Filter same fancy group: marketId + selectionId (per exchange rule)
     const oldGroup = existingBets.filter(
       (b) =>
@@ -213,12 +233,15 @@ export class FancyExposureService {
     // 2️⃣ Add new bet to group
     const newGroup = [...oldGroup, newBet];
 
-    // 3️⃣ Calculate exposure for this group only (isolated)
+    // 3️⃣ Calculate exposure for this group only using Maximum Possible Loss
     const oldExposure = this.calculateFancyExposureInMemory(oldGroup);
     const newExposure = this.calculateFancyExposureInMemory(newGroup);
 
-    // 4️⃣ Return delta (wallet will be updated by this delta ONLY)
-    return newExposure - oldExposure;
+    // 4️⃣ Return delta (isRangeConsumed is deprecated in Maximum Possible Loss model)
+    return {
+      delta: newExposure - oldExposure,
+      isRangeConsumed: false, // No longer used - Maximum Possible Loss handles all scenarios
+    };
   }
 }
 

@@ -105,6 +105,7 @@ model Bet {
   metadata     Json?
   status       BetStatus @default(PENDING)
   pnl          Float     @default(0)
+  isRangeConsumed Boolean @default(false)
   settledAt    DateTime?
   rollbackAt   DateTime?
   createdAt    DateTime  @default(now())
