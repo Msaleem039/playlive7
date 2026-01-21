@@ -456,8 +456,37 @@ export class BetsService {
     // Calculate lossAmount based on market type
     let normalizedLossAmount = 0;
 
-    // Fancy & Bookmaker keep old behavior
-    if (betGtype === 'fancy' || betGtype === 'bookmaker') {
+    // ✅ FIXED: Fancy LAY bets use loss_amount from payload if provided
+    if (betGtype === 'fancy') {
+      const upperBetType = bet_type?.toUpperCase();
+      
+      if (upperBetType === 'NO' || upperBetType === 'LAY') {
+        // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
+        const payloadLossAmount = Number(loss_amount) || 0;
+        if (payloadLossAmount > 0) {
+          normalizedLossAmount = payloadLossAmount;
+        } else {
+          // Fallback to calculated liability
+          normalizedLossAmount = this.calculateLiability(
+            gtype,
+            bet_type,
+            normalizedBetValue,
+            normalizedBetRate
+          );
+        }
+      } else {
+        // Fancy YES/BACK: Use calculated liability
+        normalizedLossAmount = this.calculateLiability(
+          gtype,
+          bet_type,
+          normalizedBetValue,
+          normalizedBetRate
+        );
+      }
+    }
+
+    // Bookmaker keeps old behavior
+    if (betGtype === 'bookmaker') {
       normalizedLossAmount = this.calculateLiability(
         gtype,
         bet_type,
@@ -633,26 +662,12 @@ export class BetsService {
           }
 
           // 🔐 STEP 6: Update wallet EXACTLY ONCE using exposureDelta
-          // ✅ MATCH ODDS WALLET RULE: balance + liability = constant (except settlement)
-          // exposureDelta > 0: Lock funds (reduce balance, increase liability)
-          // exposureDelta < 0: Release funds (increase balance, decrease liability)
-          // exposureDelta = 0: No change (perfect offset achieved)
-          let updatedBalance: number;
-          let updatedLiability: number;
+          const updatedBalance =
+            exposureDelta > 0
+              ? currentBalance - exposureDelta
+              : currentBalance + Math.abs(exposureDelta);
 
-          if (exposureDelta > 0) {
-            // Lock funds: deduct from balance, add to liability
-            updatedBalance = currentBalance - exposureDelta;
-            updatedLiability = currentLiability + exposureDelta;
-          } else if (exposureDelta < 0) {
-            // Release funds: add to balance, deduct from liability
-            updatedBalance = currentBalance + Math.abs(exposureDelta);
-            updatedLiability = currentLiability + exposureDelta; // exposureDelta is negative, so this decreases liability
-          } else {
-            // exposureDelta === 0: No wallet change (perfect offset)
-            updatedBalance = currentBalance;
-            updatedLiability = currentLiability;
-          }
+          const updatedLiability = currentLiability + exposureDelta;
 
           await tx.wallet.update({
             where: { userId },

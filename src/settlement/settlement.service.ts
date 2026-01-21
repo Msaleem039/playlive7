@@ -859,42 +859,29 @@ export class SettlementService {
             // LAY BET
             if (bet.betType?.toUpperCase() === 'LAY') {
               if (!isWinner) {
-                // ✅ LAY WIN: Profit only (lay liability), NOT stake
-                // Exchange rule: LAY WIN profit = stake * (odds - 1) = lay liability
-                // Stake is NEVER returned to wallet for LAY bets
-                const layLiabilityAmount = this.layLiability(stake, odds);
-                const payoutPerBet = layLiabilityAmount; // Profit only, not stake
+                // ✅ CLIENT RULE: LAY WIN = stake + profit
+                const profit = this.layLiability(stake, odds); // stake * (odds - 1)
+                const payoutPerBet = stake + profit;           // FULL RETURN
+
                 totalPayout += payoutPerBet;
-                
-                // ✅ LAY WIN: Release lay liability
-                this.logger.log(
-                  `[LAY WIN LIABILITY] Bet ${bet.id}: Calculating liability release. ` +
-                  `stake=${stake}, odds=${odds}, betType=LAY`,
-                );
-                
-                const totalBetLiabilityBefore = totalBetLiability;
-                totalBetLiability += layLiabilityAmount;
-                
-                this.logger.log(
-                  `[LAY WIN LIABILITY] Bet ${bet.id}: Liability calculated. ` +
-                  `layLiabilityAmount=${layLiabilityAmount}, ` +
-                  `payoutPerBet=${payoutPerBet} (profit only, NOT stake), ` +
-                  `totalBetLiability before=${totalBetLiabilityBefore}, ` +
-                  `totalBetLiability after=${totalBetLiability}`,
-                );
+
+                // ✅ Release ONLY locked liability (profit part)
+                totalBetLiability += profit;
 
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
                     status: BetStatus.WON,
                     // @ts-ignore
-                    pnl: layLiabilityAmount, // Reporting: profit = lay liability
+                    pnl: profit, // reporting only
                     settledAt: new Date(),
                     updatedAt: new Date(),
                   },
                 });
+
                 this.logger.debug(
-                  `LAY bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet} (profit), liabilityReleased: ${layLiabilityAmount}`,
+                  `LAY bet ${bet.id} WON (CLIENT MODE). stake=${stake}, odds=${odds}, ` +
+                  `profit=${profit}, payout=${payoutPerBet}, liabilityReleased=${profit}`,
                 );
               } else {
                 // LAY LOSS: 0 payout + DO NOT release liability
