@@ -167,7 +167,7 @@ export class FancyExposureService {
   private applyRangeFancyPolicyForFancy(fancyBets: any[]): number | null {
     // DEPRECATED: Range detection logic removed in favor of Maximum Possible Loss calculation
     return null;
-  }
+      }
 
   /**
    * @deprecated - Replaced by calculateFancyMaxLoss (Maximum Possible Loss model)

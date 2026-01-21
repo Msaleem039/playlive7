@@ -82,109 +82,41 @@ export class SettlementService {
   }
 
   /**
-   * ✅ DOUBLE / GOLA FANCY GROUP EVALUATOR
+   * ✅ NORMAL FANCY EVALUATOR (SINGLE BET LEVEL)
    * 
-   * Evaluates fancy bets individually or as groups (Double/Gola Fancy)
+   * Evaluates normal fancy bets only (not RANGE fancy).
+   * Each bet is evaluated independently based on actual runs vs line.
+   * 
+   * ⚠️ GROUP / DOUBLE / GOLA = COMPLETELY GONE
    * 
    * @param bets - Array of bets to evaluate
    * @param actualRuns - Actual runs scored
    * @returns Map of betId -> isWin (true if bet wins, false if loses)
    */
-  private evaluateFancyGroup(
+  private evaluateFancySingle(
     bets: Array<{
       id: string;
       betType: string | null;
       betRate: number | null;
       odds: number | null;
-      metadata: any;
     }>,
     actualRuns: number,
   ): Map<string, boolean> {
     const result = new Map<string, boolean>();
 
-    // Group bets by fancyGroupId (or bet.id for single fancy)
-    const groupMap = new Map<
-      string,
-      Array<{
-        id: string;
-        betType: string | null;
-        betRate: number | null;
-        odds: number | null;
-      }>
-    >();
-
     for (const bet of bets) {
-      const metadata = bet.metadata as any;
-      const fancyGroupId = metadata?.fancyGroupId;
-      const fancyGroupType = metadata?.fancyGroupType;
+      const line = bet.betRate ?? bet.odds ?? 0;
+      const betType = bet.betType?.toUpperCase();
 
-      // If no group metadata, treat as single fancy (use bet.id as group key)
-      const groupKey = fancyGroupId && (fancyGroupType === 'DOUBLE' || fancyGroupType === 'GOLA')
-        ? fancyGroupId
-        : bet.id;
+      const isYes = betType === 'YES' || betType === 'BACK';
+      const isNo = betType === 'NO' || betType === 'LAY';
 
-      if (!groupMap.has(groupKey)) {
-        groupMap.set(groupKey, []);
-      }
-      groupMap.get(groupKey)!.push({
-        id: bet.id,
-        betType: bet.betType,
-        betRate: bet.betRate,
-        odds: bet.odds,
-      });
-    }
+      let isWin = false;
 
-    // Evaluate each group
-    for (const [groupKey, groupBets] of groupMap.entries()) {
-      const isGroup = groupKey !== groupBets[0]?.id; // If groupKey is not a bet.id, it's a group
+      if (isNo && actualRuns < line) isWin = true;
+      if (isYes && actualRuns >= line) isWin = true;
 
-      if (!isGroup) {
-        // ✅ SINGLE FANCY: Evaluate individually (existing logic)
-        const bet = groupBets[0];
-        const line = bet.betRate ?? bet.odds ?? 0;
-        const betType = bet.betType?.toUpperCase();
-        const isYes = betType === 'YES' || betType === 'BACK';
-        const isNo = betType === 'NO' || betType === 'LAY';
-
-        let isWin = false;
-        if (isNo && actualRuns < line) {
-          isWin = true;
-        }
-        if (isYes && actualRuns >= line) {
-          isWin = true;
-        }
-
-        result.set(bet.id, isWin);
-      } else {
-        // ✅ DOUBLE / GOLA FANCY: Evaluate ALL legs together
-        // Group wins ONLY if ALL legs satisfy their condition
-        let allLegsWin = true;
-
-        for (const bet of groupBets) {
-          const line = bet.betRate ?? bet.odds ?? 0;
-          const betType = bet.betType?.toUpperCase();
-          const isYes = betType === 'YES' || betType === 'BACK';
-          const isNo = betType === 'NO' || betType === 'LAY';
-
-          let legWins = false;
-          if (isNo && actualRuns < line) {
-            legWins = true;
-          }
-          if (isYes && actualRuns >= line) {
-            legWins = true;
-          }
-
-          if (!legWins) {
-            allLegsWin = false;
-            break; // Early exit: if any leg loses, group loses
-          }
-        }
-
-        // Apply group result to ALL bets in the group
-        for (const bet of groupBets) {
-          result.set(bet.id, allLegsWin);
-        }
-      }
+      result.set(bet.id, isWin);
     }
 
     return result;
@@ -355,137 +287,182 @@ export class SettlementService {
           let balanceDelta = 0;
           let liabilityDelta = 0;
 
-          // ✅ Track credited GOLA groups to prevent over-crediting
-          const creditedGolaGroups = new Set<string>();
+          // ✅ SYSTEM-LEVEL RANGE FANCY DETECTION
+          // A settlement group is treated as RANGE FANCY when:
+          // - Multiple bets share the same settlementId (they already do in this function)
+          // - There is at least one BACK and one LAY bet in that group
+          const hasBack = userBets.some(
+            (b) => (b.betType?.toUpperCase() === 'BACK' || b.betType?.toUpperCase() === 'YES'),
+          );
+          const hasLay = userBets.some(
+            (b) => (b.betType?.toUpperCase() === 'LAY' || b.betType?.toUpperCase() === 'NO'),
+          );
+          const isRangeStyleGroup = hasBack && hasLay && userBets.length > 1;
 
-          // ✅ Evaluate fancy groups (single or double/gola) BEFORE processing bets
+          // ✅ Evaluate normal fancy bets only (for non-range-style groups)
           const winResultMap = isCancel
             ? new Map<string, boolean>() // Cancel doesn't need evaluation
-            : this.evaluateFancyGroup(userBets, actualRuns);
+            : this.evaluateFancySingle(userBets, actualRuns);
 
-          // ✅ Pre-calculate GOLA group totals to credit wallet correctly
-          const golaGroupTotals = new Map<string, { totalStake: number; totalProfit: number; betType: string }>();
-          if (!isCancel) {
-            for (const bet of userBets) {
-              const isWin = winResultMap.get(bet.id) ?? false;
-              if (isWin) {
-                const metadata = bet.metadata as any;
-                const isGola = metadata?.fancyGroupType === 'GOLA';
-                const golaGroupId = metadata?.fancyGroupId;
-                
-                if (isGola && golaGroupId) {
-                  const stake = bet.amount ?? 0;
-                  const winAmount = bet.winAmount ?? stake;
-                  const betType = bet.betType?.toUpperCase() || '';
-                  
-                  if (!golaGroupTotals.has(golaGroupId)) {
-                    golaGroupTotals.set(golaGroupId, { totalStake: 0, totalProfit: 0, betType });
-                  }
-                  
-                  const totals = golaGroupTotals.get(golaGroupId)!;
-                  totals.totalStake += stake;
-                  totals.totalProfit += winAmount;
-                }
-              }
-            }
-          }
-
-          // 3️⃣ Process each bet
-          for (const bet of userBets) {
-            // ✅ CORRECT FANCY FIELD MAPPING
-            const stake = bet.amount ?? 0; // stake amount
-            const line = bet.betRate ?? bet.odds ?? 0; // fancy line (the run value to compare against)
-            const betType = bet.betType?.toUpperCase(); // BACK / LAY or YES / NO
-            const winAmount = bet.winAmount ?? stake; // profit amount when bet wins (use winAmount if available, otherwise fallback to stake)
-            const lossAmount = bet.lossAmount ?? stake; // loss amount when bet loses
-            
-            // Determine liability amount: BACK uses stake, LAY uses lossAmount
-            const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-
-            // CANCEL: Refund the amount that was deducted (liabilityAmount)
+          // ✅ RANGE-STYLE GROUP SETTLEMENT (if detected)
+          if (isRangeStyleGroup) {
             if (isCancel) {
-              liabilityDelta -= liabilityAmount; // release the liability that was locked
-              balanceDelta += liabilityAmount; // refund the amount that was deducted
+              // CANCEL: Refund all locked liabilities for range-style group
+              let totalLiabilityRelease = 0;
+              for (const bet of userBets) {
+                const betType = bet.betType?.toUpperCase();
+                const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
+                const liabilityAmount =
+                  betType === 'LAY' || betType === 'NO' ? lossAmount : bet.amount ?? 0;
 
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.CANCELLED,
-                  // @ts-ignore
-                  pnl: 0,
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
-              continue;
-            }
+                totalLiabilityRelease += liabilityAmount;
 
-            // ✅ Get win/loss result from group evaluator (handles single fancy and double/gola fancy)
-            const isWin = winResultMap.get(bet.id) ?? false;
-            
-            // 3️⃣ Always release liability (use liabilityAmount which is lossAmount for LAY, stake for BACK)
-            liabilityDelta -= liabilityAmount;
-
-            // 4️⃣ Apply result (use winAmount/lossAmount from bet record)
-            if (isWin) {
-              // ✅ GOLA FANCY FIX: Credit wallet ONLY ONCE per group
-              const metadata = bet.metadata as any;
-              const isGola = metadata?.fancyGroupType === 'GOLA';
-              const golaGroupId = metadata?.fancyGroupId;
-
-              if (isGola && golaGroupId) {
-                // GOLA: Credit wallet ONLY ONCE per group with total stake + total profit
-                if (!creditedGolaGroups.has(golaGroupId)) {
-                  // ✅ Credit wallet for GOLA group (ONCE) with total amounts
-                  const groupTotals = golaGroupTotals.get(golaGroupId);
-                  if (groupTotals) {
-                    if (betType === 'BACK' || betType === 'YES') {
-                      balanceDelta += groupTotals.totalStake + groupTotals.totalProfit; // Return total stake + total profit for BACK/YES
-                    } else {
-                      balanceDelta += groupTotals.totalProfit; // Total profit only for LAY/NO
-                    }
-                  }
-                  creditedGolaGroups.add(golaGroupId);
-                }
-                // Other bets in the GOLA group are marked WON but don't affect wallet
-              } else {
-                // ✅ SINGLE/DOUBLE FANCY: Credit wallet per bet (existing logic)
-                if (betType === 'BACK' || betType === 'YES') {
-                  balanceDelta += stake + winAmount; // Return stake + profit for BACK/YES
-                } else {
-                  balanceDelta += winAmount; // Profit only for LAY/NO
-                }
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.CANCELLED,
+                    // @ts-ignore
+                    pnl: 0,
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
               }
 
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.WON,
-                  // @ts-ignore
-                  pnl: winAmount, // Reporting: profit = winAmount
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
+              liabilityDelta -= totalLiabilityRelease;
+              balanceDelta += totalLiabilityRelease; // Refund all locked amounts
             } else {
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.LOST,
-                  // @ts-ignore
-                  pnl: -lossAmount, // Reporting: loss amount
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
-              // 🔐 CRITICAL: NO balance change for loss
-              // ASSUMPTION: At bet placement, we MUST have done:
-              //   BACK: wallet.balance -= stake, wallet.liability += stake
-              //   LAY: wallet.balance -= lossAmount, wallet.liability += lossAmount
-              // If this assumption is false, fancy wallet math is broken.
-              // NOTE: PNL = -lossAmount for reporting, but walletImpact = 0
-              // The deducted amount (stake for BACK, lossAmount for LAY) was already locked at placement
-              // Reporting layer should expose: { pnl: -lossAmount, walletImpact: 0, liabilityReleased: liabilityAmount }
+              // Calculate net profit across all bets in the group
+              let netProfit = 0;
+              let totalLiabilityRelease = 0;
+
+              for (const bet of userBets) {
+                const betType = bet.betType?.toUpperCase();
+                const winAmount = bet.winAmount ?? bet.amount ?? 0;
+                const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
+                const liabilityAmount =
+                  betType === 'LAY' || betType === 'NO' ? lossAmount : bet.amount ?? 0;
+
+                // Always release liability for each bet
+                totalLiabilityRelease += liabilityAmount;
+
+                // Determine win/loss for this bet
+                const isWin = winResultMap.get(bet.id) ?? false;
+
+                if (isWin) {
+                  // Winning bet contributes profit
+                  netProfit += winAmount;
+                } else {
+                  // Losing bet contributes negative (loss)
+                  netProfit -= lossAmount;
+                }
+
+                // Mark bet as settled
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: isWin ? BetStatus.WON : BetStatus.LOST,
+                    // @ts-ignore
+                    pnl: isWin ? winAmount : -lossAmount,
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
+              }
+
+              // Release all liabilities
+              liabilityDelta -= totalLiabilityRelease;
+
+              // ✅ RANGE-STYLE SETTLEMENT RULE:
+              // If net profit > 0: credit wallet ONCE per settlementId
+              // If net profit <= 0: no wallet balance change
+              if (netProfit > 0) {
+                balanceDelta += netProfit;
+              }
+              // If netProfit <= 0, balanceDelta remains 0 (no wallet change)
+            }
+
+            // Skip per-bet processing for range-style groups
+            // Wallet update will happen once per user below
+          } else {
+            // ✅ NORMAL FANCY SETTLEMENT (per-bet processing)
+            // 3️⃣ Process each bet
+            for (const bet of userBets) {
+              // ✅ CORRECT FANCY FIELD MAPPING
+              const stake = bet.amount ?? 0; // stake amount
+              const betType = bet.betType?.toUpperCase(); // BACK / LAY or YES / NO
+              const winAmount = bet.winAmount ?? stake; // profit amount when bet wins
+              const lossAmount = bet.lossAmount ?? stake; // loss amount when bet loses
+              
+              // Determine liability amount: BACK uses stake, LAY uses lossAmount
+              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+
+              // 🔁 CANCEL: Refund the amount that was deducted (liabilityAmount)
+              if (isCancel) {
+                liabilityDelta -= liabilityAmount; // release the liability that was locked
+                balanceDelta += liabilityAmount; // refund the amount that was deducted
+
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.CANCELLED,
+                    // @ts-ignore
+                    pnl: 0,
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
+                continue;
+              }
+
+              /* =========================================
+                 ✅ NORMAL FANCY — EXISTING LOGIC
+                 ========================================= */
+
+              const isWin = winResultMap.get(bet.id) ?? false;
+
+              // Always release liability
+              liabilityDelta -= liabilityAmount;
+
+              if (isWin) {
+                if (betType === 'BACK' || betType === 'YES') {
+                  // BACK/YES WIN: return stake + profit
+                  balanceDelta += stake + winAmount;
+                } else {
+                  // LAY/NO WIN: return locked stake (lossAmount) + profit
+                  balanceDelta += lossAmount + winAmount;
+                }
+
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.WON,
+                    // @ts-ignore
+                    pnl: winAmount, // Reporting: profit = winAmount
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
+              } else {
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.LOST,
+                    // @ts-ignore
+                    pnl: -lossAmount, // Reporting: loss amount
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
+                // 🔐 CRITICAL: NO balance change for loss
+                // ASSUMPTION: At bet placement, we MUST have done:
+                //   BACK: wallet.balance -= stake, wallet.liability += stake
+                //   LAY: wallet.balance -= lossAmount, wallet.liability += lossAmount
+                // If this assumption is false, fancy wallet math is broken.
+                // NOTE: PNL = -lossAmount for reporting, but walletImpact = 0
+                // The deducted amount (stake for BACK, lossAmount for LAY) was already locked at placement
+                // Reporting layer should expose: { pnl: -lossAmount, walletImpact: 0, liabilityReleased: liabilityAmount }
+              }
             }
           }
 
@@ -696,6 +673,37 @@ export class SettlementService {
             continue;
           }
 
+          // ✅ OFFSET DETECTION: Find BACK + LAY pairs with same marketId, selectionId, betValue
+          // OFFSET bets are already neutralized at bet placement, so settlement must skip them
+          const offsetBetIds = new Set<string>();
+          const betMap = new Map<string, { back?: any; lay?: any }>();
+
+          for (const bet of userBets) {
+            const betKey = `${bet.marketId}_${bet.selectionId}_${bet.betValue ?? bet.amount ?? 0}`;
+            if (!betMap.has(betKey)) {
+              betMap.set(betKey, {});
+            }
+            const pair = betMap.get(betKey)!;
+            const betType = bet.betType?.toUpperCase();
+            if (betType === 'BACK') {
+              pair.back = bet;
+            } else if (betType === 'LAY') {
+              pair.lay = bet;
+            }
+          }
+
+          // Mark OFFSET pairs (both BACK and LAY exist with same key)
+          for (const [key, pair] of betMap.entries()) {
+            if (pair.back && pair.lay) {
+              offsetBetIds.add(pair.back.id);
+              offsetBetIds.add(pair.lay.id);
+              this.logger.debug(
+                `OFFSET detected: BACK bet ${pair.back.id} + LAY bet ${pair.lay.id} ` +
+                `(marketId: ${pair.back.marketId}, selectionId: ${pair.back.selectionId}, betValue: ${pair.back.betValue ?? pair.back.amount})`,
+              );
+            }
+          }
+
           // 🔐 SIMPLE SETTLEMENT: Calculate payout per bet and sum
           // Settlement is FINAL PAYOUT ONLY - no adjustments, no complex calculations
           // 
@@ -705,6 +713,7 @@ export class SettlementService {
           //   LAY WIN   → stake
           //   LAY LOSS  → 0
           //   CANCEL    → stake
+          //   OFFSET    → 0 (skip all calculations)
           let totalPayout = 0; // Total amount to add to wallet.balance
           let totalBetLiability = 0; // Total liability to release from wallet.liability
 
@@ -713,15 +722,42 @@ export class SettlementService {
             const stake = bet.betValue ?? bet.amount ?? 0;
             const odds = bet.betRate ?? bet.odds ?? 0;
             const betType = bet.betType?.toUpperCase() || '';
+            
+            this.logger.log(
+              `[BET PROCESSING] Bet ${bet.id}: ` +
+              `betType=${betType}, stake=${stake}, odds=${odds}, ` +
+              `isOffset=${offsetBetIds.has(bet.id)}, ` +
+              `totalPayout=${totalPayout}, totalBetLiability=${totalBetLiability}`,
+            );
+            
+            // ✅ OFFSET: Skip all calculations for OFFSET bets
+            if (offsetBetIds.has(bet.id)) {
+              // Mark as CANCELLED but skip payout/liability
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.CANCELLED,
+                  // @ts-ignore
+                  pnl: 0,
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+              this.logger.log(
+                `[OFFSET SKIP] Bet ${bet.id} skipped from settlement calculations. ` +
+                `Marked as CANCELLED with pnl=0. No wallet changes.`,
+              );
+              continue; // Skip all payout/liability calculations
+            }
 
             // Calculate bet liability (for liability release only, not for payout)
-            let betLiability = 0;
-            if (betType === 'BACK') {
-              betLiability = stake;
-            } else if (betType === 'LAY') {
-              betLiability = this.layLiability(stake, odds);
-            }
-            totalBetLiability += betLiability;
+            // let betLiability = 0;
+            // if (betType === 'BACK') {
+            //   betLiability = stake;
+            // } else if (betType === 'LAY') {
+            //   betLiability = this.layLiability(stake, odds);
+            // }
+            // totalBetLiability += betLiability;
 
             // CANCEL/TIE: Refund stake
             if (isCancel) {
@@ -777,6 +813,9 @@ export class SettlementService {
 
             // BACK BET
             if (bet.betType?.toUpperCase() === 'BACK') {
+              // ✅ BACK: Always release stake liability (both WIN and LOSS)
+              totalBetLiability += stake;
+              
               if (isWinner) {
                 // BACK WIN: stake + (stake * (odds - 1)) = stake * odds
                 const payoutPerBet = stake * odds;
@@ -820,28 +859,49 @@ export class SettlementService {
             // LAY BET
             if (bet.betType?.toUpperCase() === 'LAY') {
               if (!isWinner) {
-                // LAY WIN: stake payout
-                const payoutPerBet = stake;
+                // ✅ LAY WIN: Profit only (lay liability), NOT stake
+                // Exchange rule: LAY WIN profit = stake * (odds - 1) = lay liability
+                // Stake is NEVER returned to wallet for LAY bets
+                const layLiabilityAmount = this.layLiability(stake, odds);
+                const payoutPerBet = layLiabilityAmount; // Profit only, not stake
                 totalPayout += payoutPerBet;
+                
+                // ✅ LAY WIN: Release lay liability
+                this.logger.log(
+                  `[LAY WIN LIABILITY] Bet ${bet.id}: Calculating liability release. ` +
+                  `stake=${stake}, odds=${odds}, betType=LAY`,
+                );
+                
+                const totalBetLiabilityBefore = totalBetLiability;
+                totalBetLiability += layLiabilityAmount;
+                
+                this.logger.log(
+                  `[LAY WIN LIABILITY] Bet ${bet.id}: Liability calculated. ` +
+                  `layLiabilityAmount=${layLiabilityAmount}, ` +
+                  `payoutPerBet=${payoutPerBet} (profit only, NOT stake), ` +
+                  `totalBetLiability before=${totalBetLiabilityBefore}, ` +
+                  `totalBetLiability after=${totalBetLiability}`,
+                );
 
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
                     status: BetStatus.WON,
                     // @ts-ignore
-                    pnl: stake, // Reporting: profit
+                    pnl: layLiabilityAmount, // Reporting: profit = lay liability
                     settledAt: new Date(),
                     updatedAt: new Date(),
                   },
                 });
                 this.logger.debug(
-                  `LAY bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}`,
+                  `LAY bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet} (profit), liabilityReleased: ${layLiabilityAmount}`,
                 );
               } else {
-                // LAY LOSS: 0 payout
+                // LAY LOSS: 0 payout + DO NOT release liability
                 const payoutPerBet = 0;
                 totalPayout += payoutPerBet;
                 const liab = this.layLiability(stake, odds); // For reporting only
+                // ✅ LAY LOSS: Liability remains locked (do NOT add to totalBetLiability)
 
                 await tx.bet.update({
                   where: { id: bet.id },
@@ -854,7 +914,7 @@ export class SettlementService {
                   },
                 });
                 this.logger.debug(
-                  `LAY bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}`,
+                  `LAY bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}, liabilityRemains: ${liab}`,
                 );
               }
             }
@@ -869,6 +929,14 @@ export class SettlementService {
           const currentLiability = wallet.liability ?? 0;
           const newLiability = Math.max(0, currentLiability - totalBetLiability);
 
+          // 🔍 DETAILED LOGGING: Track liability release for debugging
+          this.logger.log(
+            `[WALLET UPDATE] User ${userId}: ` +
+            `currentBalance=${wallet.balance}, totalPayout=${totalPayout}, newBalance=${wallet.balance + totalPayout}, ` +
+            `currentLiability=${currentLiability}, totalBetLiability=${totalBetLiability}, newLiability=${newLiability}, ` +
+            `betsCount=${userBets.length}`,
+          );
+
           if (totalPayout !== 0 || totalBetLiability !== 0) {
             await tx.wallet.update({
               where: { userId },
@@ -877,6 +945,12 @@ export class SettlementService {
                 liability: newLiability, // Release liability (clamped to prevent negative)
               },
             });
+            
+            this.logger.log(
+              `[WALLET UPDATED] User ${userId}: ` +
+              `balance: ${wallet.balance} → ${wallet.balance + totalPayout}, ` +
+              `liability: ${currentLiability} → ${newLiability} (released ${totalBetLiability})`,
+            );
 
             // Create transaction record (only if payout > 0)
             if (totalPayout > 0) {

@@ -633,12 +633,26 @@ export class BetsService {
           }
 
           // 🔐 STEP 6: Update wallet EXACTLY ONCE using exposureDelta
-          const updatedBalance =
-            exposureDelta > 0
-              ? currentBalance - exposureDelta
-              : currentBalance + Math.abs(exposureDelta);
+          // ✅ MATCH ODDS WALLET RULE: balance + liability = constant (except settlement)
+          // exposureDelta > 0: Lock funds (reduce balance, increase liability)
+          // exposureDelta < 0: Release funds (increase balance, decrease liability)
+          // exposureDelta = 0: No change (perfect offset achieved)
+          let updatedBalance: number;
+          let updatedLiability: number;
 
-          const updatedLiability = currentLiability + exposureDelta;
+          if (exposureDelta > 0) {
+            // Lock funds: deduct from balance, add to liability
+            updatedBalance = currentBalance - exposureDelta;
+            updatedLiability = currentLiability + exposureDelta;
+          } else if (exposureDelta < 0) {
+            // Release funds: add to balance, deduct from liability
+            updatedBalance = currentBalance + Math.abs(exposureDelta);
+            updatedLiability = currentLiability + exposureDelta; // exposureDelta is negative, so this decreases liability
+          } else {
+            // exposureDelta === 0: No wallet change (perfect offset)
+            updatedBalance = currentBalance;
+            updatedLiability = currentLiability;
+          }
 
           await tx.wallet.update({
             where: { userId },
