@@ -332,7 +332,43 @@ export class BetsService {
       );
     }
   }
-
+  private calculateMatchOddsSelectionOffset(
+    existingBets: any[],
+    newBet: any,
+  ): number {
+    const sameSelectionOppositeBets = existingBets.filter(bet =>
+      bet.marketId === newBet.marketId &&
+      bet.selectionId === newBet.selectionId &&
+      bet.betType?.toUpperCase() !== newBet.betType?.toUpperCase() &&
+      (bet.gtype === 'matchodds' || bet.gtype === 'match')
+    );
+  
+    if (!sameSelectionOppositeBets.length) {
+      return 0; // ❌ No offset possible
+    }
+  
+    let remainingStake = newBet.betValue;
+    let releasedLiability = 0;
+  
+    for (const bet of sameSelectionOppositeBets) {
+      if (remainingStake <= 0) break;
+  
+      const offsetQty = Math.min(bet.betValue, remainingStake);
+  
+      // BACK releases stake, LAY releases (odds-1)*stake
+      const betLiability =
+        bet.betType === 'BACK'
+          ? offsetQty
+          : (bet.betRate - 1) * offsetQty;
+  
+      releasedLiability += betLiability;
+      remainingStake -= offsetQty;
+    }
+  
+    // 🔥 NEGATIVE means liability release
+    return -releasedLiability;
+  }
+  
 
   async placeBet(input: PlaceBetDto) {
     const debug: Record<string, unknown> = {};
@@ -609,11 +645,20 @@ export class BetsService {
           let bookmakerDelta = 0;
 
           if (actualMarketType === 'matchodds') {
-            // ✅ MATCH ODDS OFFSET (BACK ↔ LAY both directions)
-            matchOddsDelta = this.matchOddsExposureService.calculateMatchOddsExposureDelta(
-              allPendingBets,
-              newBet,
-            );
+            // 1️⃣ Try HARD OFFSET first (selection based)
+            const selectionOffsetDelta =
+              this.calculateMatchOddsSelectionOffset(allPendingBets, newBet);
+
+            if (selectionOffsetDelta !== 0) {
+              matchOddsDelta = selectionOffsetDelta;
+            } else {
+              // 2️⃣ Fallback to exposure delta (only if no cancel)
+              matchOddsDelta =
+                this.matchOddsExposureService.calculateMatchOddsExposureDelta(
+                  allPendingBets,
+                  newBet,
+                );
+            }
           } else if (actualMarketType === 'fancy') {
             // ✅ FANCY DELTA using Maximum Possible Loss model
             // Use calculateFancyGroupDeltaSafe to isolate by group (marketId + selectionId)
@@ -789,35 +834,68 @@ export class BetsService {
 
         // ✅ MARKET ISOLATION: Use market-specific position functions
         if (transactionResult.marketType === 'matchodds' || transactionResult.marketType === 'match') {
-          // Calculate Match Odds position (isolated)
-          const matchOddsPosition = calculateMatchOddsPosition(pendingBets as Bet[], marketId);
-          if (matchOddsPosition) {
-            // Convert to backward-compatible format
-            for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
-              positions[selectionId] = {
-                win: position.profit,
-                lose: position.loss,
-              };
-            }
-            this.logger.debug(
-              `Match Odds position calculated: ${JSON.stringify(positions)}`,
+          // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
+          // For now, derive minimal set from bets as fallback
+          const marketSelections = Array.from(
+            new Set(
+              pendingBets
+                .map((bet) => bet.selectionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+                .map((id) => String(id))
+            )
+          );
+          
+          if (marketSelections.length > 0) {
+            const matchOddsPosition = calculateMatchOddsPosition(
+              pendingBets as Bet[],
+              marketId,
+              marketSelections,
             );
+            if (matchOddsPosition) {
+              // Convert to backward-compatible format (net -> win/lose)
+              for (const [selectionId, runner] of Object.entries(matchOddsPosition.runners)) {
+                const net = runner.net;
+                positions[selectionId] = {
+                  win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+                  lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+                };
+              }
+              this.logger.debug(
+                `Match Odds position calculated: ${JSON.stringify(positions)}`,
+              );
+            }
           }
         } else if (transactionResult.marketType === 'bookmaker') {
-          // Calculate Bookmaker position (isolated)
-          const bookmakerPosition = calculateBookmakerPosition(pendingBets as Bet[], marketId);
-          if (bookmakerPosition) {
-            // Convert to backward-compatible format
-            // Bookmaker position now returns { profit, loss } per selection
-            for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
-              positions[selectionId] = {
-                win: position.profit,
-                lose: position.loss,
-              };
-            }
-            this.logger.debug(
-              `Bookmaker position calculated: ${JSON.stringify(positions)}`,
+          // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
+          // For now, derive minimal set from bets as fallback
+          const marketSelections = Array.from(
+            new Set(
+              pendingBets
+                .map((bet) => bet.selectionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+                .map((id) => String(id))
+            )
+          );
+          
+          if (marketSelections.length > 0) {
+            const bookmakerPosition = calculateBookmakerPosition(
+              pendingBets as Bet[],
+              marketId,
+              marketSelections,
             );
+            if (bookmakerPosition) {
+              // Convert to backward-compatible format (net -> win/lose)
+              for (const [selectionId, runner] of Object.entries(bookmakerPosition.runners)) {
+                const net = runner.net;
+                positions[selectionId] = {
+                  win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+                  lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+                };
+              }
+              this.logger.debug(
+                `Bookmaker position calculated: ${JSON.stringify(positions)}`,
+              );
+            }
           }
         } else if (transactionResult.marketType === 'fancy') {
           // Calculate Fancy position (isolated)
@@ -1034,27 +1112,62 @@ export class BetsService {
     let authoritativePositions: Record<string, { win: number; lose: number }> = {};
 
     if (betGtype === 'matchodds' || betGtype === 'match') {
-      // Match Odds position
-      const matchOddsPosition = calculateMatchOddsPosition(pendingBets, bet.marketId);
-      if (matchOddsPosition) {
-        for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
-          authoritativePositions[selectionId] = {
-            win: position.profit,
-            lose: position.loss,
-          };
+      // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
+      // For now, derive minimal set from bets as fallback
+      const marketSelections = Array.from(
+        new Set(
+          pendingBets
+            .map((b) => b.selectionId)
+            .filter((id): id is number => id !== null && id !== undefined)
+            .map((id) => String(id))
+        )
+      );
+      
+      if (marketSelections.length > 0) {
+        const matchOddsPosition = calculateMatchOddsPosition(
+          pendingBets,
+          bet.marketId,
+          marketSelections,
+        );
+        if (matchOddsPosition) {
+          // Convert net position to backward-compatible win/lose format
+          for (const [selectionId, runner] of Object.entries(matchOddsPosition.runners)) {
+            const net = runner.net;
+            authoritativePositions[selectionId] = {
+              win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+              lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+            };
+          }
         }
       }
     } else if (betGtype === 'bookmaker' || 
                (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds')) {
-      // Bookmaker position
-      const bookmakerPosition = calculateBookmakerPosition(pendingBets, bet.marketId);
-      if (bookmakerPosition) {
-        // Bookmaker position now returns { profit, loss } per selection
-        for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
-          authoritativePositions[selectionId] = {
-            win: position.profit,
-            lose: position.loss,
-          };
+      // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
+      // For now, derive minimal set from bets as fallback
+      const marketSelections = Array.from(
+        new Set(
+          pendingBets
+            .map((b) => b.selectionId)
+            .filter((id): id is number => id !== null && id !== undefined)
+            .map((id) => String(id))
+        )
+      );
+      
+      if (marketSelections.length > 0) {
+        const bookmakerPosition = calculateBookmakerPosition(
+          pendingBets,
+          bet.marketId,
+          marketSelections,
+        );
+        if (bookmakerPosition) {
+          // Convert net position to backward-compatible win/lose format
+          for (const [selectionId, runner] of Object.entries(bookmakerPosition.runners)) {
+            const net = runner.net;
+            authoritativePositions[selectionId] = {
+              win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+              lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+            };
+          }
         }
       }
     } else {
@@ -1098,27 +1211,42 @@ export class BetsService {
     let authoritativePositions: Record<string, { win: number; lose: number }> = {};
 
     if (firstBetGtype === 'matchodds' || firstBetGtype === 'match') {
-      // Match Odds position (isolated)
-      const matchOddsPosition = calculateMatchOddsPosition(pendingBets, marketId);
-      if (matchOddsPosition) {
-        for (const [selectionId, position] of Object.entries(matchOddsPosition.positions)) {
-          authoritativePositions[selectionId] = {
-            win: position.profit,
-            lose: position.loss,
-          };
+      // ✅ Use provided marketSelections (from market source)
+      if (marketSelections && marketSelections.length > 0) {
+        const matchOddsPosition = calculateMatchOddsPosition(
+          pendingBets,
+          marketId,
+          marketSelections,
+        );
+        if (matchOddsPosition) {
+          // Convert net position to backward-compatible win/lose format
+          for (const [selectionId, runner] of Object.entries(matchOddsPosition.runners)) {
+            const net = runner.net;
+            authoritativePositions[selectionId] = {
+              win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+              lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+            };
+          }
         }
       }
     } else if (firstBetGtype === 'bookmaker' || 
                (firstBetGtype.startsWith('match') && firstBetGtype !== 'match' && firstBetGtype !== 'matchodds')) {
-      // Bookmaker position (isolated)
-      const bookmakerPosition = calculateBookmakerPosition(pendingBets, marketId);
-      if (bookmakerPosition) {
-        // Bookmaker position now returns { profit, loss } per selection
-        for (const [selectionId, position] of Object.entries(bookmakerPosition.positions)) {
-          authoritativePositions[selectionId] = {
-            win: position.profit,
-            lose: position.loss,
-          };
+      // ✅ Use provided marketSelections (from market source)
+      if (marketSelections && marketSelections.length > 0) {
+        const bookmakerPosition = calculateBookmakerPosition(
+          pendingBets,
+          marketId,
+          marketSelections,
+        );
+        if (bookmakerPosition) {
+          // Convert net position to backward-compatible win/lose format
+          for (const [selectionId, runner] of Object.entries(bookmakerPosition.runners)) {
+            const net = runner.net;
+            authoritativePositions[selectionId] = {
+              win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
+              lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
+            };
+          }
         }
       }
     } else if (firstBetGtype === 'fancy') {

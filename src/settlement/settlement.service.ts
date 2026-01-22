@@ -105,18 +105,18 @@ export class SettlementService {
     const result = new Map<string, boolean>();
 
     for (const bet of bets) {
-      const line = bet.betRate ?? bet.odds ?? 0;
-      const betType = bet.betType?.toUpperCase();
+        const line = bet.betRate ?? bet.odds ?? 0;
+        const betType = bet.betType?.toUpperCase();
 
-      const isYes = betType === 'YES' || betType === 'BACK';
-      const isNo = betType === 'NO' || betType === 'LAY';
+        const isYes = betType === 'YES' || betType === 'BACK';
+        const isNo = betType === 'NO' || betType === 'LAY';
 
-      let isWin = false;
+        let isWin = false;
 
       if (isNo && actualRuns < line) isWin = true;
       if (isYes && actualRuns >= line) isWin = true;
 
-      result.set(bet.id, isWin);
+        result.set(bet.id, isWin);
     }
 
     return result;
@@ -309,7 +309,7 @@ export class SettlementService {
             if (isCancel) {
               // CANCEL: Refund all locked liabilities for range-style group
               let totalLiabilityRelease = 0;
-              for (const bet of userBets) {
+            for (const bet of userBets) {
                 const betType = bet.betType?.toUpperCase();
                 const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
                 const liabilityAmount =
@@ -368,8 +368,8 @@ export class SettlementService {
                     updatedAt: new Date(),
                   },
                 });
-              }
-
+                  }
+                  
               // Release all liabilities
               liabilityDelta -= totalLiabilityRelease;
 
@@ -386,82 +386,82 @@ export class SettlementService {
             // Wallet update will happen once per user below
           } else {
             // ✅ NORMAL FANCY SETTLEMENT (per-bet processing)
-            // 3️⃣ Process each bet
-            for (const bet of userBets) {
-              // ✅ CORRECT FANCY FIELD MAPPING
-              const stake = bet.amount ?? 0; // stake amount
-              const betType = bet.betType?.toUpperCase(); // BACK / LAY or YES / NO
+          // 3️⃣ Process each bet
+          for (const bet of userBets) {
+            // ✅ CORRECT FANCY FIELD MAPPING
+            const stake = bet.amount ?? 0; // stake amount
+            const betType = bet.betType?.toUpperCase(); // BACK / LAY or YES / NO
               const winAmount = bet.winAmount ?? stake; // profit amount when bet wins
-              const lossAmount = bet.lossAmount ?? stake; // loss amount when bet loses
-              
-              // Determine liability amount: BACK uses stake, LAY uses lossAmount
-              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+            const lossAmount = bet.lossAmount ?? stake; // loss amount when bet loses
+            
+            // Determine liability amount: BACK uses stake, LAY uses lossAmount
+            const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
 
               // 🔁 CANCEL: Refund the amount that was deducted (liabilityAmount)
-              if (isCancel) {
-                liabilityDelta -= liabilityAmount; // release the liability that was locked
-                balanceDelta += liabilityAmount; // refund the amount that was deducted
+            if (isCancel) {
+              liabilityDelta -= liabilityAmount; // release the liability that was locked
+              balanceDelta += liabilityAmount; // refund the amount that was deducted
 
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.CANCELLED,
-                    // @ts-ignore
-                    pnl: 0,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-                continue;
-              }
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.CANCELLED,
+                  // @ts-ignore
+                  pnl: 0,
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+              continue;
+            }
 
               /* =========================================
                  ✅ NORMAL FANCY — EXISTING LOGIC
                  ========================================= */
 
-              const isWin = winResultMap.get(bet.id) ?? false;
-
+            const isWin = winResultMap.get(bet.id) ?? false;
+            
               // Always release liability
-              liabilityDelta -= liabilityAmount;
+            liabilityDelta -= liabilityAmount;
 
-              if (isWin) {
-                if (betType === 'BACK' || betType === 'YES') {
+            if (isWin) {
+                    if (betType === 'BACK' || betType === 'YES') {
                   // BACK/YES WIN: return stake + profit
                   balanceDelta += stake + winAmount;
-                } else {
+                    } else {
                   // LAY/NO WIN: return locked stake (lossAmount) + profit
                   balanceDelta += lossAmount + winAmount;
-                }
+              }
 
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    // @ts-ignore
-                    pnl: winAmount, // Reporting: profit = winAmount
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-              } else {
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: -lossAmount, // Reporting: loss amount
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-                // 🔐 CRITICAL: NO balance change for loss
-                // ASSUMPTION: At bet placement, we MUST have done:
-                //   BACK: wallet.balance -= stake, wallet.liability += stake
-                //   LAY: wallet.balance -= lossAmount, wallet.liability += lossAmount
-                // If this assumption is false, fancy wallet math is broken.
-                // NOTE: PNL = -lossAmount for reporting, but walletImpact = 0
-                // The deducted amount (stake for BACK, lossAmount for LAY) was already locked at placement
-                // Reporting layer should expose: { pnl: -lossAmount, walletImpact: 0, liabilityReleased: liabilityAmount }
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.WON,
+                  // @ts-ignore
+                  pnl: winAmount, // Reporting: profit = winAmount
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+            } else {
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.LOST,
+                  // @ts-ignore
+                  pnl: -lossAmount, // Reporting: loss amount
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              });
+              // 🔐 CRITICAL: NO balance change for loss
+              // ASSUMPTION: At bet placement, we MUST have done:
+              //   BACK: wallet.balance -= stake, wallet.liability += stake
+              //   LAY: wallet.balance -= lossAmount, wallet.liability += lossAmount
+              // If this assumption is false, fancy wallet math is broken.
+              // NOTE: PNL = -lossAmount for reporting, but walletImpact = 0
+              // The deducted amount (stake for BACK, lossAmount for LAY) was already locked at placement
+              // Reporting layer should expose: { pnl: -lossAmount, walletImpact: 0, liabilityReleased: liabilityAmount }
               }
             }
           }
@@ -722,7 +722,7 @@ export class SettlementService {
             const stake = bet.betValue ?? bet.amount ?? 0;
             const odds = bet.betRate ?? bet.odds ?? 0;
             const betType = bet.betType?.toUpperCase() || '';
-            
+
             this.logger.log(
               `[BET PROCESSING] Bet ${bet.id}: ` +
               `betType=${betType}, stake=${stake}, odds=${odds}, ` +

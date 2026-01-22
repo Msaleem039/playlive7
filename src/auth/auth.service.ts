@@ -20,11 +20,27 @@ export class AuthService {
   async login(loginDto: LoginDto): Promise<AuthResponseDto> {
     const { username, password } = loginDto;
 
-    // Try to find user by username first, then by email
-    let user = await this.usersService.findByUsername(username);
+    // ✅ Case-insensitive username/email lookup
+    // Try to find user by username first (case-insensitive), then by email
+    let user = await this.prisma.user.findFirst({
+      where: {
+        username: {
+          equals: username,
+          mode: 'insensitive', // Case-insensitive search
+        },
+      },
+    });
+    
     if (!user) {
-      // If not found by username, try email
-      user = await this.usersService.findByEmail(username);
+      // If not found by username, try email (case-insensitive)
+      user = await this.prisma.user.findFirst({
+        where: {
+          email: {
+            equals: username,
+            mode: 'insensitive', // Case-insensitive search
+          },
+        },
+      });
     }
     
     if (!user) {
@@ -148,15 +164,29 @@ export class AuthService {
         throw new ConflictException('Username is required');
       }
       
-      // Check if user already exists by username
-      const existingUserByUsername = await this.usersService.findByUsername(username);
+      // ✅ Case-insensitive username check: prevent "John" and "john" from both existing
+      const existingUserByUsername = await this.prisma.user.findFirst({
+        where: {
+          username: {
+            equals: username,
+            mode: 'insensitive', // Case-insensitive search
+          },
+        },
+      });
       if (existingUserByUsername) {
-        throw new ConflictException('User with this username already exists');
+        throw new ConflictException('User with this username already exists (case-insensitive check)');
       }
       
-      // Check if email is provided and if user exists by email
+      // Check if email is provided and if user exists by email (case-insensitive)
       if (email) {
-        const existingUserByEmail = await this.usersService.findByEmail(email);
+        const existingUserByEmail = await this.prisma.user.findFirst({
+          where: {
+            email: {
+              equals: email,
+              mode: 'insensitive', // Case-insensitive search
+            },
+          },
+        });
         if (existingUserByEmail) {
           throw new ConflictException('User with this email already exists');
         }
@@ -189,6 +219,8 @@ export class AuthService {
             }
           }
         }
+        
+
         
         user = await this.usersService.create({
           name,

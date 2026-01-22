@@ -16,38 +16,79 @@ export class MatchOddsExposureService {
    * @param bets - Array of Match Odds bets
    * @returns Map of selectionId to { win: number, lose: number }
    */
-  private buildMatchOddsPositions(bets: any[]): Map<number, { win: number; lose: number }> {
-    const map = new Map<number, { win: number; lose: number }>();
+  // private buildMatchOddsPositions(bets: any[]): Map<number, { win: number; lose: number }> {
+  //   const map = new Map<number, { win: number; lose: number }>();
 
+  //   for (const bet of bets) {
+  //     const selectionId = Number(bet.selectionId ?? bet.selection_id);
+  //     if (!selectionId) continue;
+
+  //     const stake = Number(bet.betValue ?? bet.betvalue ?? bet.amount ?? 0);
+  //     const odds = Number(bet.betRate ?? bet.bet_rate ?? bet.odds ?? 0);
+  //     const type = String(bet.betType ?? bet.bet_type ?? '').toUpperCase();
+
+  //     if (!map.has(selectionId)) {
+  //       map.set(selectionId, { win: 0, lose: 0 });
+  //     }
+
+  //     const pos = map.get(selectionId)!;
+  //     const profit = (odds - 1) * stake;
+
+  //     if (type === 'BACK') {
+  //       pos.win += profit; // if wins
+  //       pos.lose -= stake; // if loses
+  //     }
+
+  //     if (type === 'LAY') {
+  //       pos.win -= profit; // if wins (liability)
+  //       pos.lose += stake; // if loses (stake kept)
+  //     }
+  //   }
+
+  //   return map;
+  // }
+  private buildMatchOddsPositions(
+    bets: any[],
+  ): Map<string, { win: number; lose: number }> {
+    const map = new Map<string, { win: number; lose: number }>();
+  
     for (const bet of bets) {
-      const selectionId = Number(bet.selectionId ?? bet.selection_id);
-      if (!selectionId) continue;
-
+      /**
+       * 🔐 CRITICAL FIX:
+       * Match Odds exposure must NOT rely on raw selectionId
+       * Use a stable internal runnerKey per outcome
+       */
+      const runnerKey =
+        bet.runnerKey ??
+        `${bet.marketId}_${bet.selectionId ?? bet.selection_id}`;
+  
+      if (!runnerKey) continue;
+  
       const stake = Number(bet.betValue ?? bet.betvalue ?? bet.amount ?? 0);
       const odds = Number(bet.betRate ?? bet.bet_rate ?? bet.odds ?? 0);
       const type = String(bet.betType ?? bet.bet_type ?? '').toUpperCase();
-
-      if (!map.has(selectionId)) {
-        map.set(selectionId, { win: 0, lose: 0 });
+  
+      if (!map.has(runnerKey)) {
+        map.set(runnerKey, { win: 0, lose: 0 });
       }
-
-      const pos = map.get(selectionId)!;
+  
+      const pos = map.get(runnerKey)!;
       const profit = (odds - 1) * stake;
-
+  
       if (type === 'BACK') {
-        pos.win += profit; // if wins
-        pos.lose -= stake; // if loses
+        pos.win += profit;
+        pos.lose -= stake;
       }
-
+  
       if (type === 'LAY') {
-        pos.win -= profit; // if wins (liability)
-        pos.lose += stake; // if loses (stake kept)
+        pos.win -= profit;
+        pos.lose += stake;
       }
     }
-
+  
     return map;
   }
-
+  
   /**
    * Calculate Match Odds exposure in memory (no database queries)
    * 

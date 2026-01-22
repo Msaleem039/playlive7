@@ -44,11 +44,14 @@ export type BetForPosition = Pick<
 >;
 
 /**
- * Match Odds Position Result
+ * Match Odds Position Result (Exchange Standard)
+ * 
+ * Returns NET P/L if each runner wins.
+ * Values can be positive (profit) or negative (loss).
  */
 export interface MatchOddsPosition {
   marketId: string;
-  positions: Record<string, { profit: number; loss: number }>;
+  runners: Record<string, { net: number }>; // selectionId -> { net P/L if this runner wins }
 }
 
 /**
@@ -64,95 +67,90 @@ export interface FancyPosition {
 }
 
 /**
- * Bookmaker Position Result
+ * Bookmaker Position Result (Exchange Standard)
+ * 
+ * Returns NET P/L if each runner wins.
+ * Values can be positive (profit) or negative (loss).
  */
 export interface BookmakerPosition {
   marketId: string;
-  positions: Record<string, { profit: number; loss: number }>; // selectionId -> { profit, loss }
+  runners: Record<string, { net: number }>; // selectionId -> { net P/L if this runner wins }
 }
 
 /**
  * Complete Position Result
+ * 
+ * Supports multiple Match Odds and Bookmaker markets.
  */
 export interface AllPositions {
-  matchOdds?: MatchOddsPosition;
+  matchOdds?: MatchOddsPosition[]; // Array to support multiple Match Odds markets
   fancy?: FancyPosition[];
-  bookmaker?: BookmakerPosition;
+  bookmaker?: BookmakerPosition[]; // Array to support multiple Bookmaker markets
 }
 
 /**
- * ✅ PURE FUNCTION: Calculate Match Odds Position
+ * ✅ PURE FUNCTION: Calculate Match Odds Position (Exchange Standard)
  * 
- * Match Odds Position Rules:
- * - Aggregates ONLY bets with gtype='matchodds' or gtype='match'
- * - Position per selection: { profit, loss }
- *   - profit: Total P/L if this selection WINS (aggregates all bets)
- *   - loss: Same as profit (UI compatibility - represents P/L for this outcome)
+ * Exchange Standard Definition:
+ * - For EACH runner in the market, calculate NET P/L **IF THAT RUNNER WINS**
+ * - Return ONE value per runner (NOT profit + loss separately)
+ * - Values can be POSITIVE (profit) or NEGATIVE (loss)
+ * - MUST include ALL runners, even if they have no direct bets
  * 
- * Exchange-standard calculation:
- * - For each outcome: Calculate total P/L if that outcome wins
- * - BACK bet on winning selection: + (odds - 1) * stake
- * - BACK bet on losing selection: - stake
- * - LAY bet on winning selection: - (odds - 1) * stake
- * - LAY bet on losing selection: + stake
+ * Formula per bet:
+ * BACK bet:
+ *   - If selected runner wins  → +(odds - 1) * stake
+ *   - If selected runner loses → -stake
+ * 
+ * LAY bet:
+ *   - If selected runner wins  → -(odds - 1) * stake
+ *   - If selected runner loses → +stake
+ * 
+ * For every runner:
+ * - Sum impact of ALL bets (including opposite-runner effects)
+ * - Final value can be POSITIVE or NEGATIVE (hedged/loss scenarios)
+ * - Runners with no direct bets still get position from opposite-runner bets
  * 
  * @param bets - Array of ALL bets (will be filtered to Match Odds only)
- * @param marketId - Market ID to filter bets (optional, if provided only includes bets for this market)
- * @returns Match Odds position or null if no Match Odds bets found
+ * @param marketId - Market ID (required for runner list)
+ * @param marketSelections - Array of ALL runner IDs in the market (REQUIRED)
+ * @returns Match Odds position or null if no Match Odds bets found or marketSelections empty
  */
 export function calculateMatchOddsPosition(
   bets: BetForPosition[] | Bet[],
-  marketId?: string,
+  marketId: string,
+  marketSelections: string[],
 ): MatchOddsPosition | null {
-  // Filter to ONLY Match Odds bets
+  // ✅ CRITICAL: marketSelections is REQUIRED - contains ALL runners in market
+  if (!marketSelections || marketSelections.length === 0) {
+    return null;
+  }
+
+  if (!marketId) {
+    return null;
+  }
+
+  // Filter to ONLY Match Odds bets for this market
   const matchOddsBets = bets.filter((bet) => {
     const betGtype = (bet.gtype || '').toLowerCase();
     const isMatchOdds = betGtype === 'matchodds' || betGtype === 'match';
-    
-    // If marketId provided, must match
-    if (marketId && bet.marketId !== marketId) {
-      return false;
-    }
-    
-    return isMatchOdds && bet.status === 'PENDING';
+    // ✅ CRITICAL: Include ALL bets regardless of status (but filter by marketId)
+    // Status filtering should be done at query level, not here
+    return isMatchOdds && bet.marketId === marketId;
   });
 
-  if (matchOddsBets.length === 0) {
-    return null;
-  }
+  // ✅ CRITICAL: Return position even if no bets (all runners will have net = 0)
+  // This ensures ALL runners are included in response
 
-  // Get unique marketId (should be same for all bets if filtered)
-  const firstMarketId = matchOddsBets[0]?.marketId;
-  if (!firstMarketId) {
-    return null;
-  }
+  // Initialize positions for ALL runners in market
+  const runners: Record<string, { net: number }> = {};
 
-  // Get all unique selectionIds from bets
-  const selectionIds = Array.from(
-    new Set(
-      matchOddsBets
-        .map((bet) => bet.selectionId)
-        .filter((id): id is number => id !== null && id !== undefined)
-        .map((id) => String(id))
-    )
-  );
+  // ✅ Exchange Standard: Calculate NET P/L for EACH runner in market
+  // Loop through ALL runners (from marketSelections), not just runners with bets
+  for (const runnerSelectionId of marketSelections) {
+    let netPnL = 0; // Net P/L if THIS runner wins (can be positive or negative)
 
-  if (selectionIds.length === 0) {
-    return null;
-  }
-
-  // Initialize positions for all selections
-  const positions: Record<string, { profit: number; loss: number }> = {};
-
-  // ✅ Calculate P/L per outcome using pre-calculated winAmount/lossAmount
-  // winAmount = profit if bet wins, lossAmount = liability if bet loses
-  // For each outcome: calculate BOTH scenarios:
-  // 1. If THIS outcome wins → profit
-  // 2. If THIS outcome loses → loss
-  for (const outcomeSelection of selectionIds) {
-    let profitIfWins = 0; // Net profit if this selection wins
-    let lossIfLoses = 0;  // Net loss if this selection loses
-
+    // Calculate impact of ALL bets on this runner
     for (const bet of matchOddsBets) {
       // Skip bets with invalid selectionId
       if (bet.selectionId === null || bet.selectionId === undefined) {
@@ -161,76 +159,73 @@ export function calculateMatchOddsPosition(
 
       const betSelection = String(bet.selectionId);
       const betType = bet.betType?.toUpperCase();
-      const winAmount = bet.winAmount ?? 0;
-      const lossAmount = bet.lossAmount ?? 0;
+      const odds = bet.betRate ?? bet.odds ?? 0;
+      const stake = bet.betValue ?? bet.amount ?? 0;
 
       // Skip invalid bets
-      if (!betType || (betType !== 'BACK' && betType !== 'LAY')) {
+      if (!betType || (betType !== 'BACK' && betType !== 'LAY') || odds <= 0 || stake <= 0) {
         continue;
       }
 
-      // Use pre-calculated winAmount/lossAmount if available, otherwise calculate from odds
-      let betWinAmount = winAmount;
-      let betLossAmount = lossAmount;
-
-      // Fallback to calculation only if winAmount/lossAmount not provided
-      if (betWinAmount === 0 && betLossAmount === 0) {
-        const odds = bet.betRate ?? bet.odds ?? 0;
-        const stake = bet.betValue ?? bet.amount ?? 0;
-        
-        if (odds > 0 && stake > 0) {
-          if (betType === 'BACK') {
-            betWinAmount = (odds - 1) * stake; // profit
-            betLossAmount = stake; // liability
-          } else if (betType === 'LAY') {
-            betWinAmount = stake; // profit
-            betLossAmount = (odds - 1) * stake; // liability
-          }
+      if (betSelection === runnerSelectionId) {
+        // Bet is on THIS runner
+        if (betType === 'BACK') {
+          // BACK on winning runner: profit = (odds - 1) * stake
+          netPnL += (odds - 1) * stake;
+        } else if (betType === 'LAY') {
+          // LAY on winning runner: loss = -(odds - 1) * stake
+          netPnL -= (odds - 1) * stake;
         }
-      }
-
-      if (betSelection === outcomeSelection) {
-        // Bet is on THIS outcome
-        // If THIS outcome wins: we get profit (winAmount)
-        profitIfWins += betWinAmount;
-        // If THIS outcome loses: we lose liability (lossAmount)
-        lossIfLoses += betLossAmount;
       } else {
-        // Bet is on ANOTHER outcome
-        // If THIS outcome wins (bet outcome loses): we lose liability of the bet
-        profitIfWins -= betLossAmount;
-        // If THIS outcome loses (bet outcome wins): we get profit of the bet
-        lossIfLoses -= betWinAmount;
+        // Bet is on ANOTHER runner (opposite effect)
+        if (betType === 'BACK') {
+          // BACK on losing runner: loss = -stake
+          netPnL -= stake;
+        } else if (betType === 'LAY') {
+          // LAY on losing runner: profit = +stake
+          netPnL += stake;
+        }
       }
     }
 
-    // ✅ UI FIX: Return profit and loss separately
-    // profit: what we gain if this selection wins (can be negative if hedged)
-    // loss: what we lose if this selection loses (can be negative if hedged)
-    positions[outcomeSelection] = {
-      profit: profitIfWins > 0 ? profitIfWins : 0,
-      loss: lossIfLoses > 0 ? lossIfLoses : 0,
+    // ✅ Exchange Standard: Return net P/L (can be negative for hedged/loss scenarios)
+    // Include ALL runners, even if netPnL = 0 (no direct bets)
+    // Round to 2 decimals to avoid floating point artifacts (e.g., 319.9999999999 → 320.00)
+    runners[runnerSelectionId] = {
+      net: Math.round(netPnL * 100) / 100, // Round to 2 decimals, negative values are valid
     };
   }
 
   return {
-    marketId: firstMarketId,
-    positions,
+    marketId,
+    runners,
   };
 }
 
 /**
- * ✅ PURE FUNCTION: Calculate Fancy Position
+ * ✅ PURE FUNCTION: Calculate Fancy Position (Exchange Standard)
  * 
  * Fancy Position Rules:
  * - Aggregates ONLY bets with gtype='fancy'
  * - Grouped by (eventId, selectionId) = fancyId
- * - Position: { YES: number, NO: number }
- *   - YES: Net position for BACK/YES bets (positive = profit, negative = loss)
- *   - NO: Net position for LAY/NO bets (positive = profit, negative = loss)
- * - Fancy liability = stake (for both BACK and LAY)
- * - BACK/YES: +stake if wins, -stake if loses
- * - LAY/NO: -stake if wins, +stake if loses
+ * - Liability = stake (for both BACK and LAY)
+ * 
+ * Exchange Standard Calculation:
+ * YES (BACK):
+ *   - If YES wins → +stake (for each YES bet)
+ *   - If YES loses (NO wins) → -stake (for each YES bet)
+ * 
+ * NO (LAY):
+ *   - If NO wins (YES loses) → +stake (for each NO bet)
+ *   - If NO loses (YES wins) → -stake (for each NO bet)
+ * 
+ * Position Calculation:
+ * - YES position = sum(YES stakes) - sum(NO stakes)
+ *   (Net P/L if YES wins: YES bets profit, NO bets lose)
+ * - NO position = sum(NO stakes) - sum(YES stakes)
+ *   (Net P/L if NO wins: NO bets profit, YES bets lose)
+ * 
+ * Values can be POSITIVE or NEGATIVE (hedged scenarios).
  * 
  * @param bets - Array of ALL bets (will be filtered to Fancy only)
  * @returns Array of Fancy positions grouped by fancyId
@@ -260,35 +255,9 @@ export function calculateFancyPosition(bets: BetForPosition[] | Bet[]): FancyPos
   const fancyPositions: FancyPosition[] = [];
 
   for (const [fancyId, fancyBetsGroup] of betsByFancyId.entries()) {
-    let yesPosition = 0; // BACK/YES bets
-    let noPosition = 0;  // LAY/NO bets
-
-    for (const bet of fancyBetsGroup) {
-      const betType = bet.betType?.toUpperCase() || '';
-      const stake = bet.betValue ?? bet.amount ?? 0;
-
-      if (stake <= 0) continue;
-
-      // FANCY: liability = stake for both BACK and LAY
-      if (betType === 'BACK' || betType === 'YES') {
-        // BACK/YES: If wins, get stake back + profit = stake, if loses = -stake
-        // Net position: positive means profit potential, negative means loss potential
-        yesPosition += stake; // Assuming win scenario
-        // For loss scenario, we'd subtract stake, but we track net
-      } else if (betType === 'LAY' || betType === 'NO') {
-        // LAY/NO: If wins, lose stake = -stake, if loses, profit = +stake
-        noPosition += stake; // Assuming win scenario (we profit if they lose)
-      }
-    }
-
-    // Calculate net positions
-    // YES position: sum of all BACK/YES stakes (what we stand to win/lose)
-    // NO position: sum of all LAY/NO stakes (what we stand to win/lose)
-    // For display: YES shows net BACK position, NO shows net LAY position
-    
-    // Refined calculation: YES = net BACK position, NO = net LAY position
-    let netYes = 0;
-    let netNo = 0;
+    // ✅ Exchange Standard: Calculate net P/L for YES and NO outcomes
+    let sumYesStakes = 0; // Sum of all YES/BACK bet stakes
+    let sumNoStakes = 0;  // Sum of all NO/LAY bet stakes
 
     for (const bet of fancyBetsGroup) {
       const betType = bet.betType?.toUpperCase() || '';
@@ -297,23 +266,31 @@ export function calculateFancyPosition(bets: BetForPosition[] | Bet[]): FancyPos
       if (stake <= 0) continue;
 
       if (betType === 'BACK' || betType === 'YES') {
-        netYes += stake; // BACK increases YES position
+        sumYesStakes += stake;
       } else if (betType === 'LAY' || betType === 'NO') {
-        netNo += stake; // LAY increases NO position
+        sumNoStakes += stake;
       }
     }
 
-    // Net position: positive = net BACK (if YES wins, we profit), negative = net LAY (if NO wins, we profit)
-    // For fancy display:
-    // YES = netYes - netNo (if positive, net BACK position)
-    // NO = netNo - netYes (if positive, net LAY position)
+    // ✅ Exchange Standard Calculation:
+    // YES position = Net P/L if YES wins
+    //   = sum(YES stakes) - sum(NO stakes)
+    //   (YES bets profit +stake each, NO bets lose -stake each)
+    // 
+    // NO position = Net P/L if NO wins
+    //   = sum(NO stakes) - sum(YES stakes)
+    //   (NO bets profit +stake each, YES bets lose -stake each)
+    // 
+    // Values can be NEGATIVE (hedged scenarios are valid)
+    const yesPosition = sumYesStakes - sumNoStakes;
+    const noPosition = sumNoStakes - sumYesStakes;
     
     fancyPositions.push({
       fancyId,
       name: fancyBetsGroup[0]?.betName || undefined,
       positions: {
-        YES: netYes - netNo, // Net position on YES side
-        NO: netNo - netYes,  // Net position on NO side
+        YES: yesPosition, // Net P/L if YES wins (can be negative)
+        NO: noPosition,   // Net P/L if NO wins (can be negative)
       },
     });
   }
@@ -322,81 +299,67 @@ export function calculateFancyPosition(bets: BetForPosition[] | Bet[]): FancyPos
 }
 
 /**
- * ✅ PURE FUNCTION: Calculate Bookmaker Position (UI FIX)
+ * ✅ PURE FUNCTION: Calculate Bookmaker Position (Exchange Standard)
  * 
- * Bookmaker Position Rules (same as Match Odds):
- * - Aggregates ONLY bets with gtype='bookmaker' or gtype starts with 'match' (match1, match2, etc.) but NOT 'matchodds' or 'match'
- * - For EACH runner: Calculate P/L if this runner wins
- * - Apply BACK and LAY impact
- * - Apply opposite impact for other runners
- * - Collapse to net exposure
- * - Return per selection: { profit, loss }
+ * Exchange Standard Definition (same as Match Odds):
+ * - For EACH runner in the market, calculate NET P/L **IF THAT RUNNER WINS**
+ * - Return ONE value per runner (NOT profit + loss separately)
+ * - Values can be POSITIVE (profit) or NEGATIVE (loss)
+ * - MUST include ALL runners, even if they have no direct bets
  * 
- * Exchange-standard calculation:
- * - For each outcome: Calculate total P/L if that outcome wins
- * - BACK bet on winning selection: + (odds - 1) * stake
- * - BACK bet on losing selection: - stake
- * - LAY bet on winning selection: - (odds - 1) * stake
- * - LAY bet on losing selection: + stake
+ * Formula per bet:
+ * BACK bet:
+ *   - If selected runner wins  → +(odds - 1) * stake
+ *   - If selected runner loses → -stake
+ * 
+ * LAY bet:
+ *   - If selected runner wins  → -(odds - 1) * stake
+ *   - If selected runner loses → +stake
+ * 
+ * For every runner:
+ * - Sum impact of ALL bets (including opposite-runner effects)
+ * - Final value can be POSITIVE or NEGATIVE (hedged/loss scenarios)
+ * - Runners with no direct bets still get position from opposite-runner bets
  * 
  * @param bets - Array of ALL bets (will be filtered to Bookmaker only)
- * @param marketId - Market ID to filter bets (optional, if provided only includes bets for this market)
- * @returns Bookmaker position or null if no Bookmaker bets found
+ * @param marketId - Market ID (required for runner list)
+ * @param marketSelections - Array of ALL runner IDs in the market (REQUIRED)
+ * @returns Bookmaker position or null if no Bookmaker bets found or marketSelections empty
  */
 export function calculateBookmakerPosition(
   bets: BetForPosition[] | Bet[],
-  marketId?: string,
+  marketId: string,
+  marketSelections: string[],
 ): BookmakerPosition | null {
-  // Filter to ONLY Bookmaker bets
+  // ✅ CRITICAL: marketSelections is REQUIRED - contains ALL runners in market
+  if (!marketSelections || marketSelections.length === 0) {
+    return null;
+  }
+
+  if (!marketId) {
+    return null;
+  }
+
+  // Filter to ONLY Bookmaker bets for this market
   const bookmakerBets = bets.filter((bet) => {
     const betGtype = (bet.gtype || '').toLowerCase();
     const isBookmaker = betGtype === 'bookmaker' ||
       (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds');
-    
-    // If marketId provided, must match
-    if (marketId && bet.marketId !== marketId) {
-      return false;
-    }
-    
-    return isBookmaker && bet.status === 'PENDING';
+    return isBookmaker && bet.marketId === marketId && bet.status === 'PENDING';
   });
 
-  if (bookmakerBets.length === 0) {
-    return null;
-  }
+  // ✅ CRITICAL: Return position even if no bets (all runners will have net = 0)
+  // This ensures ALL runners are included in response
 
-  // Get unique marketId (should be same for all bets if filtered)
-  const firstMarketId = bookmakerBets[0]?.marketId;
-  if (!firstMarketId) {
-    return null;
-  }
+  // Initialize positions for ALL runners in market
+  const runners: Record<string, { net: number }> = {};
 
-  // Get all unique selectionIds from bets
-  const selectionIds = Array.from(
-    new Set(
-      bookmakerBets
-        .map((bet) => bet.selectionId)
-        .filter((id): id is number => id !== null && id !== undefined)
-        .map((id) => String(id))
-    )
-  );
+  // ✅ Exchange Standard: Calculate NET P/L for EACH runner in market
+  // Loop through ALL runners (from marketSelections), not just runners with bets
+  for (const runnerSelectionId of marketSelections) {
+    let netPnL = 0; // Net P/L if THIS runner wins (can be positive or negative)
 
-  if (selectionIds.length === 0) {
-    return null;
-  }
-
-  // Initialize positions for all selections
-  const positions: Record<string, { profit: number; loss: number }> = {};
-
-  // ✅ Calculate P/L per outcome (same logic as Match Odds)
-  // winAmount = profit if bet wins, lossAmount = liability if bet loses
-  // For each outcome: calculate BOTH scenarios:
-  // 1. If THIS outcome wins → profit
-  // 2. If THIS outcome loses → loss
-  for (const outcomeSelection of selectionIds) {
-    let profitIfWins = 0; // Net profit if this selection wins
-    let lossIfLoses = 0;  // Net loss if this selection loses
-
+    // Calculate impact of ALL bets on this runner
     for (const bet of bookmakerBets) {
       // Skip bets with invalid selectionId
       if (bet.selectionId === null || bet.selectionId === undefined) {
@@ -405,61 +368,46 @@ export function calculateBookmakerPosition(
 
       const betSelection = String(bet.selectionId);
       const betType = bet.betType?.toUpperCase();
-      const winAmount = bet.winAmount ?? 0;
-      const lossAmount = bet.lossAmount ?? 0;
+      const odds = bet.betRate ?? bet.odds ?? 0;
+      const stake = bet.betValue ?? bet.amount ?? 0;
 
       // Skip invalid bets
-      if (!betType || (betType !== 'BACK' && betType !== 'LAY')) {
+      if (!betType || (betType !== 'BACK' && betType !== 'LAY') || odds <= 0 || stake <= 0) {
         continue;
       }
 
-      // Use pre-calculated winAmount/lossAmount if available, otherwise calculate from odds
-      let betWinAmount = winAmount;
-      let betLossAmount = lossAmount;
-
-      // Fallback to calculation only if winAmount/lossAmount not provided
-      if (betWinAmount === 0 && betLossAmount === 0) {
-        const odds = bet.betRate ?? bet.odds ?? 0;
-        const stake = bet.betValue ?? bet.amount ?? 0;
-        
-        if (odds > 0 && stake > 0) {
-          if (betType === 'BACK') {
-            betWinAmount = (odds - 1) * stake; // profit
-            betLossAmount = stake; // liability
-          } else if (betType === 'LAY') {
-            betWinAmount = stake; // profit
-            betLossAmount = (odds - 1) * stake; // liability
-          }
+      if (betSelection === runnerSelectionId) {
+        // Bet is on THIS runner
+        if (betType === 'BACK') {
+          // BACK on winning runner: profit = (odds - 1) * stake
+          netPnL += (odds - 1) * stake;
+        } else if (betType === 'LAY') {
+          // LAY on winning runner: loss = -(odds - 1) * stake
+          netPnL -= (odds - 1) * stake;
         }
-      }
-
-      if (betSelection === outcomeSelection) {
-        // Bet is on THIS outcome
-        // If THIS outcome wins: we get profit (winAmount)
-        profitIfWins += betWinAmount;
-        // If THIS outcome loses: we lose liability (lossAmount)
-        lossIfLoses += betLossAmount;
       } else {
-        // Bet is on ANOTHER outcome
-        // If THIS outcome wins (bet outcome loses): we lose liability of the bet
-        profitIfWins -= betLossAmount;
-        // If THIS outcome loses (bet outcome wins): we get profit of the bet
-        lossIfLoses -= betWinAmount;
+        // Bet is on ANOTHER runner (opposite effect)
+        if (betType === 'BACK') {
+          // BACK on losing runner: loss = -stake
+          netPnL -= stake;
+        } else if (betType === 'LAY') {
+          // LAY on losing runner: profit = +stake
+          netPnL += stake;
+        }
       }
     }
 
-    // ✅ UI FIX: Return profit and loss separately
-    // profit: what we gain if this selection wins (can be negative if hedged)
-    // loss: what we lose if this selection loses (can be negative if hedged)
-    positions[outcomeSelection] = {
-      profit: profitIfWins > 0 ? profitIfWins : 0,
-      loss: lossIfLoses > 0 ? lossIfLoses : 0,
+    // ✅ Exchange Standard: Return net P/L (can be negative for hedged/loss scenarios)
+    // Include ALL runners, even if netPnL = 0 (no direct bets)
+    // Round to 2 decimals to avoid floating point artifacts (e.g., 319.9999999999 → 320.00)
+    runners[runnerSelectionId] = {
+      net: Math.round(netPnL * 100) / 100, // Round to 2 decimals, negative values are valid
     };
   }
 
   return {
-    marketId: firstMarketId,
-    positions,
+    marketId,
+    runners,
   };
 }
 
@@ -469,10 +417,17 @@ export function calculateBookmakerPosition(
  * Calculates positions for all market types from open bets.
  * Markets are completely isolated - no mixing.
  * 
+ * ⚠️ NOTE: Match Odds and Bookmaker positions require marketSelections.
+ * If not provided, those markets will be skipped.
+ * 
  * @param bets - Array of ALL open bets
+ * @param marketSelectionsMap - Optional map of marketId -> runner IDs array
  * @returns All positions grouped by market type
  */
-export function calculateAllPositions(bets: BetForPosition[] | Bet[]): AllPositions {
+export function calculateAllPositions(
+  bets: BetForPosition[] | Bet[],
+  marketSelectionsMap?: Map<string, string[]>,
+): AllPositions {
   const result: AllPositions = {};
 
   // Calculate Match Odds position (aggregate all Match Odds markets)
@@ -488,17 +443,32 @@ export function calculateAllPositions(bets: BetForPosition[] | Bet[]): AllPositi
     }
   }
 
-  // For now, return first Match Odds market (can be extended to support multiple)
-  // TODO: If frontend needs multiple Match Odds markets, extend to return array
-  if (matchOddsBetsByMarket.size > 0) {
-    const firstMarketId = Array.from(matchOddsBetsByMarket.keys())[0];
+  // ✅ Calculate positions for ALL Match Odds markets (not just the first one)
+  const matchOddsPositions: MatchOddsPosition[] = [];
+  
+  for (const [marketId, marketBets] of matchOddsBetsByMarket.entries()) {
+    const marketSelections = marketSelectionsMap?.get(marketId);
+    
+    // ✅ CRITICAL: Match Odds runners MUST come from Detail Match API, NOT from bets
+    // This ensures ALL runners are included even if they have no bets
+    // If marketSelections not provided, skip this market (don't derive from bets)
+    if (!marketSelections || marketSelections.length === 0) {
+      // Skip this market - runners must come from API
+      continue;
+    }
+    
     const matchOddsPosition = calculateMatchOddsPosition(
-      matchOddsBetsByMarket.get(firstMarketId)!,
-      firstMarketId,
+      marketBets,
+      marketId,
+      marketSelections,
     );
     if (matchOddsPosition) {
-      result.matchOdds = matchOddsPosition;
+      matchOddsPositions.push(matchOddsPosition);
     }
+  }
+  
+  if (matchOddsPositions.length > 0) {
+    result.matchOdds = matchOddsPositions;
   }
 
   // Calculate Fancy positions (all fancy bets grouped by fancyId)
@@ -521,16 +491,41 @@ export function calculateAllPositions(bets: BetForPosition[] | Bet[]): AllPositi
     }
   }
 
-  // For now, return first Bookmaker market (can be extended to support multiple)
-  if (bookmakerBetsByMarket.size > 0) {
-    const firstMarketId = Array.from(bookmakerBetsByMarket.keys())[0];
-    const bookmakerPosition = calculateBookmakerPosition(
-      bookmakerBetsByMarket.get(firstMarketId)!,
-      firstMarketId,
-    );
-    if (bookmakerPosition) {
-      result.bookmaker = bookmakerPosition;
+  // ✅ Calculate positions for ALL Bookmaker markets (not just the first one)
+  const bookmakerPositions: BookmakerPosition[] = [];
+  
+  for (const [marketId, marketBets] of bookmakerBetsByMarket.entries()) {
+    const marketSelections = marketSelectionsMap?.get(marketId);
+    
+    // ✅ CRITICAL: If marketSelections not provided, derive from bets as fallback
+    // This ensures newly placed bets are included even if not in marketSelectionsMap
+    let finalMarketSelections = marketSelections;
+    if (!finalMarketSelections || finalMarketSelections.length === 0) {
+      // Derive from bets as fallback
+      finalMarketSelections = Array.from(
+        new Set(
+          marketBets
+            .map((bet) => bet.selectionId)
+            .filter((id): id is number => id !== null && id !== undefined)
+            .map((id) => String(id))
+        )
+      );
     }
+    
+    if (finalMarketSelections && finalMarketSelections.length > 0) {
+      const bookmakerPosition = calculateBookmakerPosition(
+        marketBets,
+        marketId,
+        finalMarketSelections,
+      );
+      if (bookmakerPosition) {
+        bookmakerPositions.push(bookmakerPosition);
+      }
+    }
+  }
+  
+  if (bookmakerPositions.length > 0) {
+    result.bookmaker = bookmakerPositions;
   }
 
   return result;
@@ -612,9 +607,17 @@ export class PositionService {
 
   /**
    * Calculate Match Odds position
+   * 
+   * @param bets - Array of bets
+   * @param marketId - Market ID (required)
+   * @param marketSelections - Array of ALL runner IDs in the market (required)
    */
-  calculateMatchOddsPosition(bets: BetForPosition[] | Bet[], marketId?: string): MatchOddsPosition | null {
-    return calculateMatchOddsPosition(bets, marketId);
+  calculateMatchOddsPosition(
+    bets: BetForPosition[] | Bet[],
+    marketId: string,
+    marketSelections: string[],
+  ): MatchOddsPosition | null {
+    return calculateMatchOddsPosition(bets, marketId, marketSelections);
   }
 
   /**
@@ -626,16 +629,30 @@ export class PositionService {
 
   /**
    * Calculate Bookmaker position
+   * 
+   * @param bets - Array of bets
+   * @param marketId - Market ID (required)
+   * @param marketSelections - Array of ALL runner IDs in the market (required)
    */
-  calculateBookmakerPosition(bets: BetForPosition[] | Bet[], marketId?: string): BookmakerPosition | null {
-    return calculateBookmakerPosition(bets, marketId);
+  calculateBookmakerPosition(
+    bets: BetForPosition[] | Bet[],
+    marketId: string,
+    marketSelections: string[],
+  ): BookmakerPosition | null {
+    return calculateBookmakerPosition(bets, marketId, marketSelections);
   }
 
   /**
    * Calculate all positions (all market types)
+   * 
+   * @param bets - Array of bets
+   * @param marketSelectionsMap - Optional map of marketId -> runner IDs array
    */
-  calculateAllPositions(bets: BetForPosition[] | Bet[]): AllPositions {
-    return calculateAllPositions(bets);
+  calculateAllPositions(
+    bets: BetForPosition[] | Bet[],
+    marketSelectionsMap?: Map<string, string[]>,
+  ): AllPositions {
+    return calculateAllPositions(bets, marketSelectionsMap);
   }
 
   /**

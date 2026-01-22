@@ -6,9 +6,12 @@ import {
   HttpStatus,
   Logger,
   Param,
+  Query,
 } from '@nestjs/common';
 import { PositionService } from './position.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AggregatorService } from '../cricketid/aggregator.service';
+import { CricketIdService } from '../cricketid/cricketid.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { BetStatus } from '@prisma/client';
@@ -27,12 +30,17 @@ export class PositionsController {
   constructor(
     private readonly positionService: PositionService,
     private readonly prisma: PrismaService,
+    private readonly aggregatorService: AggregatorService,
+    private readonly cricketIdService: CricketIdService,
   ) {}
 
   /**
-   * ✅ GET /positions
+   * ✅ GET /positions?eventId={eventId}
    * 
    * Returns all positions (P/L projections) for the authenticated user across all market types.
+   * 
+   * Query Parameters:
+   * - eventId (optional): Filter positions for a specific event/match
    * 
    * 🚨 CRITICAL RULES:
    * - Position is calculated fresh from ALL open bets (never stored in DB)
@@ -41,36 +49,41 @@ export class PositionsController {
    * 
    * Response Format:
    * {
+   *   "eventId": "32547891",
    *   "matchOdds": {
-   *     "marketId": "...",
-   *     "positions": {
-   *       "selectionId": { "profit": number, "loss": number }
-   *     }
+   *     "7337": 80,      // selectionId -> net P/L (can be negative)
+   *     "10301": -200
    *   },
-   *   "fancy": [
-   *     {
-   *       "fancyId": "eventId_selectionId",
-   *       "name": "...",
-   *       "positions": { "YES": number, "NO": number }
-   *     }
-   *   ],
    *   "bookmaker": {
-   *     "marketId": "...",
-   *     "positions": {
-   *       "selectionId": number  // net position
+   *     "7337": 120,
+   *     "10301": -150
+   *   },
+   *   "fancy": {
+   *     "fancyId_1": {
+   *       "YES": 50,
+   *       "NO": -100
    *     }
    *   }
    * }
    */
   @Get()
-  async getAllPositions(@CurrentUser() user: User) {
+  async getAllPositions(
+    @CurrentUser() user: User,
+    @Query('eventId') eventId?: string,
+  ) {
     try {
-      // ✅ Load ALL open bets for this user (read-only, no wallet/DB modifications)
+      // ✅ Load open bets for this user (filter by eventId if provided)
+      const whereClause: any = {
+        userId: user.id,
+        status: BetStatus.PENDING,
+      };
+      
+      if (eventId) {
+        whereClause.eventId = eventId;
+      }
+      
       const openBets = await this.prisma.bet.findMany({
-        where: {
-          userId: user.id,
-          status: BetStatus.PENDING,
-        },
+        where: whereClause,
         select: {
           id: true,
           gtype: true,
@@ -87,18 +100,236 @@ export class PositionsController {
           betName: true,
           status: true,
         },
+        orderBy: {
+          createdAt: 'desc', // Most recent bets first
+        },
       });
 
+      // ✅ DEBUG: Log all bets to verify they're included
       this.logger.debug(
         `Calculating positions for user ${user.id}: Found ${openBets.length} open bets`,
       );
+      
+      // Log Match Odds bets specifically
+      const matchOddsBets = openBets.filter(
+        (bet) => (bet.gtype || '').toLowerCase() === 'matchodds' || (bet.gtype || '').toLowerCase() === 'match',
+      );
+      if (matchOddsBets.length > 0) {
+        this.logger.debug(
+          `Match Odds bets (${matchOddsBets.length}): ` +
+          matchOddsBets.map(
+            (bet) => `id=${bet.id}, marketId=${bet.marketId}, selectionId=${bet.selectionId}, betType=${bet.betType}, stake=${bet.betValue ?? bet.amount}`,
+          ).join('; '),
+        );
+      }
+
+      // ✅ CRITICAL: Use selectionIds from bets (these match UI/Match Detail API selectionIds)
+      // This ensures Position API returns selectionIds that match what the UI expects
+      const marketSelectionsMap = new Map<string, string[]>();
+      
+      // Group Match Odds bets by eventId and marketId
+      const matchOddsBetsByEvent = new Map<string, Map<string, typeof openBets>>();
+      for (const bet of openBets) {
+        const betGtype = (bet.gtype || '').toLowerCase();
+        const isMatchOdds = (betGtype === 'matchodds' || betGtype === 'match') && bet.marketId && bet.eventId;
+        
+        if (isMatchOdds && bet.marketId && bet.eventId) {
+          const eventId = bet.eventId;
+          const marketId = bet.marketId;
+          
+          if (!matchOddsBetsByEvent.has(eventId)) {
+            matchOddsBetsByEvent.set(eventId, new Map());
+          }
+          const marketsMap = matchOddsBetsByEvent.get(eventId)!;
+          if (!marketsMap.has(marketId)) {
+            marketsMap.set(marketId, []);
+          }
+          marketsMap.get(marketId)!.push(bet);
+        }
+      }
+      
+      // ✅ Extract ALL unique selectionIds from bets for each market
+      // These selectionIds match what the UI/Match Detail API expects (e.g., 681460, 63361)
+      for (const [eventId, marketsMap] of matchOddsBetsByEvent.entries()) {
+        for (const [marketId, marketBets] of marketsMap.entries()) {
+          // Get all unique selectionIds from bets in this market
+          const selectionIds = Array.from(
+            new Set(
+              marketBets
+                .map((bet) => bet.selectionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+                .map((id) => String(id))
+            )
+          );
+          
+          if (selectionIds.length > 0) {
+            marketSelectionsMap.set(marketId, selectionIds);
+            this.logger.debug(
+              `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${selectionIds.length} selectionIds from bets: [${selectionIds.join(', ')}]`,
+            );
+          }
+        }
+      }
+      
+      // ✅ CRITICAL: Get ALL runners from getBookmakerFancy API (has correct selectionIds for UI)
+      // This ensures we include ALL runners, even if there are no bets on them
+      for (const [eventId, marketsMap] of matchOddsBetsByEvent.entries()) {
+        try {
+          // Use getBookmakerFancy which has Match Odds with correct selectionIds
+          const bookmakerFancyData = await this.cricketIdService.getBookmakerFancy(eventId);
+          const markets = Array.isArray(bookmakerFancyData?.data) ? bookmakerFancyData.data : [];
+          
+          // Find Match Odds market (mname === 'MATCH_ODDS')
+          const matchOddsMarket = markets.find((market: any) => {
+            const mname = (market.mname || '').toUpperCase();
+            return mname === 'MATCH_ODDS';
+          });
+          
+          if (matchOddsMarket && matchOddsMarket.section && Array.isArray(matchOddsMarket.section)) {
+            // Extract selectionIds from sections (each section.sid is a runner/selectionId)
+            const apiSelectionIds = matchOddsMarket.section
+              .map((section: any) => {
+                const selectionId = section.sid;
+                return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;
+              })
+              .filter((id): id is string => id !== null);
+            
+            this.logger.debug(
+              `Match Odds API (eventId ${eventId}): Found ${apiSelectionIds.length} runners from getBookmakerFancy. ` +
+              `SelectionIds: [${apiSelectionIds.join(', ')}]`,
+            );
+            
+            // ✅ Use API selectionIds for ALL markets in this eventId
+            // This ensures ALL runners are included, even without bets
+            for (const [marketId] of marketsMap.entries()) {
+              // Merge bet selectionIds with API selectionIds (API takes priority for completeness)
+              const betSelectionIds = marketSelectionsMap.get(marketId) || [];
+              const allSelectionIds = Array.from(new Set([...apiSelectionIds, ...betSelectionIds]));
+              
+              marketSelectionsMap.set(marketId, allSelectionIds);
+              this.logger.debug(
+                `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${allSelectionIds.length} selectionIds ` +
+                `(API: ${apiSelectionIds.length}, Bets: ${betSelectionIds.length}): [${allSelectionIds.join(', ')}]`,
+              );
+            }
+          } else {
+            this.logger.warn(
+              `Match Odds market not found in getBookmakerFancy for eventId ${eventId}. Using bet selectionIds only.`,
+            );
+          }
+        } catch (error: any) {
+          // API call failed - continue using bet selectionIds only
+          this.logger.debug(
+            `Could not fetch getBookmakerFancy for eventId ${eventId}: ${error?.message || String(error)}. Using bet selectionIds only.`,
+          );
+        }
+      }
+      
+      // For non-Match Odds markets (Bookmaker, Fancy), derive from bets as fallback
+      const otherBetsByMarket = new Map<string, typeof openBets>();
+      for (const bet of openBets) {
+        const betGtype = (bet.gtype || '').toLowerCase();
+        const isMatchOdds = betGtype === 'matchodds' || betGtype === 'match';
+        if (!isMatchOdds && bet.marketId) {
+          if (!otherBetsByMarket.has(bet.marketId)) {
+            otherBetsByMarket.set(bet.marketId, []);
+          }
+          otherBetsByMarket.get(bet.marketId)!.push(bet);
+        }
+      }
+      
+      // Extract runners from bets for non-Match Odds markets
+      for (const [marketId, marketBets] of otherBetsByMarket.entries()) {
+        if (!marketSelectionsMap.has(marketId)) {
+          const selectionIds = Array.from(
+            new Set(
+              marketBets
+                .map((bet) => bet.selectionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+                .map((id) => String(id))
+            )
+          );
+          if (selectionIds.length > 0) {
+            marketSelectionsMap.set(marketId, selectionIds);
+          }
+        }
+      }
 
       // ✅ Calculate positions using pure function (no side effects)
-      const allPositions = calculateAllPositions(openBets);
+      const allPositions = calculateAllPositions(openBets, marketSelectionsMap);
+      
+      // Log calculated positions for debugging
+      this.logger.debug(
+        `Position calculation result: ` +
+        `matchOdds=${allPositions.matchOdds ? 'present' : 'null'}, ` +
+        `fancy=${allPositions.fancy?.length || 0} markets, ` +
+        `bookmaker=${allPositions.bookmaker ? 'present' : 'null'}`,
+      );
+
+      // ✅ Transform response to new format: group by eventId, flatten structure
+      const response: any = {};
+      
+      // Determine eventId (from query param or from bets)
+      // If eventId query param provided, use it; otherwise use first bet's eventId
+      let responseEventId: string | null = null;
+      if (eventId) {
+        responseEventId = eventId;
+      } else if (openBets.length > 0) {
+        // Get first non-null eventId from bets
+        const firstEventId = openBets.find(bet => bet.eventId)?.eventId;
+        if (firstEventId) {
+          responseEventId = firstEventId;
+        }
+      }
+      
+      if (responseEventId) {
+        response.eventId = responseEventId;
+      }
+      
+      // Transform Match Odds: flatten runners to selectionId -> net
+      if (allPositions.matchOdds && allPositions.matchOdds.length > 0) {
+        // Merge all Match Odds markets (if multiple, combine their runners)
+        const matchOddsFlat: Record<string, number> = {};
+        for (const matchOddsPos of allPositions.matchOdds) {
+          for (const [selectionId, runner] of Object.entries(matchOddsPos.runners)) {
+            // If multiple markets have same selectionId, sum them
+            matchOddsFlat[selectionId] = (matchOddsFlat[selectionId] || 0) + runner.net;
+          }
+        }
+        if (Object.keys(matchOddsFlat).length > 0) {
+          response.matchOdds = matchOddsFlat;
+        }
+      }
+      
+      // Transform Bookmaker: flatten runners to selectionId -> net
+      if (allPositions.bookmaker && allPositions.bookmaker.length > 0) {
+        // Merge all Bookmaker markets (if multiple, combine their runners)
+        const bookmakerFlat: Record<string, number> = {};
+        for (const bookmakerPos of allPositions.bookmaker) {
+          for (const [selectionId, runner] of Object.entries(bookmakerPos.runners)) {
+            // If multiple markets have same selectionId, sum them
+            bookmakerFlat[selectionId] = (bookmakerFlat[selectionId] || 0) + runner.net;
+          }
+        }
+        if (Object.keys(bookmakerFlat).length > 0) {
+          response.bookmaker = bookmakerFlat;
+        }
+      }
+      
+      // Transform Fancy: convert array to object with fancyId as key
+      if (allPositions.fancy && allPositions.fancy.length > 0) {
+        const fancyFlat: Record<string, { YES: number; NO: number }> = {};
+        for (const fancyPos of allPositions.fancy) {
+          fancyFlat[fancyPos.fancyId] = fancyPos.positions;
+        }
+        if (Object.keys(fancyFlat).length > 0) {
+          response.fancy = fancyFlat;
+        }
+      }
 
       return {
         success: true,
-        data: allPositions,
+        data: response,
         betCount: openBets.length,
       };
     } catch (error) {
@@ -180,22 +411,81 @@ export class PositionsController {
       let marketPosition: MatchOddsPosition | BookmakerPosition | null = null;
 
       if (firstBetGtype === 'matchodds' || firstBetGtype === 'match') {
-        // Match Odds position
-        marketPosition = this.positionService.calculateMatchOddsPosition(
-          openBets,
-          marketId,
-        );
+        // ✅ CRITICAL: Match Odds runners MUST come from Detail Match API
+        const eventId = openBets[0]?.eventId;
+        let marketSelections: string[] = [];
+        
+        if (eventId) {
+          try {
+            // Call Detail Match API to get market runners
+            const marketDetails = await this.aggregatorService.getMatchDetail(eventId);
+            const markets = Array.isArray(marketDetails) ? marketDetails : [];
+            
+            // Find market by marketId
+            const apiMarket = markets.find((m: any) => m.marketId === marketId);
+            
+            if (apiMarket && apiMarket.runners && Array.isArray(apiMarket.runners)) {
+              // Extract selectionIds from API runners (source of truth)
+              marketSelections = apiMarket.runners
+                .map((r: any) => {
+                  const selectionId = r.selectionId;
+                  return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;
+                })
+                .filter((id): id is string => id !== null);
+              
+              this.logger.debug(
+                `Market ${marketId} (eventId ${eventId}): Found ${marketSelections.length} runners from API: [${marketSelections.join(', ')}]`,
+              );
+            } else {
+              this.logger.warn(
+                `Market ${marketId} (eventId ${eventId}): Not found in API response. Cannot calculate Match Odds position.`,
+              );
+            }
+          } catch (error: any) {
+            const status = error?.details?.status || error?.response?.status;
+            if (status === 400) {
+              this.logger.debug(
+                `EventId ${eventId} is expired or invalid. Cannot calculate Match Odds position.`,
+              );
+            } else {
+              this.logger.warn(
+                `Failed to fetch market details for eventId ${eventId}: ${error?.message || String(error)}. Cannot calculate Match Odds position.`,
+              );
+            }
+          }
+        }
+        
+        // Only calculate if runners from API are available
+        if (marketSelections.length > 0) {
+          marketPosition = this.positionService.calculateMatchOddsPosition(
+            openBets,
+            marketId,
+            marketSelections,
+          );
+        }
       } else if (
         firstBetGtype === 'bookmaker' ||
         (firstBetGtype.startsWith('match') &&
           firstBetGtype !== 'match' &&
           firstBetGtype !== 'matchodds')
       ) {
-        // Bookmaker position
-        marketPosition = this.positionService.calculateBookmakerPosition(
-          openBets,
-          marketId,
+        // Bookmaker position - derive runners from bets (not from API)
+        const marketSelections = Array.from(
+          new Set(
+            openBets
+              .map((bet) => bet.selectionId)
+              .filter((id): id is number => id !== null && id !== undefined)
+              .map((id) => String(id))
+          )
         );
+        
+        if (marketSelections.length > 0) {
+          marketPosition = this.positionService.calculateBookmakerPosition(
+            openBets,
+            marketId,
+            marketSelections,
+          );
+        }
       } else {
         throw new HttpException(
           {

@@ -29,6 +29,7 @@ export class FancyExposureService {
    * - For each outcome, calculates total P/L across all bets
    * - Returns the maximum possible loss (worst-case scenario)
    * 
+   * 
    * This approach is:
    * - Deterministic (same bets = same exposure)
    * - Idempotent (order-independent)
