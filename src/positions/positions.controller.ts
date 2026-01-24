@@ -171,57 +171,82 @@ export class PositionsController {
         }
       }
       
-      // ✅ CRITICAL: Get ALL runners from getBookmakerFancy API (has correct selectionIds for UI)
-      // This ensures we include ALL runners, even if there are no bets on them
+      // ✅ CRITICAL: Get ALL runners from getMatchDetail API (same as pending bets endpoint)
+      // This ensures we use the correct selectionIds that match the actual bets
       for (const [eventId, marketsMap] of matchOddsBetsByEvent.entries()) {
         try {
-          // Use getBookmakerFancy which has Match Odds with correct selectionIds
-          const bookmakerFancyData = await this.cricketIdService.getBookmakerFancy(eventId);
-          const markets = Array.isArray(bookmakerFancyData?.data) ? bookmakerFancyData.data : [];
+          // Use getMatchDetail which returns markets with correct selectionIds (same as pending bets API)
+          const marketDetails = await this.aggregatorService.getMatchDetail(eventId);
+          const markets = Array.isArray(marketDetails) ? marketDetails : [];
           
-          // Find Match Odds market (mname === 'MATCH_ODDS')
-          const matchOddsMarket = markets.find((market: any) => {
-            const mname = (market.mname || '').toUpperCase();
-            return mname === 'MATCH_ODDS';
-          });
-          
-          if (matchOddsMarket && matchOddsMarket.section && Array.isArray(matchOddsMarket.section)) {
-            // Extract selectionIds from sections (each section.sid is a runner/selectionId)
-            const apiSelectionIds = matchOddsMarket.section
-              .map((section: any) => {
-                const selectionId = section.sid;
-                return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;
-              })
-              .filter((id): id is string => id !== null);
+          // ✅ CRITICAL: Match markets by marketId for each bet's market
+          // This ensures we get the exact market that the bets are on
+          for (const [marketId] of marketsMap.entries()) {
+            // First try to find market by exact marketId match
+            let matchOddsMarket = markets.find((market: any) => {
+              return String(market.marketId) === String(marketId);
+            });
             
-            this.logger.debug(
-              `Match Odds API (eventId ${eventId}): Found ${apiSelectionIds.length} runners from getBookmakerFancy. ` +
-              `SelectionIds: [${apiSelectionIds.join(', ')}]`,
-            );
+            // If not found by marketId, fallback to finding by market name (for backwards compatibility)
+            if (!matchOddsMarket) {
+              matchOddsMarket = markets.find((market: any) => {
+                const marketName = (market.marketName || '').toLowerCase();
+                return (
+                  marketName === 'match odds' &&
+                  !marketName.includes('including tie') &&
+                  !marketName.includes('tied match') &&
+                  !marketName.includes('completed match')
+                );
+              });
+            }
             
-            // ✅ Use API selectionIds for ALL markets in this eventId
-            // This ensures ALL runners are included, even without bets
-            for (const [marketId] of marketsMap.entries()) {
-              // Merge bet selectionIds with API selectionIds (API takes priority for completeness)
-              const betSelectionIds = marketSelectionsMap.get(marketId) || [];
-              const allSelectionIds = Array.from(new Set([...apiSelectionIds, ...betSelectionIds]));
+            if (matchOddsMarket && matchOddsMarket.runners && Array.isArray(matchOddsMarket.runners)) {
+              // Extract selectionIds from runners (same structure as pending bets API)
+              const apiSelectionIds = matchOddsMarket.runners
+                .map((runner: any) => {
+                  const selectionId = runner.selectionId;
+                  const runnerName = (runner.runnerName || runner.name || '').toLowerCase();
+                  // Skip Yes/No runners (Tied Match market) and Tie/Draw runners (Match Odds Including Tie)
+                  if (runnerName === 'yes' || runnerName === 'no' || 
+                      runnerName === 'tie' || runnerName === 'the draw' || runnerName === 'draw') {
+                    return null;
+                  }
+                  return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;
+                })
+                .filter((id): id is string => id !== null);
               
-              marketSelectionsMap.set(marketId, allSelectionIds);
               this.logger.debug(
-                `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${allSelectionIds.length} selectionIds ` +
-                `(API: ${apiSelectionIds.length}, Bets: ${betSelectionIds.length}): [${allSelectionIds.join(', ')}]`,
+                `Match Odds API (eventId ${eventId}, marketId ${marketId}): Found ${apiSelectionIds.length} runners from getMatchDetail. ` +
+                `SelectionIds: [${apiSelectionIds.join(', ')}]`,
+              );
+              
+              // ✅ Use ONLY API selectionIds (source of truth for market runners)
+              // Do NOT merge with bet selectionIds because:
+              // 1. Bet selectionIds might be outdated (e.g., _selectionIdUpdated: true)
+              // 2. API runners are the authoritative source for the market
+              // 3. Position calculation will still work correctly because it matches bet.selectionId to runnerSelectionId
+              marketSelectionsMap.set(marketId, apiSelectionIds);
+              this.logger.debug(
+                `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${apiSelectionIds.length} selectionIds from API: [${apiSelectionIds.join(', ')}]`,
+              );
+            } else {
+              this.logger.warn(
+                `Match Odds market (marketId ${marketId}) not found in getMatchDetail for eventId ${eventId}. Using bet selectionIds only.`,
               );
             }
-          } else {
-            this.logger.warn(
-              `Match Odds market not found in getBookmakerFancy for eventId ${eventId}. Using bet selectionIds only.`,
-            );
           }
         } catch (error: any) {
           // API call failed - continue using bet selectionIds only
-          this.logger.debug(
-            `Could not fetch getBookmakerFancy for eventId ${eventId}: ${error?.message || String(error)}. Using bet selectionIds only.`,
-          );
+          const status = error?.details?.status || error?.response?.status;
+          if (status === 400) {
+            this.logger.debug(
+              `EventId ${eventId} is expired or invalid. Using bet selectionIds only.`,
+            );
+          } else {
+            this.logger.debug(
+              `Could not fetch getMatchDetail for eventId ${eventId}: ${error?.message || String(error)}. Using bet selectionIds only.`,
+            );
+          }
         }
       }
       

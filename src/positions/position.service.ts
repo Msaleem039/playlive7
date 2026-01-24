@@ -138,7 +138,7 @@ export function calculateMatchOddsPosition(
     // Status filtering should be done at query level, not here
     return isMatchOdds && bet.marketId === marketId;
   });
-
+//  console.log("matchodd position details", matchOddsBets)
   // ✅ CRITICAL: Return position even if no bets (all runners will have net = 0)
   // This ensures ALL runners are included in response
 
@@ -187,7 +187,7 @@ export function calculateMatchOddsPosition(
         }
       }
     }
-
+//  console.log("runners seletion id and net pnl", runnerSelectionId, netPnL, runners)
     // ✅ Exchange Standard: Return net P/L (can be negative for hedged/loss scenarios)
     // Include ALL runners, even if netPnL = 0 (no direct bets)
     // Round to 2 decimals to avoid floating point artifacts (e.g., 319.9999999999 → 320.00)

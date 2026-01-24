@@ -332,43 +332,6 @@ export class BetsService {
       );
     }
   }
-  private calculateMatchOddsSelectionOffset(
-    existingBets: any[],
-    newBet: any,
-  ): number {
-    const sameSelectionOppositeBets = existingBets.filter(bet =>
-      bet.marketId === newBet.marketId &&
-      bet.selectionId === newBet.selectionId &&
-      bet.betType?.toUpperCase() !== newBet.betType?.toUpperCase() &&
-      (bet.gtype === 'matchodds' || bet.gtype === 'match')
-    );
-  
-    if (!sameSelectionOppositeBets.length) {
-      return 0; // ❌ No offset possible
-    }
-  
-    let remainingStake = newBet.betValue;
-    let releasedLiability = 0;
-  
-    for (const bet of sameSelectionOppositeBets) {
-      if (remainingStake <= 0) break;
-  
-      const offsetQty = Math.min(bet.betValue, remainingStake);
-  
-      // BACK releases stake, LAY releases (odds-1)*stake
-      const betLiability =
-        bet.betType === 'BACK'
-          ? offsetQty
-          : (bet.betRate - 1) * offsetQty;
-  
-      releasedLiability += betLiability;
-      remainingStake -= offsetQty;
-    }
-  
-    // 🔥 NEGATIVE means liability release
-    return -releasedLiability;
-  }
-  
 
   async placeBet(input: PlaceBetDto) {
     const debug: Record<string, unknown> = {};
@@ -544,20 +507,16 @@ export class BetsService {
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
     // 3. VALIDATE RATE AVAILABILITY (before placing bet)
-    // TODO: Re-enable validation for production
-    // Temporarily disabled for testing Gola Fancy with dummy data
-    /*
-    if (eventId && normalizedBetRate > 0) {
-      await this.validateRateAvailability(
-        eventId,
-        marketId,
-        actualMarketType,
-        normalizedBetRate,
-        normalizedSelectionId,
-        bet_type,
-      );
-    }
-    */
+    // if (eventId && normalizedBetRate > 0) {
+    //   await this.validateRateAvailability(
+    //     eventId,
+    //     marketId,
+    //     actualMarketType,
+    //     normalizedBetRate,
+    //     normalizedSelectionId,
+    //     bet_type,
+    //   );
+    // }
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
@@ -645,20 +604,12 @@ export class BetsService {
           let bookmakerDelta = 0;
 
           if (actualMarketType === 'matchodds') {
-            // 1️⃣ Try HARD OFFSET first (selection based)
-            const selectionOffsetDelta =
-              this.calculateMatchOddsSelectionOffset(allPendingBets, newBet);
-
-            if (selectionOffsetDelta !== 0) {
-              matchOddsDelta = selectionOffsetDelta;
-            } else {
-              // 2️⃣ Fallback to exposure delta (only if no cancel)
-              matchOddsDelta =
-                this.matchOddsExposureService.calculateMatchOddsExposureDelta(
-                  allPendingBets,
-                  newBet,
-                );
-            }
+            // ✅ Match Odds exposure delta (single source of truth)
+            matchOddsDelta =
+              this.matchOddsExposureService.calculateMatchOddsExposureDelta(
+                allPendingBets,
+                newBet,
+              );
           } else if (actualMarketType === 'fancy') {
             // ✅ FANCY DELTA using Maximum Possible Loss model
             // Use calculateFancyGroupDeltaSafe to isolate by group (marketId + selectionId)
