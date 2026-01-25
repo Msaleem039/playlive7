@@ -125,42 +125,80 @@ export class FancyExposureService {
    * @param actualRuns - The actual outcome value (runs/score)
    * @returns Total P/L (positive = profit, negative = loss)
    */
-  private calculateTotalPlForOutcome(fancyBets: any[], actualRuns: number): number {
-    let totalPl = 0;
+  // private calculateTotalPlForOutcome(fancyBets: any[], actualRuns: number): number {
+  //   let totalPl = 0;
 
+  //   for (const bet of fancyBets) {
+  //     const betType = (bet.betType || '').toUpperCase();
+  //     const line = bet.betRate ?? bet.odds ?? 0;
+  //     const stake = bet.betValue ?? bet.amount ?? 0;
+  //     const winAmount = bet.winAmount ?? stake;
+  //     const lossAmount = bet.lossAmount ?? stake;
+
+  //     const isYes = betType === 'YES' || betType === 'BACK';
+  //     const isNo = betType === 'NO' || betType === 'LAY';
+
+  //     let betWins = false;
+
+  //     if (isYes) {
+  //       // YES/BACK: Win if actualRuns >= line
+  //       betWins = actualRuns >= line;
+  //     } else if (isNo) {
+  //       // NO/LAY: Win if actualRuns < line
+  //       betWins = actualRuns < line;
+  //     }
+
+  //     // Calculate P/L for this bet
+  //     if (betWins) {
+  //       // Bet wins: profit = winAmount
+  //       totalPl += winAmount;
+  //     } else {
+  //       // Bet loses: loss = -lossAmount
+  //       totalPl -= lossAmount;
+  //     }
+  //   }
+
+  //   return totalPl;
+  // }
+  private calculateTotalPlForOutcome(
+    fancyBets: any[],
+    actualRuns: number,
+  ): number {
+    let totalPl = 0;
+  
     for (const bet of fancyBets) {
       const betType = (bet.betType || '').toUpperCase();
       const line = bet.betRate ?? bet.odds ?? 0;
+  
+      // ✅ Fancy stake is the ONLY value that matters
       const stake = bet.betValue ?? bet.amount ?? 0;
-      const winAmount = bet.winAmount ?? stake;
-      const lossAmount = bet.lossAmount ?? stake;
-
+  
       const isYes = betType === 'YES' || betType === 'BACK';
       const isNo = betType === 'NO' || betType === 'LAY';
-
+  
       let betWins = false;
-
+  
       if (isYes) {
-        // YES/BACK: Win if actualRuns >= line
+        // YES / BACK wins if actualRuns >= line
         betWins = actualRuns >= line;
       } else if (isNo) {
-        // NO/LAY: Win if actualRuns < line
+        // NO / LAY wins if actualRuns < line
         betWins = actualRuns < line;
       }
-
-      // Calculate P/L for this bet
+  
+      // ✅ FANCY P/L RULE
       if (betWins) {
-        // Bet wins: profit = winAmount
-        totalPl += winAmount;
+        // Profit = +stake (NOT winAmount, NOT odds)
+        totalPl += stake;
       } else {
-        // Bet loses: loss = -lossAmount
-        totalPl -= lossAmount;
+        // Loss = -stake
+        totalPl -= stake;
       }
     }
-
+  
     return totalPl;
   }
-
+  
   /**
    * @deprecated - Replaced by calculateFancyMaxLoss (Maximum Possible Loss model)
    * Kept for reference only - not used in active code path

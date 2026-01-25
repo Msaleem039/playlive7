@@ -445,6 +445,13 @@ export class BetsService {
       betGtype = 'bookmaker';
     }
 
+    // ✅ FIX: Fancy BACK/YES bets use fixed winAmount = stake (bet_rate is only a comparison line)
+    if (betGtype === 'fancy' && (isBackBet || bet_type?.toUpperCase() === 'BACK')) {
+      // Fancy profit is FIXED: winAmount = stake, lossAmount = stake
+      // bet_rate is ONLY a comparison line, NEVER a multiplier
+      normalizedWinAmount = normalizedBetValue; // winAmount = stake
+    }
+
     // Calculate lossAmount based on market type
     let normalizedLossAmount = 0;
 
@@ -501,73 +508,73 @@ export class BetsService {
 
     // 3. VALIDATE RATE AVAILABILITY (before placing bet)
     // Skip validation for match odds since MATCH_ODDS markets are filtered out
-    if (eventId && normalizedBetRate > 0 && actualMarketType !== 'matchodds') {
-      const acceptedRate = await this.validateRateAvailability(
-        eventId,
-        marketId,
-        actualMarketType,
-        normalizedBetRate,
-        normalizedSelectionId,
-        bet_type,
-      );
+    // if (eventId && normalizedBetRate > 0 && actualMarketType !== 'matchodds') {
+    //   const acceptedRate = await this.validateRateAvailability(
+    //     eventId,
+    //     marketId,
+    //     actualMarketType,
+    //     normalizedBetRate,
+    //     normalizedSelectionId,
+    //     bet_type,
+    //   );
 
-      // 🔥 OVERRIDE rate everywhere
-      normalizedBetRate = acceptedRate;
+    //   // 🔥 OVERRIDE rate everywhere
+    //   normalizedBetRate = acceptedRate;
 
-      // Recalculate winAmount with accepted rate
-      if (normalizedBetValue > 0 && normalizedBetRate > 0) {
-        if (isBackBet) {
-          // BACK bet: winAmount = stake * odds (total return)
-          normalizedWinAmount = normalizedBetValue * normalizedBetRate;
-        } else if (isLayBet) {
-          // LAY bet: winAmount = stake (if bet wins, we keep the stake)
-          normalizedWinAmount = normalizedBetValue;
-        }
-      }
+    //   // Recalculate winAmount with accepted rate
+    //   if (normalizedBetValue > 0 && normalizedBetRate > 0) {
+    //     if (isBackBet) {
+    //       // BACK bet: winAmount = stake * odds (total return)
+    //       normalizedWinAmount = normalizedBetValue * normalizedBetRate;
+    //     } else if (isLayBet) {
+    //       // LAY bet: winAmount = stake (if bet wins, we keep the stake)
+    //       normalizedWinAmount = normalizedBetValue;
+    //     }
+    //   }
 
-      // Recalculate lossAmount with accepted rate
-      if (betGtype === 'fancy') {
-        const upperBetType = bet_type?.toUpperCase();
+    //   // Recalculate lossAmount with accepted rate
+    //   if (betGtype === 'fancy') {
+    //     const upperBetType = bet_type?.toUpperCase();
         
-        if (upperBetType === 'NO' || upperBetType === 'LAY') {
-          // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
-          const payloadLossAmount = Number(loss_amount) || 0;
-          if (payloadLossAmount > 0) {
-            normalizedLossAmount = payloadLossAmount;
-          } else {
-            // Fallback to calculated liability
-            normalizedLossAmount = this.calculateLiability(
-              gtype,
-              bet_type,
-              normalizedBetValue,
-              normalizedBetRate
-            );
-          }
-        } else {
-          // Fancy YES/BACK: Use calculated liability
-          normalizedLossAmount = this.calculateLiability(
-            gtype,
-            bet_type,
-            normalizedBetValue,
-            normalizedBetRate
-          );
-        }
-      } else if (betGtype === 'bookmaker') {
-        normalizedLossAmount = this.calculateLiability(
-          gtype,
-          bet_type,
-          normalizedBetValue,
-          normalizedBetRate
-        );
-      } else if (betGtype === 'matchodds') {
-        normalizedLossAmount = isBackBet
-          ? normalizedBetValue
-          : (normalizedBetRate - 1) * normalizedBetValue;
-      }
+    //     if (upperBetType === 'NO' || upperBetType === 'LAY') {
+    //       // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
+    //       const payloadLossAmount = Number(loss_amount) || 0;
+    //       if (payloadLossAmount > 0) {
+    //         normalizedLossAmount = payloadLossAmount;
+    //       } else {
+    //         // Fallback to calculated liability
+    //         normalizedLossAmount = this.calculateLiability(
+    //           gtype,
+    //           bet_type,
+    //           normalizedBetValue,
+    //           normalizedBetRate
+    //         );
+    //       }
+    //     } else {
+    //       // Fancy YES/BACK: Use calculated liability
+    //       normalizedLossAmount = this.calculateLiability(
+    //         gtype,
+    //         bet_type,
+    //         normalizedBetValue,
+    //         normalizedBetRate
+    //       );
+    //     }
+    //   } else if (betGtype === 'bookmaker') {
+    //     normalizedLossAmount = this.calculateLiability(
+    //       gtype,
+    //       bet_type,
+    //       normalizedBetValue,
+    //       normalizedBetRate
+    //     );
+    //   } else if (betGtype === 'matchodds') {
+    //     normalizedLossAmount = isBackBet
+    //       ? normalizedBetValue
+    //       : (normalizedBetRate - 1) * normalizedBetValue;
+    //   }
 
-      // Recalculate to_return after rate override
-      to_return = normalizedWinAmount + normalizedLossAmount;
-    }
+    //   // Recalculate to_return after rate override
+    //   to_return = normalizedWinAmount + normalizedLossAmount;
+    // }
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)

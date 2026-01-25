@@ -428,6 +428,8 @@ export class SettlementService {
                     if (betType === 'BACK' || betType === 'YES') {
                   // BACK/YES WIN: return stake + profit
                   balanceDelta += stake + winAmount;
+
+                  //  balanceDelta += winAmount;
                     } else {
                   // LAY/NO WIN: return locked stake (lossAmount) + profit
                   balanceDelta += lossAmount + winAmount;
@@ -500,40 +502,8 @@ export class SettlementService {
       },
     );
 
-    // Recalculate P/L for all affected users
-    await Promise.all(
-      Array.from(affectedUserIds).map(async (userId) => {
-        try {
-          await this.pnlService.recalculateUserPnlAfterSettlement(
-            userId,
-            eventId,
-          );
-          // Distribute hierarchical P/L for FANCY market
-          // @ts-ignore - userPnl property exists after Prisma client regeneration
-          const userPnl = await this.prisma.userPnl.findUnique({
-            where: {
-              userId_eventId_marketType: {
-                userId,
-                eventId,
-                marketType: MarketType.FANCY,
-              },
-            },
-          });
-          if (userPnl) {
-            await this.hierarchyPnlService.distributePnL(
-              userId,
-              eventId,
-              MarketType.FANCY,
-              userPnl.netPnl,
-            );
-          }
-        } catch (error) {
-          this.logger.warn(
-            `Failed to recalculate P/L for user ${userId}: ${(error as Error).message}`,
-          );
-        }
-      }),
-    );
+    // Recalculate P/L for all affected users (Fancy-specific)
+    await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
 
     return { success: true, message: 'Fancy bets settled successfully' };
   }
@@ -1103,7 +1073,47 @@ export class SettlementService {
     });
   }
 
-  // Helper: Recalculate P/L for affected users
+  // Helper: Recalculate P/L for affected users (Fancy-specific)
+  private async recalculatePnLForUsersFancy(
+    affectedUserIds: Set<string>,
+    eventId: string,
+  ): Promise<void> {
+    await Promise.all(
+      Array.from(affectedUserIds).map(async (userId) => {
+        try {
+          await this.pnlService.recalculateUserPnlAfterSettlement(
+            userId,
+            eventId,
+          );
+          // Distribute hierarchical P/L for FANCY market
+          // @ts-ignore - userPnl property exists after Prisma client regeneration
+          const userPnl = await this.prisma.userPnl.findUnique({
+            where: {
+              userId_eventId_marketType: {
+                userId,
+                eventId,
+                marketType: MarketType.FANCY,
+              },
+            },
+          });
+          if (userPnl) {
+            await this.hierarchyPnlService.distributePnL(
+              userId,
+              eventId,
+              MarketType.FANCY,
+              userPnl.netPnl,
+            );
+          }
+        } catch (error) {
+          this.logger.warn(
+            `Failed to recalculate P/L for user ${userId} (Fancy): ${(error as Error).message}`,
+          );
+        }
+      }),
+    );
+  }
+
+  // Helper: Recalculate P/L for affected users (Generic - for Match Odds and Bookmaker)
   private async recalculatePnLForUsers(
     affectedUserIds: Set<string>,
     eventId: string,
