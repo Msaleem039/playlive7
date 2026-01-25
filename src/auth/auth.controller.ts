@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Patch, BadRequestException, Param } from '@nestjs/common';
+import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Patch, BadRequestException, Param, Query } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -152,8 +152,12 @@ export class AuthController {
   
   @Get('subordinates')
   @UseGuards(JwtAuthGuard)
-  async getSubordinates(@CurrentUser() currentUser: User) {
-    return this.authService.getSubordinates(currentUser.id);
+  async getSubordinates(
+    @CurrentUser() currentUser: User,
+    @Query('parentId') parentId?: string,
+    @Query('type') type?: string,
+  ) {
+    return this.authService.getSubordinates(currentUser, parentId, type);
   }
 
   /**

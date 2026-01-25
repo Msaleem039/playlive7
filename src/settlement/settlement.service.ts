@@ -717,62 +717,32 @@ export class SettlementService {
           let totalPayout = 0; // Total amount to add to wallet.balance
           let totalBetLiability = 0; // Total liability to release from wallet.liability
 
-          // 3️⃣ Process each bet and calculate payout
+          // 3️⃣ Process each bet and calculate payout (collect updates for batching)
+          const betUpdates: Array<{ id: string; status: BetStatus; pnl: number }> = [];
+          
           for (const bet of userBets) {
             const stake = bet.betValue ?? bet.amount ?? 0;
             const odds = bet.betRate ?? bet.odds ?? 0;
             const betType = bet.betType?.toUpperCase() || '';
-
-            this.logger.log(
-              `[BET PROCESSING] Bet ${bet.id}: ` +
-              `betType=${betType}, stake=${stake}, odds=${odds}, ` +
-              `isOffset=${offsetBetIds.has(bet.id)}, ` +
-              `totalPayout=${totalPayout}, totalBetLiability=${totalBetLiability}`,
-            );
             
             // ✅ OFFSET: Skip all calculations for OFFSET bets
             if (offsetBetIds.has(bet.id)) {
-              // Mark as CANCELLED but skip payout/liability
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.CANCELLED,
-                  // @ts-ignore
-                  pnl: 0,
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
+              betUpdates.push({
+                id: bet.id,
+                status: BetStatus.CANCELLED,
+                pnl: 0,
               });
-              this.logger.log(
-                `[OFFSET SKIP] Bet ${bet.id} skipped from settlement calculations. ` +
-                `Marked as CANCELLED with pnl=0. No wallet changes.`,
-              );
               continue; // Skip all payout/liability calculations
             }
-
-            // Calculate bet liability (for liability release only, not for payout)
-            // let betLiability = 0;
-            // if (betType === 'BACK') {
-            //   betLiability = stake;
-            // } else if (betType === 'LAY') {
-            //   betLiability = this.layLiability(stake, odds);
-            // }
-            // totalBetLiability += betLiability;
 
             // CANCEL/TIE: Refund stake
             if (isCancel) {
               const payoutPerBet = stake;
               totalPayout += payoutPerBet;
-
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.CANCELLED,
-                  // @ts-ignore
-                  pnl: 0,
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
+              betUpdates.push({
+                id: bet.id,
+                status: BetStatus.CANCELLED,
+                pnl: 0,
               });
               continue;
             }
@@ -821,38 +791,19 @@ export class SettlementService {
                 const payoutPerBet = stake * odds;
                 totalPayout += payoutPerBet;
                 const profit = stake * (odds - 1); // For reporting only
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    // @ts-ignore
-                    pnl: profit, // Reporting: profit only
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.WON,
+                  pnl: profit,
                 });
-                this.logger.debug(
-                  `BACK bet ${bet.id} WON. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}, profit: ${profit}`,
-                );
               } else {
                 // BACK LOSS: 0 payout
-                const payoutPerBet = 0;
-                totalPayout += payoutPerBet;
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: -stake, // Reporting: loss amount (for reporting only, not applied to wallet)
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                totalPayout += 0;
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.LOST,
+                  pnl: -stake,
                 });
-                this.logger.debug(
-                  `BACK bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}`,
-                );
               }
             }
 
@@ -862,49 +813,44 @@ export class SettlementService {
                 // ✅ CLIENT RULE: LAY WIN = stake + profit
                 const profit = this.layLiability(stake, odds); // stake * (odds - 1)
                 const payoutPerBet = stake + profit;           // FULL RETURN
-
                 totalPayout += payoutPerBet;
-
                 // ✅ Release ONLY locked liability (profit part)
                 totalBetLiability += profit;
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    // @ts-ignore
-                    pnl: profit, // reporting only
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.WON,
+                  pnl: profit,
                 });
-
-                this.logger.debug(
-                  `LAY bet ${bet.id} WON (CLIENT MODE). stake=${stake}, odds=${odds}, ` +
-                  `profit=${profit}, payout=${payoutPerBet}, liabilityReleased=${profit}`,
-                );
               } else {
                 // LAY LOSS: 0 payout + DO NOT release liability
-                const payoutPerBet = 0;
-                totalPayout += payoutPerBet;
+                totalPayout += 0;
                 const liab = this.layLiability(stake, odds); // For reporting only
-                // ✅ LAY LOSS: Liability remains locked (do NOT add to totalBetLiability)
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: -liab, // Reporting: loss amount (for reporting only, not applied to wallet)
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.LOST,
+                  pnl: -liab,
                 });
-                this.logger.debug(
-                  `LAY bet ${bet.id} LOST. selectionId: ${bet.selectionId}, winnerSelectionId: ${winnerSelectionIdNum}, payout: ${payoutPerBet}, liabilityRemains: ${liab}`,
-                );
               }
             }
+          }
+
+          // 🚀 BATCH UPDATE: Update all bets at once instead of individually
+          if (betUpdates.length > 0) {
+            const now = new Date();
+            await Promise.all(
+              betUpdates.map((update) =>
+                tx.bet.update({
+                  where: { id: update.id },
+                  data: {
+                    status: update.status,
+                    // @ts-ignore
+                    pnl: update.pnl,
+                    settledAt: now,
+                    updatedAt: now,
+                  },
+                }),
+              ),
+            );
           }
 
           // 4️⃣ Apply wallet changes ONCE per user
@@ -1289,9 +1235,15 @@ export class SettlementService {
           `Skipping API call for expired eventId ${eventId} (cached). Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
         );
       } else {
-        // Try to fetch market details from API
+        // Try to fetch market details from API (with timeout to avoid blocking settlement)
         try {
-          const apiResponse = await this.aggregatorService.getMatchDetail(eventId);
+          // Use Promise.race to timeout API call after 2 seconds
+          const apiResponse = await Promise.race([
+            this.aggregatorService.getMatchDetail(eventId),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('API timeout')), 2000)
+            ),
+          ]) as any;
           marketDetails = Array.isArray(apiResponse) ? apiResponse : null;
         if (marketDetails && marketDetails.length > 0) {
           // Find Match Odds market
@@ -1316,7 +1268,14 @@ export class SettlementService {
         } catch (error: any) {
           // Check if this is a 400 error (invalid/expired eventId) - mark as expired
           const status = error?.details?.status || error?.response?.status;
-          if (status === 400) {
+          const isTimeout = error?.message === 'API timeout';
+          
+          if (isTimeout) {
+            // API timeout - skip validation, use bet-based validation
+            this.logger.debug(
+              `API call timed out for eventId ${eventId}. Using bet-based validation.`,
+            );
+          } else if (status === 400) {
             // Mark as expired to avoid future API calls for this eventId
             this.markEventIdAsExpired(eventId);
             this.logger.debug(
@@ -1324,7 +1283,7 @@ export class SettlementService {
             );
           } else {
             // API failed for other reasons - will validate against bets instead
-            this.logger.warn(
+            this.logger.debug(
               `Market API validation failed: ${(error as Error).message}. ` +
               `Will validate winnerSelectionId against found bets' selectionIds as fallback.`,
             );
@@ -1818,20 +1777,13 @@ export class SettlementService {
           let balanceDelta = 0;
           let liabilityDelta = 0;
 
+          // 🚀 OPTIMIZATION: Collect bet updates for batching
+          const betUpdates: Array<{ id: string; status: BetStatus; pnl: number }> = [];
+
           // 3️⃣ Process each bet with BOOKMAKER-SPECIFIC rules
           for (const bet of userBets) {
-            // 🔐 HARD GUARD: Bet must be PENDING (double-check inside transaction)
-            const currentBet = await tx.bet.findUnique({
-              where: { id: bet.id },
-              select: { status: true },
-            });
-
-            if (!currentBet || currentBet.status !== BetStatus.PENDING) {
-              throw new BadRequestException(
-                `CRITICAL: Bet ${bet.id} is not PENDING (status: ${currentBet?.status || 'NOT_FOUND'}). ` +
-                `Settlement aborted to prevent double settlement.`,
-              );
-            }
+            // 🔐 HARD GUARD: Bet status already validated before transaction
+            // Skip redundant status check to improve performance
 
             const stake = Number(bet.betValue ?? bet.amount ?? 0);
             const odds = Number(bet.betRate ?? bet.odds ?? 0);
@@ -1872,49 +1824,21 @@ export class SettlementService {
                 const profit = this.bookmakerBackProfit(stake, odds);
                 balanceDelta += profit; // ✅ Credit profit ONLY
                 liabilityDelta -= stake; // ✅ Release liability
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    // @ts-ignore
-                    pnl: profit,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.WON,
+                  pnl: profit,
                 });
-
-                // 🧾 LOG EVERYTHING THAT MOVES MONEY
-                this.logger.log(
-                  `BOOKMAKER BACK WIN: betId=${bet.id}, userId=${userId}, ` +
-                  `stake=${stake}, odds=${odds}, betType=BACK, ` +
-                  `profit=${profit}, liability=${stakeLiability}, ` +
-                  `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
-                );
               } else {
                 // ✅ BACK LOSS: liability -= stake ONLY
                 // ⚠️ CRITICAL: Balance unchanged (stake already deducted at placement)
                 // NO balance change - stake was already deducted when bet was placed
                 liabilityDelta -= stake; // ✅ Release liability ONLY
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: -stake, // Reporting: loss amount
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.LOST,
+                  pnl: -stake,
                 });
-
-                // 🧾 LOG EVERYTHING THAT MOVES MONEY
-                this.logger.log(
-                  `BOOKMAKER BACK LOSS: betId=${bet.id}, userId=${userId}, ` +
-                  `stake=${stake}, odds=${odds}, betType=BACK, ` +
-                  `profit=0 (no balance change), liability=${stake} (released), ` +
-                  `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
-                );
               }
             }
 
@@ -1929,51 +1853,50 @@ export class SettlementService {
                 // Only release liability
                 liabilityDelta -= layLiability; // ✅ Release liability ONLY
                 const profit = stake; // For reporting only (NOT credited to balance)
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    // @ts-ignore
-                    pnl: profit, // Reporting: profit amount
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.WON,
+                  pnl: profit,
                 });
-
-                // 🧾 LOG EVERYTHING THAT MOVES MONEY
-                this.logger.log(
-                  `BOOKMAKER LAY WIN: betId=${bet.id}, userId=${userId}, ` +
-                  `stake=${stake}, odds=${odds}, betType=LAY, ` +
-                  `profit=${profit} (reporting only), liability=${layLiability}, ` +
-                  `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
-                );
               } else {
                 // ✅ LAY LOSS (selection wins): balance -= (stake * odds / 100), liability -= (stake * odds / 100)
                 // ⚠️ CRITICAL: Deduct loss amount = liability (we pay opponent)
                 balanceDelta -= layLiability; // ✅ Deduct loss
                 liabilityDelta -= layLiability; // ✅ Release liability
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: -layLiability, // Reporting: loss amount
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.LOST,
+                  pnl: -layLiability,
                 });
-
-                // 🧾 LOG EVERYTHING THAT MOVES MONEY
-                this.logger.log(
-                  `BOOKMAKER LAY LOSS: betId=${bet.id}, userId=${userId}, ` +
-                  `stake=${stake}, odds=${odds}, betType=LAY, ` +
-                  `profit=${-layLiability}, liability=${layLiability}, ` +
-                  `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
-                );
               }
             }
+          }
+
+          // 🚀 BATCH UPDATE: Update all bets at once instead of individually
+          if (betUpdates.length > 0) {
+            const now = new Date();
+            await Promise.all(
+              betUpdates.map((update) =>
+                tx.bet.update({
+                  where: { id: update.id },
+                  data: {
+                    status: update.status,
+                    // @ts-ignore
+                    pnl: update.pnl,
+                    settledAt: now,
+                    updatedAt: now,
+                  },
+                }),
+              ),
+            );
+          }
+
+          // 🧾 LOG settlement summary (reduced verbosity)
+          if (betUpdates.length > 0) {
+            this.logger.log(
+              `BOOKMAKER Settlement for userId=${userId}: ` +
+              `bets=${betUpdates.length}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
+            );
           }
 
           // 4️⃣ PREVENT DOUBLE LIABILITY RELEASE: Clamp liability to prevent negative values
@@ -5153,7 +5076,7 @@ export class SettlementService {
 
     // OPTIMIZED: Batch fetch all bets for all settlements in a single query
     const settlementIds = settlements.map((s) => s.settlementId);
-    const allBets = settlementIds.length > 0
+    const allBetsRaw = settlementIds.length > 0
       ? await this.prisma.bet.findMany({
           where: {
             settlementId: { in: settlementIds },
@@ -5171,13 +5094,6 @@ export class SettlementService {
             settledAt: true,
             rollbackAt: true,
             createdAt: true,
-            user: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-              },
-            },
             match: {
               select: {
                 id: true,
@@ -5190,6 +5106,27 @@ export class SettlementService {
           },
         })
       : [];
+
+    // Fetch users separately to handle missing users gracefully
+    const userIds = [...new Set(allBetsRaw.map(b => b.userId).filter((id): id is string => id !== null))];
+    const users = userIds.length > 0
+      ? await this.prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: {
+            id: true,
+            name: true,
+            username: true,
+          },
+        })
+      : [];
+    
+    const usersMap = new Map(users.map(u => [u.id, u]));
+    
+    // Join users to bets
+    const allBets = allBetsRaw.map(bet => ({
+      ...bet,
+      user: bet.userId ? usersMap.get(bet.userId) || null : null,
+    }));
 
     // Group bets by settlementId for O(1) lookup
     const betsBySettlementId = new Map<string, typeof allBets>();
@@ -5290,8 +5227,8 @@ export class SettlementService {
           bets: bets.map((bet) => ({
             id: bet.id,
             userId: bet.userId,
-            userName: bet.user.name,
-            userUsername: bet.user.username,
+            userName: bet.user?.name || null,
+            userUsername: bet.user?.username || null,
             amount: bet.amount,
             odds: bet.odds,
             betType: bet.betType,

@@ -286,10 +286,14 @@ export class CricketIdService {
    * Endpoint: /v3/bookmakerFancy?eventId={eventId}
    * Returns bookmaker fancy data with markets, sections, odds, etc.
    * Data is sorted in the following order:
-   * 1. match_odds (MATCH_ODDS)
-   * 2. bookmakerfancy (Bookmaker, Bookmaker 2)
-   * 3. tie match (Tied Match, TIED_MATCH)
-   * 4. normal fancy (all other fancy types)
+   * 1. bookmakerfancy (Bookmaker, Bookmaker 2)
+   * 2. tie match (Tied Match, TIED_MATCH)
+   * 3. normal fancy (all other fancy types)
+   * 
+   * Excluded markets:
+   * - MATCH_ODDS
+   * - Markets containing "bhav" in the name (case-insensitive)
+   * 
    * @param eventId - Event ID (e.g., "34917574")
    */
   async getBookmakerFancy(eventId: string | number) {
@@ -305,6 +309,7 @@ export class CricketIdService {
     }>('/v3/bookmakerFancy', { eventId });
 
     // Sort the data array according to the required sequence
+    // Note: MATCH_ODDS will be sorted but filtered out later
     if (response && response.data && Array.isArray(response.data)) {
       response.data.sort((a, b) => {
         // Helper function to get sort priority
@@ -312,7 +317,7 @@ export class CricketIdService {
           const mname = item.mname?.toUpperCase() || '';
           const gtype = item.gtype?.toLowerCase() || '';
 
-          // 1. match_odds (MATCH_ODDS)
+          // 1. match_odds (MATCH_ODDS) - will be filtered out later
           if (mname === 'MATCH_ODDS') {
             return 1;
           }
@@ -348,35 +353,53 @@ export class CricketIdService {
 
       // Filter to ONLY include these exact market names (all others are skipped):
       // - "Normal"
-      // - "MATCH_ODDS"
       // - "Bookmaker"
       // - "TIED_MATCH"
+      // Excludes: 
+      // - MATCH_ODDS markets
+      // - Sections containing "bhav" in their nat field (case-insensitive)
       response.data = response.data.filter((market) => {
         const mname = market.mname?.toUpperCase() || '';
         const originalMname = market.mname || '';
 
-        // 1. MATCH_ODDS (case-insensitive)
+        // Skip MATCH_ODDS
         if (mname === 'MATCH_ODDS') {
-          return true;
+          return false;
         }
 
-        // 2. Bookmaker (exact match, case-sensitive)
+        // Skip markets containing "bhav" (case-insensitive)
+        if (originalMname.toLowerCase().includes('bhav')) {
+          return false;
+        }
+
+        // 1. Bookmaker (exact match, case-sensitive)
         if (originalMname === 'Bookmaker') {
           return true;
         }
 
-        // 3. TIED_MATCH (case-insensitive)
+        // 2. TIED_MATCH (case-insensitive)
         if (mname === 'TIED_MATCH') {
           return true;
         }
 
-        // 4. Normal (exact match, case-sensitive)
+        // 3. Normal (exact match, case-sensitive)
         if (originalMname === 'Normal') {
           return true;
         }
 
         // Exclude all other markets
         return false;
+      });
+
+      // Filter out sections containing "bhav" in their nat field (case-insensitive)
+      response.data.forEach((market) => {
+        if (market.section && Array.isArray(market.section)) {
+          market.section = market.section.filter((section) => {
+            const nat = section.nat || '';
+            // Exclude sections with "bhav" in nat field
+            return !nat.toLowerCase().includes('bhav');
+          });
+        }
       });
 
       // Add isSuspended field to each market

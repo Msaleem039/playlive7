@@ -375,6 +375,11 @@ export class AuthService {
   /**
    * Get subordinates with financial information
    * 
+   * Enhanced to support hierarchical drill-down:
+   * - Default: Returns direct subordinates of current user
+   * - With parentId: Returns children of specified parent (with access validation)
+   * - With parentId + type=bets: Returns bet history for CLIENT
+   * 
    * BETFAIR STANDARD: Uses userPnl as single source of truth for P/L
    * 
    * CRITICAL:
@@ -386,9 +391,32 @@ export class AuthService {
    * Validation check:
    * balance_after_settlement === opening_balance + deposits - withdrawals + total_net_pnl
    */
-  async getSubordinates(userId: string) {
+  async getSubordinates(
+    currentUser: User,
+    parentId?: string,
+    type?: string,
+  ) {
+    // 🔐 ACCESS VALIDATION: CLIENT role cannot access this endpoint
+    if (currentUser.role === UserRole.CLIENT) {
+      throw new ForbiddenException('Clients are not allowed to access this endpoint');
+    }
+
+    // If type=bets and parentId provided, return bet history
+    if (type === 'bets' && parentId) {
+      return this.getClientBetHistory(currentUser, parentId);
+    }
+
+    // Determine target parentId (default to current user if not provided)
+    let targetParentId = currentUser.id;
+
+    // If parentId is provided, validate access and resolve to actual user ID
+    if (parentId) {
+      targetParentId = await this.validateHierarchyAccess(currentUser, parentId);
+    }
+
+    // Get children of target parent
     const users = await this.prisma.user.findMany({
-      where: { parentId: userId },
+      where: { parentId: targetParentId },
       include: {
         wallet: {
           select: {
@@ -456,6 +484,169 @@ export class AuthService {
         updatedAt: user.updatedAt,
       };
     });
+  }
+
+  /**
+   * Find user by ID or username
+   */
+  private async findUserByIdOrUsername(identifier: string) {
+    // Try to find by ID first
+    let user = await this.prisma.user.findUnique({
+      where: { id: identifier },
+      select: {
+        id: true,
+        role: true,
+        parentId: true,
+        username: true,
+      },
+    });
+
+    // If not found by ID, try username
+    if (!user) {
+      user = await this.prisma.user.findUnique({
+        where: { username: identifier },
+        select: {
+          id: true,
+          role: true,
+          parentId: true,
+          username: true,
+        },
+      });
+    }
+
+    return user;
+  }
+
+  /**
+   * Validate that current user can access target user's data based on hierarchy
+   */
+  private async validateHierarchyAccess(currentUser: User, targetIdentifier: string): Promise<string> {
+    // SUPER_ADMIN can access anyone
+    if (currentUser.role === UserRole.SUPER_ADMIN) {
+      // Still need to find the user to return their ID
+      const targetUser = await this.findUserByIdOrUsername(targetIdentifier);
+      if (!targetUser) {
+        throw new BadRequestException('Target user not found');
+      }
+      return targetUser.id;
+    }
+
+    // Get target user by ID or username
+    const targetUser = await this.findUserByIdOrUsername(targetIdentifier);
+
+    if (!targetUser) {
+      throw new BadRequestException('Target user not found');
+    }
+
+    // Check if target user is in current user's hierarchy
+    const isInHierarchy = await this.isUserInHierarchy(currentUser.id, targetUser.id);
+    
+    if (!isInHierarchy) {
+      throw new ForbiddenException('You do not have access to this user\'s data');
+    }
+
+    return targetUser.id;
+  }
+
+  /**
+   * Check if target user is in current user's hierarchy (recursive check)
+   */
+  private async isUserInHierarchy(currentUserId: string, targetUserId: string): Promise<boolean> {
+    // If target is current user, allow
+    if (targetUserId === currentUserId) {
+      return true;
+    }
+
+    // Get all descendants of current user recursively
+    const descendants = await this.getAllDescendants(currentUserId);
+    return descendants.some(desc => desc.id === targetUserId);
+  }
+
+  /**
+   * Get all descendants of a user (recursive)
+   */
+  private async getAllDescendants(userId: string): Promise<Array<{ id: string; role: UserRole }>> {
+    const descendants: Array<{ id: string; role: UserRole }> = [];
+    const queue: string[] = [userId];
+
+    while (queue.length > 0) {
+      const currentId = queue.shift()!;
+      const children = await this.prisma.user.findMany({
+        where: { parentId: currentId },
+        select: {
+          id: true,
+          role: true,
+        },
+      });
+
+      for (const child of children) {
+        descendants.push(child);
+        queue.push(child.id);
+      }
+    }
+
+    return descendants;
+  }
+
+  /**
+   * Get bet history for a CLIENT
+   * Only accessible if client is in current user's hierarchy
+   */
+  private async getClientBetHistory(currentUser: User, clientIdentifier: string) {
+    // Validate access and get actual user ID (supports both ID and username)
+    const clientId = await this.validateHierarchyAccess(currentUser, clientIdentifier);
+
+    // Get client to verify role
+    const client = await this.prisma.user.findUnique({
+      where: { id: clientId },
+      select: { role: true },
+    });
+
+    if (!client) {
+      throw new BadRequestException('Client not found');
+    }
+
+    if (client.role !== UserRole.CLIENT) {
+      throw new BadRequestException('Bet history is only available for CLIENT users');
+    }
+
+    // Get all bets for this client (bet history includes all bets)
+    const bets = await this.prisma.bet.findMany({
+      where: {
+        userId: clientId,
+      },
+      select: {
+        id: true,
+        betName: true,
+        marketName: true,
+        marketType: true,
+        betRate: true,
+        odds: true,
+        betValue: true,
+        amount: true,
+        pnl: true,
+        createdAt: true,
+        status: true,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      take: 1000, // Limit to prevent excessive data
+    });
+
+    // Transform to required format
+    return bets.map((bet) => ({
+      id: bet.id,
+      name: bet.betName || null,
+      marketName: bet.marketName || null,
+      marketType: bet.marketType || null,
+      odds: bet.betRate || bet.odds,
+      stake: bet.betValue || bet.amount,
+      netProfit: bet.pnl || 0, // pnl is the net profit/loss
+      createdAt: bet.createdAt,
+      status: bet.status,
+      // WIN/LOSS derivable from netProfit: positive = WIN, negative = LOSS, zero = CANCELLED/PENDING
+    }));
   }
 
   async toggleUserStatus(currentUser: User, targetUserId: string, isActive: boolean) {

@@ -211,127 +211,97 @@ export class BetsService {
     requestedRate: number,
     selectionId: number,
     betType?: string,
-  ): Promise<void> {
+  ): Promise<number> {
     try {
-      // Both match odds and fancy are in getBookmakerFancy response
       const marketData = await this.cricketIdService.getBookmakerFancy(eventId);
-      
+  
       if (!marketData?.data || !Array.isArray(marketData.data)) {
         throw new HttpException(
-          {
-            success: false,
-            error: 'Rate not matched',
-            code: 'RATE_NOT_MATCHED',
-          },
+          { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
           400,
         );
       }
-
-      // Determine expected market name and bet type
-      const expectedMname = marketType === 'matchodds' ? 'MATCH_ODDS' : null;
+  
       const expectedOtype = betType?.toUpperCase() === 'LAY' ? 'lay' : 'back';
-      
-      let rateFound = false;
+      const side = betType?.toUpperCase();
+  
       let marketFound = false;
-
-      // Search through all markets
+      let acceptedRate: number | null = null;
+  
       for (const market of marketData.data) {
         const mname = (market.mname || '').toUpperCase();
-        
-        // For match odds: only check MATCH_ODDS market
-        if (marketType === 'matchodds' && mname !== 'MATCH_ODDS') {
+  
+        if (marketType === 'matchodds' && mname !== 'MATCH_ODDS') continue;
+        if (marketType === 'bookmaker' && !mname.includes('BOOKMAKER')) continue;
+        if (
+          marketType === 'fancy' &&
+          (mname === 'MATCH_ODDS' || mname === 'BOOKMAKER' || mname === 'TIED_MATCH')
+        ) {
           continue;
         }
-        
-        // For fancy: skip MATCH_ODDS, Bookmaker, TIED_MATCH (only check Normal fancy)
-        if (marketType === 'fancy') {
-          if (mname === 'MATCH_ODDS' || mname === 'BOOKMAKER' || mname === 'TIED_MATCH') {
-            continue;
-          }
-        }
-
+  
         marketFound = true;
-
-        // Check sections array
-        if (market.section && Array.isArray(market.section)) {
-          for (const section of market.section) {
-            const sectionSid = Number(section.sid || 0);
-            
-            // For match odds and fancy: match by selectionId (sid)
-            if (selectionId > 0 && sectionSid !== selectionId) {
-              continue;
+  
+        if (!Array.isArray(market.section)) continue;
+  
+        for (const section of market.section) {
+          const sectionSid = Number(section.sid || 0);
+          if (selectionId > 0 && sectionSid !== selectionId) continue;
+  
+          if (!Array.isArray(section.odds)) continue;
+  
+          for (const odd of section.odds) {
+            const availableRate = Number(odd.odds || 0);
+            const oddOtype = (odd.otype || '').toLowerCase();
+  
+            if (availableRate <= 0) continue;
+            if (betType && oddOtype !== expectedOtype) continue;
+  
+            // 🎯 CLIENT REQUIREMENT:
+            // Always accept CURRENT market rate
+            // Direction check only (BACK / LAY safety)
+  
+            if (side === 'BACK' && availableRate >= requestedRate) {
+              acceptedRate = availableRate;
+              break;
             }
-
-            // Check odds array in this section
-            if (section.odds && Array.isArray(section.odds)) {
-              for (const odd of section.odds) {
-                const availableRate = Number(odd.odds || 0);
-                const oddOtype = (odd.otype || '').toLowerCase();
-                
-                // Check if rate matches and otype matches bet type
-                if (availableRate > 0 && Math.abs(availableRate - requestedRate) < 0.01) {
-                  // If betType is specified, also check otype matches
-                  if (betType) {
-                    if (oddOtype === expectedOtype) {
-                      rateFound = true;
-                      break;
-                    }
-                  } else {
-                    // If betType not specified, accept any otype
-                    rateFound = true;
-                    break;
-                  }
-                }
-              }
+  
+            if (side === 'LAY' && availableRate <= requestedRate) {
+              acceptedRate = availableRate;
+              break;
             }
-            
-            if (rateFound) break;
           }
+  
+          if (acceptedRate !== null) break;
         }
-        
-        if (rateFound) break;
+  
+        if (acceptedRate !== null) break;
       }
-
-      if (!marketFound) {
+  
+      if (!marketFound || acceptedRate === null) {
         throw new HttpException(
-          {
-            success: false,
-            error: `Rate not matched `,
-            code: 'RATE_NOT_MATCHED',
-          },
+          { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
           400,
         );
       }
-
-      if (!rateFound) {
-        throw new HttpException(
-          {
-            success: false,
-            error: `Rate not matched `,
-            code: 'RATE_NOT_MATCHED',
-          },
-          400,
-        );
-      }
-      // Note: Bookmaker markets validation can be added similarly if needed
+  
+      // ✅ RETURN latest market rate (not requestedRate)
+      return acceptedRate;
     } catch (error) {
-      // If it's already an HttpException, re-throw it
-      if (error instanceof HttpException) {
-        throw error;
-      }
-      
-      // Log and wrap other errors
-      this.logger.error(`Error validating rate availability:`, error);
+      if (error instanceof HttpException) throw error;
+  
+      this.logger.error(
+        `Error validating rate availability: eventId=${eventId}, requestedRate=${requestedRate}`,
+        error,
+      );
+  
       throw new HttpException(
-        {
-          success: false,
-          error: 'Rate not matched ',
-          code: 'RATE_VALIDATION_ERROR',
-        },
+        { success: false, error: 'Rate not matched', code: 'RATE_VALIDATION_ERROR' },
         400,
       );
     }
   }
+  
 
   async placeBet(input: PlaceBetDto) {
     const debug: Record<string, unknown> = {};
@@ -355,8 +325,31 @@ export class BetsService {
     } = input;
 
     const normalizedBetValue = Number(betvalue) || 0;
-    const normalizedBetRate = Number(bet_rate) || 0;
+    let normalizedBetRate = Number(bet_rate) || 0;
     const normalizedSelectionId = Number(selection_id) || 0;
+    
+    // Validate bet value range: minimum 500, maximum 200000
+    if (normalizedBetValue < 500) {
+      throw new HttpException(
+        {
+          success: false,
+          error: 'Bet value must be at least 500',
+          code: 'INVALID_BET_VALUE_MIN',
+        },
+        400,
+      );
+    }
+    
+    if (normalizedBetValue > 200000) {
+      throw new HttpException(
+        {
+          success: false,
+          error: 'Bet value cannot exceed 200000',
+          code: 'INVALID_BET_VALUE_MAX',
+        },
+        400,
+      );
+    }
     
     // REAL CRICKET EXCHANGE RULES:
     // - FANCY: liability = stake (for both BACK and LAY)
@@ -502,21 +495,79 @@ export class BetsService {
     }
 
     // Calculate to_return after lossAmount is determined
-    const to_return = normalizedWinAmount + normalizedLossAmount;
+    let to_return = normalizedWinAmount + normalizedLossAmount;
 
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
     // 3. VALIDATE RATE AVAILABILITY (before placing bet)
-    // if (eventId && normalizedBetRate > 0) {
-    //   await this.validateRateAvailability(
-    //     eventId,
-    //     marketId,
-    //     actualMarketType,
-    //     normalizedBetRate,
-    //     normalizedSelectionId,
-    //     bet_type,
-    //   );
-    // }
+    // Skip validation for match odds since MATCH_ODDS markets are filtered out
+    if (eventId && normalizedBetRate > 0 && actualMarketType !== 'matchodds') {
+      const acceptedRate = await this.validateRateAvailability(
+        eventId,
+        marketId,
+        actualMarketType,
+        normalizedBetRate,
+        normalizedSelectionId,
+        bet_type,
+      );
+
+      // 🔥 OVERRIDE rate everywhere
+      normalizedBetRate = acceptedRate;
+
+      // Recalculate winAmount with accepted rate
+      if (normalizedBetValue > 0 && normalizedBetRate > 0) {
+        if (isBackBet) {
+          // BACK bet: winAmount = stake * odds (total return)
+          normalizedWinAmount = normalizedBetValue * normalizedBetRate;
+        } else if (isLayBet) {
+          // LAY bet: winAmount = stake (if bet wins, we keep the stake)
+          normalizedWinAmount = normalizedBetValue;
+        }
+      }
+
+      // Recalculate lossAmount with accepted rate
+      if (betGtype === 'fancy') {
+        const upperBetType = bet_type?.toUpperCase();
+        
+        if (upperBetType === 'NO' || upperBetType === 'LAY') {
+          // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
+          const payloadLossAmount = Number(loss_amount) || 0;
+          if (payloadLossAmount > 0) {
+            normalizedLossAmount = payloadLossAmount;
+          } else {
+            // Fallback to calculated liability
+            normalizedLossAmount = this.calculateLiability(
+              gtype,
+              bet_type,
+              normalizedBetValue,
+              normalizedBetRate
+            );
+          }
+        } else {
+          // Fancy YES/BACK: Use calculated liability
+          normalizedLossAmount = this.calculateLiability(
+            gtype,
+            bet_type,
+            normalizedBetValue,
+            normalizedBetRate
+          );
+        }
+      } else if (betGtype === 'bookmaker') {
+        normalizedLossAmount = this.calculateLiability(
+          gtype,
+          bet_type,
+          normalizedBetValue,
+          normalizedBetRate
+        );
+      } else if (betGtype === 'matchodds') {
+        normalizedLossAmount = isBackBet
+          ? normalizedBetValue
+          : (normalizedBetRate - 1) * normalizedBetValue;
+      }
+
+      // Recalculate to_return after rate override
+      to_return = normalizedWinAmount + normalizedLossAmount;
+    }
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
