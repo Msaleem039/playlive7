@@ -3,6 +3,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import * as https from 'https';
 import { MatchVisibilityService } from './match-visibility.service';
+import { RedisService } from '../common/redis/redis.service';
+import { CricketIdService } from './cricketid.service';
 
 @Injectable()
 export class AggregatorService {
@@ -11,9 +13,16 @@ export class AggregatorService {
   private cache = new Map<string, { data: any; expiresAt: number }>();
   private activeMatches = new Map<string, { eventId: string; marketIds: string; lastAccessed: number }>();
 
+  // ✅ PERFORMANCE: Redis TTLs (in seconds)
+  private readonly REDIS_TTL = {
+    VENDOR_MATCH_DETAIL: 10,  // 10 seconds (match details change less frequently)
+  };
+
   constructor(
     private readonly http: HttpService,
     private readonly matchVisibilityService: MatchVisibilityService,
+    private readonly redisService: RedisService, // ✅ PERFORMANCE: Redis for vendor data caching
+    private readonly cricketIdService: CricketIdService, // ✅ PERFORMANCE: For fetching vendor data in cron
   ) {
     // Clean up expired cache entries every 5 minutes
     setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
@@ -283,11 +292,34 @@ export class AggregatorService {
   /**
    * Match detail (markets)
    * Endpoint: /cricketid/markets?eventId={eventId}
+   * 
+   * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
+   * 
    * @param eventId - Event ID
    */
   async getMatchDetail(eventId: string) {
+    // ✅ PERFORMANCE: Try Redis cache first
+    const cacheKey = this.redisService.getVendorKey('match-detail', eventId);
+    const cached = await this.redisService.get<any>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for match-detail: ${eventId}`);
+      return cached;
+    }
+
+    // Cache miss - fetch from vendor API (original logic unchanged)
+    this.logger.debug(`Redis cache MISS for match-detail: ${eventId} - fetching from vendor API`);
     try {
       const response = await this.fetch('/cricketid/markets', { eventId });
+      
+      // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
+      try {
+        await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_MATCH_DETAIL);
+        this.logger.debug(`Redis cache SET for match-detail: ${eventId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`);
+      } catch (error) {
+        // Log but don't fail - cache is optional
+        this.logger.warn(`Failed to set Redis cache for match-detail ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      
       return response;
     } catch (error: any) {
       // Check if this is a 400 error (invalid/expired eventId) - expected scenario

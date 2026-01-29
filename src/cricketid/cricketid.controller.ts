@@ -1,7 +1,5 @@
 import { Body, Controller, Get, Logger, Param, Post, Query, HttpException, HttpStatus } from '@nestjs/common';
 import { CricketIdService } from './cricketid.service';
-import { CricketIdWebhookDto } from './dto/webhook.dto';
-import { CricketIdWebhookService } from './cricketid.webhook';
 
 @Controller('cricketid')
 export class CricketIdController {
@@ -9,7 +7,6 @@ export class CricketIdController {
 
   constructor(
     private readonly cricketIdService: CricketIdService,
-    private readonly webhookService: CricketIdWebhookService,
   ) {}
 
   /**
@@ -92,27 +89,6 @@ export class CricketIdController {
     return this.cricketIdService.getBetfairOdds(marketIds);
   }
 
-  /**
-   * Get Betfair results for specific markets
-   * GET /cricketid/results?marketIds=1.249961303
-   * Returns result data including winner, result, status, type, etc.
-   * @param marketIds - Comma-separated market IDs (e.g., "1.249961303")
-   */
-  @Get('results')
-  getBetfairResults(@Query('marketIds') marketIds: string) {
-    return this.cricketIdService.getBetfairResults(marketIds);
-  }
-
-  /**
-   * Get fancy bet results for a specific event
-   * GET /cricketid/fancy-result?eventId=34917574
-   * Returns fancy bet results with odds, runners, etc.
-   * @param eventId - Event ID (e.g., "34917574")
-   */
-  @Get('fancy-result')
-  getFancyResult(@Query('eventId') eventId: string | number) {
-    return this.cricketIdService.getFancyResult(eventId);
-  }
 
   /**
    * Get bookmaker fancy for a specific event
@@ -144,29 +120,5 @@ export class CricketIdController {
     }
   }
 
-  /**
-   * Place bet via vendor API
-   * POST /cricketid/place-bet
-   * Body: { marketId, selectionId, side, size, price, eventId, ... }
-   */
-  @Post('place-bet')
-  async placeBet(@Body() betData: {
-    marketId: string;
-    selectionId: number;
-    side: 'BACK' | 'LAY';
-    size: number;
-    price: number;
-    eventId?: string;
-    [key: string]: any;
-  }) {
-    return this.cricketIdService.placeBet(betData);
-  }
-
-  @Post('webhook')
-  async handleWebhook(@Body() payload: CricketIdWebhookDto) {
-    this.logger.debug(`Webhook payload received: ${JSON.stringify(payload)}`);
-    await this.webhookService.handleWebhook(payload);
-    return { success: true };
-  }
 }
 

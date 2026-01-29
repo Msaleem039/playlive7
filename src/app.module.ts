@@ -18,6 +18,8 @@ import { SettlementModule } from './settlement/settlement.module';
 import { SiteVideoModule } from './site-video/site-video.module';
 import { PositionModule } from './positions/position.module';
 import { ScheduleModule } from '@nestjs/schedule';
+import { RedisModule } from './common/redis/redis.module';
+import { BackgroundProcessorModule } from './common/background/background-processor.module';
 
 @Module({
   imports: [
@@ -27,6 +29,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     }),
     ScheduleModule.forRoot(),
     PrismaModule,
+    RedisModule, // ✅ PERFORMANCE: Redis cache module (single cache layer)
     AuthModule,
     UsersModule,
     AdminModule,

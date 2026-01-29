@@ -2,20 +2,17 @@ import { HttpModule } from '@nestjs/axios';
 import { Module } from '@nestjs/common';
 import { CricketIdController } from './cricketid.controller';
 import { CricketIdService } from './cricketid.service';
-import { CricketIdWebhookService } from './cricketid.webhook';
-import { OddsGateway } from './odds.gateway';
 import { AggregatorService } from './aggregator.service';
 import { AggregatorController } from './aggregator.controller';
 import { AggregatorCronService } from './aggregator.cron.service';
 import { MatchVisibilityService } from './match-visibility.service';
+import { RedisModule } from '../common/redis/redis.module';
 
 @Module({
-  imports: [HttpModule],
+  imports: [HttpModule, RedisModule], // ✅ PERFORMANCE: Redis module for vendor data caching
   controllers: [CricketIdController, AggregatorController],
   providers: [
     CricketIdService,
-    CricketIdWebhookService,
-    OddsGateway,
     AggregatorService,
     AggregatorCronService,
     MatchVisibilityService,

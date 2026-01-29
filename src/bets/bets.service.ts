@@ -12,6 +12,7 @@ import { CricketIdService } from '../cricketid/cricketid.service';
 import { MatchOddsExposureService } from './matchodds-exposure.service';
 import { BookmakerExposureService } from './bookmaker-exposure.service';
 import { FancyExposureService } from './fancy-exposure.service';
+import { BetProcessingQueue } from './bet-processing.queue';
 
 @Injectable()
 export class BetsService {
@@ -23,6 +24,7 @@ export class BetsService {
     private readonly matchOddsExposureService: MatchOddsExposureService,
     private readonly bookmakerExposureService: BookmakerExposureService,
     private readonly fancyExposureService: FancyExposureService,
+    private readonly betProcessingQueue: BetProcessingQueue,
   ) {}
 
   /**
@@ -151,6 +153,7 @@ export class BetsService {
 
   async selectOneRow(table: string, idField: string, userId: string) {
     // OPTIMIZED: Parallel fetch user and wallet
+    const selectStart = Date.now();
     const [user, wallet] = await Promise.all([
       this.prisma.user.findUnique({
         where: { id: userId },
@@ -166,6 +169,14 @@ export class BetsService {
         },
       }),
     ]);
+    const selectMs = Date.now() - selectStart;
+    if (selectMs > 100) {
+      this.logger.warn(`[PERF][selectOneRow] Slow query detected`, {
+        ms: selectMs,
+        userId,
+        table,
+      });
+    }
 
     if (!user) {
       throw new HttpException(
@@ -304,8 +315,16 @@ export class BetsService {
   
 
   async placeBet(input: PlaceBetDto) {
+    // 🔍 PERF: Start timing IMMEDIATELY at function entry
+    const perfStart = Date.now();
+    this.logger.log('[PERF][placeBet] function_entry', {
+      ms: 0,
+      timestamp: new Date().toISOString(),
+    });
+
     const debug: Record<string, unknown> = {};
 
+    const inputParseStart = Date.now();
     const {
       selection_id,
       bet_type,
@@ -323,6 +342,19 @@ export class BetsService {
       eventId,
       runner_name_2,
     } = input;
+    const inputParseMs = Date.now() - inputParseStart;
+    if (inputParseMs > 10) {
+      this.logger.warn('[PERF][placeBet] input_parse_slow', { ms: inputParseMs });
+    }
+
+    // 🔍 PERF: Initialize per-request timing helper
+    const perfLog = (step: string, extra?: Record<string, unknown>) => {
+      const ms = Date.now() - perfStart;
+      const payload = extra ? { step, ms, ...extra } : { step, ms };
+      this.logger.log(`[PERF][placeBet]`, payload);
+    };
+    
+    perfLog('after_input_parsing');
 
     const normalizedBetValue = Number(betvalue) || 0;
     let normalizedBetRate = Number(bet_rate) || 0;
@@ -351,45 +383,12 @@ export class BetsService {
       );
     }
     
-    // REAL CRICKET EXCHANGE RULES:
-    // - FANCY: liability = stake (for both BACK and LAY)
-    // - MATCH ODDS / BOOKMAKER:
-    //   - BACK bet: liability = stake
-    //   - LAY bet: liability = (odds - 1) * stake
-    // - Loss amount = liability (for settlement purposes)
-    // - Win amount = stake * odds for BACK, stake for LAY
-    const isBackBet = bet_type?.toUpperCase() === 'BACK';
-    const isLayBet = bet_type?.toUpperCase() === 'LAY';
-    
-    let normalizedWinAmount = Number(win_amount) || 0;
-    
-    // Calculate winAmount if not provided
-    if (normalizedBetValue > 0 && normalizedBetRate > 0) {
-      if (isBackBet) {
-        // BACK bet: winAmount = stake * odds (total return)
-        normalizedWinAmount = normalizedWinAmount || normalizedBetValue * normalizedBetRate;
-      } else if (isLayBet) {
-        // LAY bet: winAmount = stake (if bet wins, we keep the stake)
-        normalizedWinAmount = normalizedWinAmount || normalizedBetValue;
-      }
-    }
+    perfLog('after_bet_value_validation', {
+      betValue: normalizedBetValue,
+      betRate: normalizedBetRate,
+    });
 
-    const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    const settlement_id = `${match_id}_${selection_id}`;
-
-    // 1. USER VALIDATION
-    const userId = String(user_id);
-    const userRow = await this.selectOneRow('fasio_supplier', 'fs_id', userId);
-
-    if (userRow.status == 3) {
-      return {
-        success: false,
-        error: 'Account is locked. Betting is not allowed.',
-        code: 'ACCOUNT_LOCKED',
-      };
-    }
-
-    // 2. VALIDATE MARKET ID (REQUIRED FOR EXCHANGE EXPOSURE)
+    // 1. VALIDATE MARKET ID (REQUIRED FOR EXCHANGE EXPOSURE)
     if (!marketId) {
       throw new HttpException(
         {
@@ -401,9 +400,42 @@ export class BetsService {
       );
     }
 
-    // Determine market type
+    // ✅ EXCHANGE LOGIC: Calculate winAmount/lossAmount BEFORE transaction
+    // REAL CRICKET EXCHANGE RULES:
+    // - FANCY: liability = stake (for both BACK and LAY)
+    // - MATCH ODDS / BOOKMAKER:
+    //   - BACK bet: liability = stake
+    //   - LAY bet: liability = (odds - 1) * stake
+    // - Loss amount = liability (for settlement purposes)
+    // - Win amount = stake * odds for BACK, stake for LAY
+    const normalizedBetType = (bet_type || '').toUpperCase();
+    const isBackBet = normalizedBetType === 'BACK';
+    const isLayBet = normalizedBetType === 'LAY' || normalizedBetType === 'NO';
+    
+    // Normalize win amount from input (defensive: handle null/undefined)
+    let normalizedWinAmount = Number(win_amount) || 0;
+    
+    // Calculate winAmount if not provided or invalid
+    if (normalizedBetValue > 0 && normalizedBetRate > 0) {
+      if (isBackBet) {
+        // BACK bet: winAmount = stake * odds (total return)
+        normalizedWinAmount = normalizedWinAmount || normalizedBetValue * normalizedBetRate;
+      } else if (isLayBet) {
+        // LAY bet: winAmount = stake (if bet wins, we keep the stake)
+        normalizedWinAmount = normalizedWinAmount || normalizedBetValue;
+      }
+    }
+
+    // Generate unique selection ID for bet tracking
+    const selid = Math.floor(Math.random() * 90000000) + 10000000;
+    // Create settlement ID for bet settlement tracking
+    const settlement_id = `${match_id}_${selection_id}`;
+
+    // Determine market type BEFORE transaction (required for exposure calculation)
+    // Normalize inputs defensively to handle null/undefined
     const normalizedGtype = (gtype || '').toLowerCase();
     const marketName = (input.market_name || '').toLowerCase();
+    // Start with gtype as default, will be refined based on business rules below
     let actualMarketType = normalizedGtype;
     
     // Handle "match1", "match2", etc. as bookmaker (numbered match markets are bookmaker)
@@ -446,7 +478,7 @@ export class BetsService {
     }
 
     // ✅ FIX: Fancy BACK/YES bets use fixed winAmount = stake (bet_rate is only a comparison line)
-    if (betGtype === 'fancy' && (isBackBet || bet_type?.toUpperCase() === 'BACK')) {
+    if (betGtype === 'fancy' && (isBackBet || normalizedBetType === 'BACK')) {
       // Fancy profit is FIXED: winAmount = stake, lossAmount = stake
       // bet_rate is ONLY a comparison line, NEVER a multiplier
       normalizedWinAmount = normalizedBetValue; // winAmount = stake
@@ -457,7 +489,7 @@ export class BetsService {
 
     // ✅ FIXED: Fancy LAY bets use loss_amount from payload if provided
     if (betGtype === 'fancy') {
-      const upperBetType = bet_type?.toUpperCase();
+      const upperBetType = normalizedBetType;
       
       if (upperBetType === 'NO' || upperBetType === 'LAY') {
         // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
@@ -504,82 +536,70 @@ export class BetsService {
     // Calculate to_return after lossAmount is determined
     let to_return = normalizedWinAmount + normalizedLossAmount;
 
+    const userId = String(user_id);
     this.logger.log(`Attempting to place bet for user ${userId}, match ${match_id}, selection ${normalizedSelectionId}, marketType: ${actualMarketType}`);
 
-    // 3. VALIDATE RATE AVAILABILITY (before placing bet)
-    // Skip validation for match odds since MATCH_ODDS markets are filtered out
-    // if (eventId && normalizedBetRate > 0 && actualMarketType !== 'matchodds') {
-    //   const acceptedRate = await this.validateRateAvailability(
-    //     eventId,
-    //     marketId,
-    //     actualMarketType,
-    //     normalizedBetRate,
-    //     normalizedSelectionId,
-    //     bet_type,
-    //   );
-
-    //   // 🔥 OVERRIDE rate everywhere
-    //   normalizedBetRate = acceptedRate;
-
-    //   // Recalculate winAmount with accepted rate
-    //   if (normalizedBetValue > 0 && normalizedBetRate > 0) {
-    //     if (isBackBet) {
-    //       // BACK bet: winAmount = stake * odds (total return)
-    //       normalizedWinAmount = normalizedBetValue * normalizedBetRate;
-    //     } else if (isLayBet) {
-    //       // LAY bet: winAmount = stake (if bet wins, we keep the stake)
-    //       normalizedWinAmount = normalizedBetValue;
-    //     }
-    //   }
-
-    //   // Recalculate lossAmount with accepted rate
-    //   if (betGtype === 'fancy') {
-    //     const upperBetType = bet_type?.toUpperCase();
-        
-    //     if (upperBetType === 'NO' || upperBetType === 'LAY') {
-    //       // Fancy LAY: Use loss_amount from payload if provided, otherwise calculate
-    //       const payloadLossAmount = Number(loss_amount) || 0;
-    //       if (payloadLossAmount > 0) {
-    //         normalizedLossAmount = payloadLossAmount;
-    //       } else {
-    //         // Fallback to calculated liability
-    //         normalizedLossAmount = this.calculateLiability(
-    //           gtype,
-    //           bet_type,
-    //           normalizedBetValue,
-    //           normalizedBetRate
-    //         );
-    //       }
-    //     } else {
-    //       // Fancy YES/BACK: Use calculated liability
-    //       normalizedLossAmount = this.calculateLiability(
-    //         gtype,
-    //         bet_type,
-    //         normalizedBetValue,
-    //         normalizedBetRate
-    //       );
-    //     }
-    //   } else if (betGtype === 'bookmaker') {
-    //     normalizedLossAmount = this.calculateLiability(
-    //       gtype,
-    //       bet_type,
-    //       normalizedBetValue,
-    //       normalizedBetRate
-    //     );
-    //   } else if (betGtype === 'matchodds') {
-    //     normalizedLossAmount = isBackBet
-    //       ? normalizedBetValue
-    //       : (normalizedBetRate - 1) * normalizedBetValue;
-    //   }
-
-    //   // Recalculate to_return after rate override
-    //   to_return = normalizedWinAmount + normalizedLossAmount;
-    // }
+    perfLog('after_exchange_calculations', {
+      userId,
+      matchId: match_id,
+      stake: normalizedBetValue,
+      winAmount: normalizedWinAmount,
+      lossAmount: normalizedLossAmount,
+      marketType: actualMarketType,
+    });
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)
+      const txStart = Date.now();
       const transactionResult = await this.prisma.$transaction(
         async (tx) => {
+          // ✅ COMBINED: Check user status AND wallet in parallel within transaction
+          const [user, wallet] = await Promise.all([
+            tx.user.findUnique({
+              where: { id: userId },
+              select: { id: true, isActive: true },
+            }),
+            tx.wallet.findUnique({
+              where: { userId },
+              select: { id: true, balance: true, liability: true },
+            }),
+          ]);
+
+          // Validate user exists and is active
+          if (!user) {
+            throw new HttpException(
+              {
+                success: false,
+                error: `User not found. Please ensure the user with ID '${userId}' exists in the system before placing bets.`,
+                code: 'USER_NOT_FOUND',
+              },
+              404,
+            );
+          }
+
+          if (!user.isActive) {
+            throw new HttpException(
+              {
+                success: false,
+                error: 'Account is locked. Betting is not allowed.',
+                code: 'ACCOUNT_LOCKED',
+              },
+              403,
+            );
+          }
+
+          // Validate wallet exists
+          if (!wallet) {
+            throw new HttpException(
+              {
+                success: false,
+                error: `Wallet not found for user ${userId}`,
+                code: 'WALLET_NOT_FOUND',
+              },
+              404,
+            );
+          }
+
           // Ensure match exists
           await tx.match.upsert({
             where: { id: String(match_id) },
@@ -598,17 +618,8 @@ export class BetsService {
             },
           });
 
-          // Get or create wallet
-          const wallet = await tx.wallet.upsert({
-            where: { userId },
-            update: {},
-            create: {
-              userId,
-              balance: 0,
-              liability: 0,
-            },
-          });
-
+          // Normalize wallet values defensively (handle null/undefined from DB)
+          // These values are critical for financial calculations - must be numbers
           let currentBalance = Number(wallet.balance) || 0;
           let currentLiability = Number(wallet.liability) || 0;
 
@@ -633,30 +644,29 @@ export class BetsService {
               odds: true,
               winAmount: true,
               lossAmount: true,
-              // @ts-ignore - isRangeConsumed will be available after Prisma client regeneration
               isRangeConsumed: true,
-            } as any,
+            },
           });
 
-          // 🔐 STEP 2: Do NOT calculate snapshot exposure for wallet
-          // Snapshot may exist ONLY for debug
-
-          // 🔐 STEP 3: Create new bet object in memory
+          // 🔐 STEP 2: Create new bet object in memory (for exposure calculation)
+          // This object represents the bet being placed and is used to calculate
+          // exposure delta before the bet is persisted to the database
           const newBet = {
-            gtype: betGtype,
-            marketId,
-            eventId: eventId || null,
-            selectionId: normalizedSelectionId,
-            betType: bet_type,
-            betValue: normalizedBetValue,
-            amount: normalizedBetValue,
-            betRate: normalizedBetRate,
-            odds: normalizedBetRate,
-            winAmount: normalizedWinAmount,
-            lossAmount: normalizedLossAmount,
+            gtype: betGtype, // Market type: 'matchodds', 'fancy', or 'bookmaker'
+            marketId, // Market identifier (required for exposure isolation)
+            eventId: eventId || null, // Event identifier (optional)
+            selectionId: normalizedSelectionId, // Selection/runner ID
+            betType: bet_type, // 'BACK' or 'LAY'
+            betValue: normalizedBetValue, // Stake amount
+            amount: normalizedBetValue, // Same as betValue (for compatibility)
+            betRate: normalizedBetRate, // Odds/rate
+            odds: normalizedBetRate, // Same as betRate (for compatibility)
+            winAmount: normalizedWinAmount, // Calculated win amount
+            lossAmount: normalizedLossAmount, // Calculated loss amount (liability)
+            isRangeConsumed: false, // Fancy range consumption flag (not used in current model)
           };
 
-          // 🔐 STEP 4: Calculate isolated deltas
+          // 🔐 STEP 3: Calculate isolated deltas
           let matchOddsDelta = 0;
           let fancyDelta = 0;
           let bookmakerDelta = 0;
@@ -676,7 +686,6 @@ export class BetsService {
               newBet,
             );
             fancyDelta = fancyResult.delta;
-            // Note: isRangeConsumed is no longer used in Maximum Possible Loss model
           } else if (actualMarketType === 'bookmaker') {
             // ✅ BOOKMAKER DELTA (isolated by marketId)
             const allBetsWithNewBet = [...allPendingBets, newBet];
@@ -688,6 +697,8 @@ export class BetsService {
           }
 
           // FINAL exposureDelta = sum of individual deltas
+          // Each market type calculates its own delta independently
+          // The total delta represents the change in locked exposure for this bet
           const exposureDelta = matchOddsDelta + fancyDelta + bookmakerDelta;
 
           // Debug: Calculate snapshot exposure for logging only (NOT for wallet update)
@@ -708,19 +719,28 @@ export class BetsService {
             total: exposureDelta,
           };
 
-          // 🔐 STEP 5: Validate balance ONLY if exposureDelta > 0
+          // 🔐 STEP 4: Validate balance ONLY if exposureDelta > 0
           if (exposureDelta > 0 && currentBalance < exposureDelta) {
-            throw new Error(
-              `Insufficient balance. Required=${exposureDelta}, Available=${currentBalance}`,
+            throw new HttpException(
+              {
+                success: false,
+                error: `Insufficient balance. Required=${exposureDelta}, Available=${currentBalance}`,
+                code: 'INSUFFICIENT_FUNDS',
+              },
+              400,
             );
           }
 
-          // 🔐 STEP 6: Update wallet EXACTLY ONCE using exposureDelta
+          // 🔐 STEP 5: Update wallet EXACTLY ONCE using exposureDelta
+          // If exposureDelta > 0: lock funds (decrease balance)
+          // If exposureDelta < 0: release funds (increase balance) - happens when bet reduces exposure
+          // Liability always increases by exposureDelta (can be negative if exposure decreases)
           const updatedBalance =
             exposureDelta > 0
               ? currentBalance - exposureDelta
               : currentBalance + Math.abs(exposureDelta);
 
+          // Liability tracks total locked exposure across all pending bets
           const updatedLiability = currentLiability + exposureDelta;
 
           await tx.wallet.update({
@@ -737,7 +757,7 @@ export class BetsService {
             exposureDelta,
           };
 
-          // 🔐 STEP 7: Persist bet
+          // 🔐 STEP 6: Persist bet
           const betData: any = {
             userId,
             matchId: String(match_id),
@@ -767,22 +787,15 @@ export class BetsService {
 
           const createdBet = await tx.bet.create({ data: betData });
 
-          // 🔐 STEP 9: Update wallet (ATOMIC with bet creation)
-          // await tx.wallet.update({
-          //   where: { userId },
-          //   data: {
-          //     balance: newBalance,
-          //     liability: newLiability,
-          //   },
-          // });
-
-          // 🔐 STEP 8: Create transaction log
+          // 🔐 STEP 7: Create transaction log for audit trail
+          // Use Math.abs() because transaction amount must be positive
+          // Type indicates whether funds were locked (BET_PLACED) or released (REFUND)
           await tx.transaction.create({
             data: {
               walletId: wallet.id,
-              amount: Math.abs(exposureDelta),
+              amount: Math.abs(exposureDelta), // Always positive for transaction record
               type: exposureDelta > 0 ? TransactionType.BET_PLACED : TransactionType.REFUND,
-              description: `${actualMarketType.charAt(0).toUpperCase() + actualMarketType.slice(1)} bet placed: ${bet_name} (${bet_type}) - Stake: ${normalizedBetValue}, Exposure Delta: ${exposureDelta}`,
+              description: `${actualMarketType.charAt(0).toUpperCase() + actualMarketType.slice(1)} bet placed: ${bet_name || 'Unknown'} (${bet_type || 'Unknown'}) - Stake: ${normalizedBetValue}, Exposure Delta: ${exposureDelta}`,
             },
           });
 
@@ -808,6 +821,22 @@ export class BetsService {
           timeout: 30000,
         },
       );
+      const txMs = Date.now() - txStart;
+      this.logger.log('[PERF][placeBet] transaction', {
+        ms: txMs,
+        userId: String(user_id),
+        exposureDelta: (transactionResult.debug?.deltas as any)?.total || 0,
+        note: 'Includes user check, wallet check, pending bets load, exposure calculation, wallet update, bet insert, and transaction log',
+      });
+      
+      // ⚠️ WARNING: If transaction takes > 1 second, investigate database performance
+      if (txMs > 1000) {
+        this.logger.warn('[PERF][placeBet] SLOW_TRANSACTION', {
+          ms: txMs,
+          userId: String(user_id),
+          suggestion: 'Check database connection pool, indexes, network latency, or lock contention',
+        });
+      }
 
       // ✅ POSITION CALCULATION (PURE, READ-ONLY, AFTER TRANSACTION)
       // Position is calculated fresh from all open bets - NOT stored in DB
@@ -842,9 +871,11 @@ export class BetsService {
         );
 
         // ✅ MARKET ISOLATION: Use market-specific position functions
+        // Position calculation is read-only and does not affect wallet or bet status
         if (transactionResult.marketType === 'matchodds' || transactionResult.marketType === 'match') {
           // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
           // For now, derive minimal set from bets as fallback
+          // Filter out null/undefined selectionIds defensively
           const marketSelections = Array.from(
             new Set(
               pendingBets
@@ -860,10 +891,11 @@ export class BetsService {
               marketId,
               marketSelections,
             );
-            if (matchOddsPosition) {
+            if (matchOddsPosition && matchOddsPosition.runners) {
               // Convert to backward-compatible format (net -> win/lose)
+              // Position calculation returns net PnL, but UI expects separate win/lose values
               for (const [selectionId, runner] of Object.entries(matchOddsPosition.runners)) {
-                const net = runner.net;
+                const net = runner?.net ?? 0; // Defensive: handle missing net value
                 positions[selectionId] = {
                   win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
                   lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
@@ -892,10 +924,11 @@ export class BetsService {
               marketId,
               marketSelections,
             );
-            if (bookmakerPosition) {
+            if (bookmakerPosition && bookmakerPosition.runners) {
               // Convert to backward-compatible format (net -> win/lose)
+              // Position calculation returns net PnL, but UI expects separate win/lose values
               for (const [selectionId, runner] of Object.entries(bookmakerPosition.runners)) {
-                const net = runner.net;
+                const net = runner?.net ?? 0; // Defensive: handle missing net value
                 positions[selectionId] = {
                   win: net > 0 ? net : 0,  // Profit if wins (clamped for backward compat)
                   lose: net < 0 ? Math.abs(net) : 0,  // Loss if loses (clamped for backward compat)
@@ -922,23 +955,69 @@ export class BetsService {
         }
       } catch (positionError) {
         // Log error but don't fail bet placement if position calculation fails
-        // Position is UI-only and doesn't affect bet placement
+        // Position is UI-only and doesn't affect bet placement or wallet
+        // This is a non-critical operation - bet has already been placed successfully
+        const errorMessage = positionError instanceof Error 
+          ? positionError.message 
+          : String(positionError);
+        const errorStack = positionError instanceof Error 
+          ? positionError.stack 
+          : undefined;
+        
         this.logger.warn(
-          `Failed to calculate positions for user ${userId}, market ${marketId}:`,
-          positionError instanceof Error ? positionError.message : String(positionError),
-          positionError instanceof Error ? positionError.stack : undefined,
+          `Failed to calculate positions for user ${userId}, market ${marketId}: ${errorMessage}`,
+          errorStack,
         );
       }
 
       // Return final result with positions
-      return {
+      const response = {
         success: true,
         betId: transactionResult.betId,
         positions,
         debug: transactionResult.debug,
         available_balance: transactionResult.available_balance,
       };
+
+      // ✅ PERFORMANCE SUMMARY LOG with breakdown
+      const totalMs = Date.now() - perfStart;
+      perfLog('end_success', {
+        userId,
+        betId: transactionResult.betId,
+        available_balance: transactionResult.available_balance,
+        totalMs,
+      });
+      const breakdown = {
+        inputParsing: 'logged_separately',
+        validation: 'logged_separately',
+        exchangeCalculations: 'logged_separately',
+        transaction: txMs,
+        positionCalculation: totalMs - txMs,
+        unaccounted: totalMs - txMs,
+        note: 'Exchange exposure calculation happens inside transaction. Position calculation is read-only after transaction.',
+      };
+      
+      this.logger.log('[PERF][placeBet] SUMMARY', {
+        userId: String(user_id),
+        betId: transactionResult.betId,
+        totalMs,
+        breakdown,
+        warning: breakdown.unaccounted > 1000 ? `⚠️ ${breakdown.unaccounted}ms unaccounted - check logs for missing steps` : null,
+      });
+
+      // Return response with positions (position calculation is synchronous but read-only)
+      return response;
     } catch (error) {
+      perfLog('end_error', {
+        userId: String(input.user_id),
+        error:
+          error instanceof Error
+            ? error.message
+            : typeof error === 'string'
+            ? error
+            : 'unknown_error',
+      });
+
       this.logger.error(`Error placing bet for user ${userId}:`, error);
       
       // If it's already an HttpException, re-throw it
@@ -951,26 +1030,33 @@ export class BetsService {
       const isTransactionError = 
         errorMessage.includes('Transaction not found') ||
         errorMessage.includes('Transaction') ||
+        errorMessage.includes('Unable to start a transaction') ||
+        errorMessage.includes('P2024') || // Prisma connection pool exhaustion
         errorMessage.includes('P2034') || // Prisma transaction timeout error code
         errorMessage.includes('P2035');   // Prisma transaction error code
 
       if (isTransactionError) {
+        const isPoolExhaustion = errorMessage.includes('Unable to start a transaction') || errorMessage.includes('P2024');
         this.logger.error(
-          `Transaction error placing bet for user ${userId}. This may be due to connection timeout or pool exhaustion.`,
+          `Transaction error placing bet for user ${userId}. ${isPoolExhaustion ? 'Connection pool may be exhausted.' : 'This may be due to connection timeout or pool exhaustion.'}`,
           error instanceof Error ? error.stack : undefined,
         );
         throw new HttpException(
           {
             success: false,
-            error: 'Transaction failed. Please try again. If the issue persists, the database connection may be experiencing issues.',
-            code: 'TRANSACTION_ERROR',
+            error: isPoolExhaustion 
+              ? 'Database connection pool is busy. Please retry in a moment.'
+              : 'Transaction failed. Please try again. If the issue persists, the database connection may be experiencing issues.',
+            code: isPoolExhaustion ? 'POOL_EXHAUSTED' : 'TRANSACTION_ERROR',
             debug: {
               ...debug,
               error_details: errorMessage,
-              suggestion: 'Retry the bet placement. If it continues to fail, check database connection health.',
+              suggestion: isPoolExhaustion 
+                ? 'The database connection pool is temporarily exhausted. Wait a moment and retry.'
+                : 'Retry the bet placement. If it continues to fail, check database connection health.',
             },
           },
-          HttpStatus.INTERNAL_SERVER_ERROR,
+          HttpStatus.SERVICE_UNAVAILABLE, // 503 for pool exhaustion
         );
       }
 

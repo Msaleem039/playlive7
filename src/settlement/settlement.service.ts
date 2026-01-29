@@ -1,7 +1,5 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
-import { BetStatus, PrismaClient, TransactionType } from '@prisma/client';
-// @ts-ignore - MarketType exists after Prisma client regeneration
-import { MarketType } from '@prisma/client';
+import { PrismaClient, BetStatus, MarketType, TransactionType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AggregatorService } from '../cricketid/aggregator.service';
 import { PnlService } from './pnl.service';

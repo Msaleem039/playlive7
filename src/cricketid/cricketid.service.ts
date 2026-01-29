@@ -4,6 +4,7 @@ import { firstValueFrom } from 'rxjs';
 import { AxiosError } from 'axios';
 import * as https from 'https';
 import * as http from 'http';
+import { RedisService } from '../common/redis/redis.service';
 
 @Injectable()
 export class CricketIdService {
@@ -13,7 +14,18 @@ export class CricketIdService {
   private readonly retryDelay = 1000; // Initial delay in ms
   private readonly timeout = 30000; // 30 seconds timeout
 
-  constructor(private readonly http: HttpService) {}
+  // ✅ PERFORMANCE: Redis TTLs (in seconds)
+  private readonly REDIS_TTL = {
+    VENDOR_ODDS: 5,           // 5 seconds (odds change frequently, but 3s was too short)
+    VENDOR_FANCY: 5,          // 5 seconds (fancy data changes frequently, but 3s was too short)
+    VENDOR_BOOKMAKER: 5,      // 5 seconds (bookmaker data changes frequently, but 3s was too short)
+    VENDOR_MATCH_DETAIL: 10,  // 10 seconds (match details change less frequently)
+  };
+
+  constructor(
+    private readonly http: HttpService,
+    private readonly redisService: RedisService, // ✅ PERFORMANCE: Redis for vendor data caching
+  ) {}
 
   /**
    * Check if error is a transient network error that should be retried
@@ -255,31 +267,71 @@ export class CricketIdService {
    * Get market list (odds/markets) for a specific event/match
    * Endpoint: /v3/marketList?eventId={eventId}
    * Returns markets with runners, odds, selectionId, etc.
+   * 
+   * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
+   * 
    * @param eventId - Event ID from the match list (e.g., "34917574")
    */
   async getMarketList(eventId: string | number) {
-    return this.fetch('/v3/marketList', { eventId });
+    // ✅ PERFORMANCE: Try Redis cache first
+    const cacheKey = this.redisService.getVendorKey('market-list', String(eventId));
+    const cached = await this.redisService.get<any>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for market-list: ${eventId}`);
+      return cached;
+    }
+
+    // Cache miss - fetch from vendor API (original logic unchanged)
+    this.logger.debug(`Redis cache MISS for market-list: ${eventId} - fetching from vendor API`);
+    const response = await this.fetch('/v3/marketList', { eventId });
+    
+    // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
+    try {
+      await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_MATCH_DETAIL);
+      this.logger.debug(`Redis cache SET for market-list: ${eventId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`);
+    } catch (error) {
+      // Log but don't fail - cache is optional
+      this.logger.warn(`Failed to set Redis cache for market-list ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    
+    return response;
   }
 
   /**
    * Get Betfair odds for specific markets
    * Endpoint: /v3/betfairOdds?marketIds={marketIds}
    * Returns detailed odds data including availableToBack, availableToLay, etc.
+   * 
+   * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
+   * 
    * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
    */
   async getBetfairOdds(marketIds: string) {
-    return this.fetch('/v3/betfairOdds', { marketIds });
+    // ✅ PERFORMANCE: Try Redis cache first
+    // Use consistent key format with getVendorKey()
+    const cacheKey = this.redisService.getVendorKey('odds', marketIds);
+    const cached = await this.redisService.get<any>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for odds: ${marketIds}`);
+      return cached;
+    }
+
+    // Cache miss - fetch from vendor API (original logic unchanged)
+    this.logger.debug(`Redis cache MISS for odds: ${marketIds} - fetching from vendor API`);
+    const response = await this.fetch('/v3/betfairOdds', { marketIds });
+    
+    // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
+    try {
+      await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_ODDS);
+      this.logger.debug(`Redis cache SET for odds: ${marketIds} (TTL: ${this.REDIS_TTL.VENDOR_ODDS}s)`);
+    } catch (error) {
+      // Log but don't fail - cache is optional
+      this.logger.warn(`Failed to set Redis cache for odds ${marketIds}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    
+    return response;
   }
 
-  /**
-   * Get Betfair results for specific markets
-   * Endpoint: /v3/betfairResults?marketIds={marketIds}
-   * Returns result data including winner, result, status, type, etc.
-   * @param marketIds - Comma-separated market IDs (e.g., "1.249961303")
-   */
-  async getBetfairResults(marketIds: string) {
-    return this.fetch('/v3/betfairResults', { marketIds });
-  }
 
   /**
    * Get bookmaker fancy for a specific event
@@ -294,9 +346,31 @@ export class CricketIdService {
    * - MATCH_ODDS
    * - Markets containing "bhav" in the name (case-insensitive)
    * 
+   * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
+   * 
    * @param eventId - Event ID (e.g., "34917574")
    */
   async getBookmakerFancy(eventId: string | number) {
+    // ✅ PERFORMANCE: Try Redis cache first
+    const cacheKey = this.redisService.getVendorKey('bookmaker-fancy', String(eventId));
+    const cached = await this.redisService.get<{
+      success: boolean;
+      msg: string;
+      status: number;
+      data: Array<{
+        mname: string;
+        gtype: string;
+        [key: string]: any;
+      }>;
+    }>(cacheKey);
+    
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for bookmaker-fancy: ${eventId}`);
+      return cached;
+    }
+
+    // Cache miss - fetch from vendor API (original logic unchanged)
+    this.logger.debug(`Redis cache MISS for bookmaker-fancy: ${eventId} - fetching from vendor API`);
     const response = await this.fetch<{
       success: boolean;
       msg: string;
@@ -408,6 +482,16 @@ export class CricketIdService {
       });
     }
 
+    // ✅ PERFORMANCE: Store in Redis for future requests (after all filtering/sorting)
+    // Await to ensure cache is set before returning
+    try {
+      await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_BOOKMAKER);
+      this.logger.debug(`Redis cache SET for bookmaker-fancy: ${eventId} (TTL: ${this.REDIS_TTL.VENDOR_BOOKMAKER}s)`);
+    } catch (error) {
+      // Log but don't fail - cache is optional
+      this.logger.warn(`Failed to set Redis cache for bookmaker-fancy ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
     return response;
   }
 
@@ -448,134 +532,5 @@ export class CricketIdService {
     return false;
   }
 
-  /**
-   * Get fancy bet results for a specific event
-   * Endpoint: /v3/fancyResult?eventId={eventId}
-   * Returns fancy bet results with odds, runners, etc.
-   * @param eventId - Event ID (e.g., "34917574")
-   */
-  async getFancyResult(eventId: string | number) {
-    return this.fetch('/v3/fancyResult', { eventId });
-  }
-
-  /**
-   * Place bet via vendor API
-   * Endpoint: /v3/placeBet (POST)
-   * @param betData - Bet placement data
-   */
-  private async fetchPost<T>(path: string, body: Record<string, any> = {}): Promise<T> {
-    const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-    const url = `${this.baseUrl}${normalizedPath}`;
-
-    let lastError: any;
-    
-    // Retry loop
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        const { data } = await firstValueFrom(
-          this.http.post<T>(url, body, {
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            timeout: this.timeout,
-            httpAgent: new http.Agent({
-              keepAlive: true,
-              keepAliveMsecs: 1000,
-              maxSockets: 50,
-              maxFreeSockets: 10,
-              timeout: this.timeout,
-            }),
-            httpsAgent: new https.Agent({
-              keepAlive: true,
-              keepAliveMsecs: 1000,
-              maxSockets: 50,
-              maxFreeSockets: 10,
-              timeout: this.timeout,
-            }),
-          }),
-        );
-        return data;
-      } catch (error) {
-        lastError = error;
-
-        // Check if error is retryable and we haven't exceeded max retries
-        if (attempt < this.maxRetries && this.isRetryableError(error)) {
-          const delay = this.retryDelay * Math.pow(2, attempt); // Exponential backoff
-          const errorCode = error instanceof AxiosError ? error.code : 'UNKNOWN';
-          
-          this.logger.warn(
-            `Vendor API POST request failed (attempt ${attempt + 1}/${this.maxRetries + 1}) for ${url}: ${errorCode}. Retrying in ${delay}ms...`,
-            {
-              url,
-              errorCode,
-              attempt: attempt + 1,
-              maxRetries: this.maxRetries,
-            },
-          );
-
-          await this.sleep(delay);
-          continue; // Retry the request
-        }
-
-        // If not retryable or max retries exceeded, handle the error
-        this.logger.error(
-          `Error posting to ${url}${attempt > 0 ? ` (after ${attempt + 1} attempts)` : ''}:`,
-          error instanceof Error ? error.message : String(error),
-        );
-        
-        if (error instanceof AxiosError) {
-          const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
-          const isNetworkError = this.isRetryableError(error);
-          const message = isNetworkError
-            ? `Network error: ${error.message || 'Connection failed'} (after ${attempt + 1} attempts)`
-            : error.response?.data?.message || error.message || 'Failed to post data to vendor API';
-          
-          throw new HttpException(
-            {
-              statusCode: status,
-              message,
-              error: 'Vendor API Error',
-              details: {
-                ...(error.response?.data || {}),
-                code: error.code,
-                attempts: attempt + 1,
-                retryable: isNetworkError,
-              },
-            },
-            status,
-          );
-        }
-        
-        throw new HttpException(
-          {
-            statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
-            message: error instanceof Error ? error.message : 'Internal server error',
-            error: 'Internal Server Error',
-          },
-          HttpStatus.INTERNAL_SERVER_ERROR,
-        );
-      }
-    }
-
-    // If we get here, all retries failed
-    throw lastError;
-  }
-
-  /**
-   * Place bet
-   * Endpoint: /v3/placeBet
-   * @param betData - Bet placement data
-   */
-  async placeBet(betData: {
-    marketId: string;
-    selectionId: number;
-    side: 'BACK' | 'LAY';
-    size: number;
-    price: number;
-    eventId?: string;
-    [key: string]: any;
-  }) {
-    return this.fetchPost('/v3/placeBet', betData);
-  }
 }
 

@@ -1,169 +1,275 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "postgresql"
+  url      = "postgresql://postgres:playlive12345678990@db.exujcrlwhucsjefdflsd.supabase.co:5432/postgres?sslmode=require"
 }
 
 model User {
-  id       String   @id @default(cuid())
-  name     String
-  username String   @unique
-  email    String?  @unique
-  password String
-  role     UserRole @default(CLIENT)
-  isActive Boolean  @default(true)
+  id                                                              String                @id @default(dbgenerated("gen_random_uuid()"))
+  name                                                            String
+  username                                                        String                @unique
+  email                                                           String?               @unique
+  password                                                        String
+  role                                                            UserRole             @default(CLIENT)
+  isActive                                                        Boolean              @default(true) @map("is_active")
+  parentId                                                        String?              @map("parent_id")
+  commissionPercentage                                           Float                @default(100) @map("commission_percentage")
+  createdAt                                                      DateTime             @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt                                                      DateTime             @default(now()) @db.Timestamp(6) @map("updated_at")
+  bets                                                            Bet[]
+  positions                                                       Position[]
+  transfer_transactions_transfer_transactions_from_user_idTousers TransferTransaction[] @relation("transfer_transactions_from_user_idTousers")
+  transfer_transactions_transfer_transactions_to_user_idTousers   TransferTransaction[] @relation("transfer_transactions_to_user_idTousers")
+  users                                                           User?                 @relation("usersTousers", fields: [parentId], references: [id], onDelete: NoAction, onUpdate: NoAction, map: "fk_parent")
+  other_users                                                     User[]                @relation("usersTousers")
+  wallet                                                          Wallet?
 
-  parentId             String?
-  commissionPercentage Float    @default(100)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-
-  // Relations
-  bets              Bet[]
-  positions         Position[]
-  wallet            Wallet?
-  parent            User?                 @relation("UserHierarchy", fields: [parentId], references: [id])
-  children          User[]                @relation("UserHierarchy")
-  sentTransfers     TransferTransaction[] @relation("SentTransfers")
-  receivedTransfers TransferTransaction[] @relation("ReceivedTransfers")
-
-  // Performance indexes
-  @@index([parentId])
-  @@index([role])
-  @@index([parentId, role])
+  @@index([parentId], map: "idx_users_parent_id")
+  @@index([parentId, role], map: "idx_users_parent_role")
+  @@index([role], map: "idx_users_role")
   @@map("users")
 }
 
 model Wallet {
-  id        String   @id @default(cuid())
-  userId    String   @unique
-  balance   Float    @default(0)
-  liability Float    @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Relations
-  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  transactions Transaction[]
+  id              String        @id @default(dbgenerated("gen_random_uuid()"))
+  userId          String        @unique @map("user_id")
+  balance         Float        @default(0)
+  liability       Float        @default(0)
+  lockedExposure Float        @default(0) @map("locked_exposure")
+  createdAt       DateTime     @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt       DateTime     @default(now()) @db.Timestamp(6) @map("updated_at")
+  transactions    Transaction[]
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_wallet_user")
 
   @@map("wallets")
 }
 
 model Match {
-  id         String      @id @default(cuid())
-  homeTeam   String
-  awayTeam   String
-  startTime  DateTime
-  status     MatchStatus @default(UPCOMING)
-  eventId    String?
-  eventName  String?
-  marketId   String?
-  marketName String?
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
+  id          String        @id @default(dbgenerated("gen_random_uuid()"))
+  homeTeam    String        @map("home_team")
+  awayTeam    String        @map("away_team")
+  startTime   DateTime      @db.Timestamp(6) @map("start_time")
+  status      MatchStatus @default(UPCOMING)
+  eventId     String?       @map("event_id")
+  eventName   String?       @map("event_name")
+  marketId    String?       @map("market_id")
+  marketName  String?       @map("market_name")
+  createdAt   DateTime     @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt   DateTime     @default(now()) @db.Timestamp(6) @map("updated_at")
+  bets        Bet[]
 
-  // Relations
-  bets Bet[]
-
-  // Performance indexes
-  @@index([eventId])
-  @@index([status])
+  @@index([eventId], map: "idx_matches_event_id")
+  @@index([status], map: "idx_matches_status")
   @@map("matches")
 }
 
 model Bet {
-  id           String    @id @default(cuid())
-  userId       String
-  matchId      String
-  amount       Float
-  odds         Float
-  selId        Int?
-  selectionId  Int?
-  betType      String?
-  betName      String?
-  marketName   String?
-  marketType   String?
-  marketId     String? // Market ID from vendor API (e.g., "1.250049502")
-  eventId      String? // Event ID from vendor API (e.g., "34917574")
-  gtype        String?
-  betValue     Float?
-  betRate      Float?
-  winAmount    Float?
-  lossAmount   Float?
-  settlementId String?
-  toReturn     Float?
-  metadata     Json?
-  status       BetStatus @default(PENDING)
-  pnl          Float     @default(0)
-  isRangeConsumed Boolean @default(false)
-  settledAt    DateTime?
-  rollbackAt   DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+  id                String      @id @default(dbgenerated("gen_random_uuid()"))
+  userId            String      @map("user_id")
+  matchId           String      @map("match_id")
+  amount            Float
+  odds              Float
+  selId             Int?         @map("sel_id")
+  selectionId       Int?         @map("selection_id")
+  betType           String?      @map("bet_type")
+  betName           String?      @map("bet_name")
+  marketName        String?      @map("market_name")
+  marketType        String?      @map("market_type")
+  marketId          String?      @map("market_id")
+  eventId           String?      @map("event_id")
+  gtype             String?
+  betValue          Float?       @map("bet_value")
+  betRate           Float?       @map("bet_rate")
+  winAmount         Float?      @map("win_amount")
+  lossAmount        Float?      @map("loss_amount")
+  settlementId      String?     @map("settlement_id")
+  toReturn          Float?      @map("to_return")
+  metadata          Json?
+  status            BetStatus @default(PENDING)
+  pnl               Float      @default(0)
+  isRangeConsumed   Boolean    @default(false) @map("is_range_consumed")
+  settledAt         DateTime?   @db.Timestamp(6) @map("settled_at")
+  rollbackAt       DateTime?   @db.Timestamp(6) @map("rollback_at")
+  createdAt         DateTime   @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt         DateTime   @default(now()) @db.Timestamp(6) @map("updated_at")
+  match             Match       @relation(fields: [matchId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_bet_match")
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_bet_user")
 
-  // Relations
-  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
-
-  // Performance indexes for frequently queried columns
-  @@index([userId])
-  @@index([userId, status])
-  @@index([eventId])
-  @@index([marketId])
-  @@index([settlementId])
-  @@index([status])
-  @@index([status, eventId])
-  @@index([status, settlementId])
-  @@index([createdAt])
-  @@index([userId, status, createdAt])
+  @@index([createdAt], map: "idx_bets_created_at")
+  @@index([eventId], map: "idx_bets_event_id")
+  @@index([marketId], map: "idx_bets_market_id")
+  @@index([settlementId], map: "idx_bets_settlement_id")
+  @@index([status], map: "idx_bets_status")
+  @@index([status, eventId], map: "idx_bets_status_event")
+  @@index([status, settlementId], map: "idx_bets_status_settlement")
+  @@index([userId], map: "idx_bets_user_id")
+  @@index([userId, status], map: "idx_bets_user_status")
+  @@index([userId, status, createdAt], map: "idx_bets_user_status_created")
   @@map("bets")
 }
 
 model Transaction {
-  id          String          @id @default(cuid())
-  walletId    String
+  id          String           @id @default(dbgenerated("gen_random_uuid()"))
+  walletId    String            @map("wallet_id")
   amount      Float
   type        TransactionType
   description String?
-  createdAt   DateTime        @default(now())
+  createdAt   DateTime        @default(now()) @db.Timestamp(6) @map("created_at")
+  wallet      Wallet           @relation(fields: [walletId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_transaction_wallet")
 
-  // Relations
-  wallet Wallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-
-  // Performance indexes
-  @@index([walletId])
-  @@index([walletId, createdAt])
-  @@index([type])
+  @@index([type], map: "idx_transactions_type")
+  @@index([walletId, createdAt], map: "idx_transactions_wallet_created")
+  @@index([walletId], map: "idx_transactions_wallet_id")
   @@map("transactions")
 }
 
 model TransferTransaction {
-  id                   String         @id @default(cuid())
-  fromUserId           String
-  toUserId             String
-  amount               Float
-  commissionPercentage Float
-  finalAmount          Float
-  commissionAmount     Float
-  status               TransferStatus @default(COMPLETED)
-  createdAt            DateTime       @default(now())
-  updatedAt            DateTime       @updatedAt
-
-  // Relations
-  fromUser User @relation("SentTransfers", fields: [fromUserId], references: [id], onDelete: Cascade)
-  toUser   User @relation("ReceivedTransfers", fields: [toUserId], references: [id], onDelete: Cascade)
+  id                                              String           @id @default(dbgenerated("gen_random_uuid()"))
+  fromUserId                                      String            @map("from_user_id")
+  toUserId                                        String            @map("to_user_id")
+  amount                                          Float
+  commissionPercentage                           Float              @map("commission_percentage")
+  finalAmount                                    Float              @map("final_amount")
+  commissionAmount                               Float              @map("commission_amount")
+  status                                          TransferStatus @default(COMPLETED)
+  createdAt                                      DateTime        @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt                                      DateTime        @default(now()) @db.Timestamp(6) @map("updated_at")
+  users_transfer_transactions_from_user_idTousers User             @relation("transfer_transactions_from_user_idTousers", fields: [fromUserId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_transfer_from")
+  users_transfer_transactions_to_user_idTousers   User             @relation("transfer_transactions_to_user_idTousers", fields: [toUserId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_transfer_to")
 
   @@map("transfer_transactions")
+}
+
+model TransferLog {
+  id           String            @id @default(dbgenerated("gen_random_uuid()"))
+  fromUserId   String            @map("from_user_id")
+  toUserId     String            @map("to_user_id")
+  amount       Float
+  remarks      String?
+  type         TransferLogType
+  createdAt    DateTime         @default(now()) @db.Timestamp(6) @map("created_at")
+
+  @@map("transfer_logs")
+}
+
+model Settlement {
+  id            String      @id @default(dbgenerated("gen_random_uuid()"))
+  settlementId  String      @unique @map("settlement_id")
+  eventId       String      @map("event_id")
+  marketType    MarketType  @map("market_type")
+  marketId      String?     @map("market_id")
+  winnerId      String?     @map("winner_id")
+  settledBy     String      @map("settled_by")
+  isRollback    Boolean    @default(false) @map("is_rollback")
+  createdAt     DateTime   @default(now()) @db.Timestamp(6) @map("created_at")
+
+  @@index([createdAt], map: "idx_settlements_created_at")
+  @@index([eventId], map: "idx_settlements_event_id")
+  @@index([eventId, marketType], map: "idx_settlements_event_market")
+  @@index([isRollback], map: "idx_settlements_is_rollback")
+  @@index([marketType], map: "idx_settlements_market_type")
+  @@map("settlements")
+}
+
+model UserPnl {
+  id          String      @id @default(dbgenerated("gen_random_uuid()"))
+  userId      String      @map("user_id")
+  eventId     String      @map("event_id")
+  marketType  MarketType  @map("market_type")
+  profit      Float      @default(0)
+  loss        Float      @default(0)
+  netPnl      Float      @default(0) @map("net_pnl")
+  createdAt   DateTime   @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt   DateTime   @default(now()) @db.Timestamp(6) @map("updated_at")
+
+  @@unique([userId, eventId, marketType], map: "uq_user_pnl")
+  @@index([eventId], map: "idx_user_pnl_event_id")
+  @@index([userId, eventId], map: "idx_user_pnl_user_event")
+  @@index([userId], map: "idx_user_pnl_user_id")
+  @@map("user_pnl")
+}
+
+model HierarchyPnl {
+  id           String      @id @default(dbgenerated("gen_random_uuid()"))
+  eventId      String      @map("event_id")
+  marketType   MarketType  @map("market_type")
+  fromUserId   String      @map("from_user_id")
+  toUserId     String      @map("to_user_id")
+  amount       Float
+  percentage   Float
+  createdAt    DateTime   @default(now()) @db.Timestamp(6) @map("created_at")
+
+  @@index([eventId, marketType, fromUserId], map: "idx_hierarchy_pnl_event_market_from")
+  @@index([fromUserId], map: "idx_hierarchy_pnl_from")
+  @@index([toUserId], map: "idx_hierarchy_pnl_to")
+  @@map("hierarchy_pnl")
+}
+
+model Position {
+  id           String    @id @default(dbgenerated("gen_random_uuid()"))
+  userId       String      @map("user_id")
+  matchId      String      @map("match_id")
+  marketType   String      @map("market_type")
+  selectionId  Int         @map("selection_id")
+  runnerName   String?     @map("runner_name")
+  backStake    Float    @default(0) @map("back_stake")
+  backOdds     Float    @default(0) @map("back_odds")
+  layStake     Float    @default(0) @map("lay_stake")
+  layOdds      Float    @default(0) @map("lay_odds")
+  pnlIfWin     Float    @default(0) @map("pnl_if_win")
+  pnlIfLose    Float    @default(0) @map("pnl_if_lose")
+  createdAt    DateTime @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt    DateTime @default(now()) @db.Timestamp(6) @map("updated_at")
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_position_user")
+
+  @@unique([userId, matchId, marketType, selectionId], map: "uq_position")
+  @@index([matchId, marketType, selectionId], map: "idx_positions_match_market_sel")
+  @@index([userId], map: "idx_positions_user")
+  @@index([userId, matchId], map: "idx_positions_user_match")
+  @@map("positions")
+}
+
+model MatchVisibility {
+  id         Int       @id @default(autoincrement())
+  eventId    String    @unique @map("event_id")
+  isEnabled  Boolean  @default(true) @map("is_enabled")
+  createdAt  DateTime @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt  DateTime @default(now()) @db.Timestamp(6) @map("updated_at")
+
+  @@map("match_visibility")
+}
+
+model SiteVideo {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  key       String    @unique
+  videoUrl  String    @map("video_url")
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @db.Timestamp(6) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @db.Timestamp(6) @map("updated_at")
+
+  @@map("site_videos")
+}
+
+enum BetStatus {
+  PENDING
+  ACCEPTED
+  CONFIRMED
+  WON
+  LOST
+  CANCELLED
+
+  @@map("bet_status")
+}
+
+enum MarketType {
+  FANCY
+  BOOKMAKER
+  MATCH_ODDS
+
+  @@map("market_type")
 }
 
 enum MatchStatus {
@@ -171,21 +277,8 @@ enum MatchStatus {
   LIVE
   FINISHED
   CANCELLED
-}
 
-enum BetStatus {
-  PENDING
-  WON
-  LOST
-  CANCELLED
-}
-
-enum UserRole {
-  SUPER_ADMIN
-  ADMIN
-  AGENT
-  CLIENT
-  SETTLEMENT_ADMIN
+  @@map("match_status")
 }
 
 enum TransactionType {
@@ -195,6 +288,15 @@ enum TransactionType {
   BET_WON
   BET_LOST
   REFUND
+
+  @@map("transaction_type")
+}
+
+enum TransferLogType {
+  TOPUP
+  TOPDOWN
+
+  @@map("transfer_log_type")
 }
 
 enum TransferStatus {
@@ -202,133 +304,16 @@ enum TransferStatus {
   COMPLETED
   FAILED
   CANCELLED
+
+  @@map("transfer_status")
 }
 
-enum TransferLogType {
-  TOPUP
-  TOPDOWN
-}
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  AGENT
+  CLIENT
+  SETTLEMENT_ADMIN
 
-model TransferLog {
-  id         String          @id @default(cuid())
-  fromUserId String
-  toUserId   String
-  amount     Float
-  remarks    String?
-  type       TransferLogType
-  createdAt  DateTime        @default(now())
-
-  @@map("transfer_logs")
-}
-
-model Settlement {
-  id           String     @id @default(cuid())
-  settlementId String     @unique
-  eventId      String
-  marketType   MarketType
-  marketId     String?
-  winnerId     String?
-  settledBy    String // ADMIN ID or "AUTO"
-  isRollback   Boolean    @default(false)
-  createdAt    DateTime   @default(now())
-
-  // Performance indexes
-  @@index([eventId])
-  @@index([marketType])
-  @@index([isRollback])
-  @@index([createdAt])
-  @@index([eventId, marketType])
-  @@map("settlements")
-}
-
-enum MarketType {
-  FANCY
-  BOOKMAKER
-  MATCH_ODDS
-}
-
-model UserPnl {
-  id         String     @id @default(cuid())
-  userId     String
-  eventId    String
-  marketType MarketType
-  profit     Float      @default(0)
-  loss       Float      @default(0)
-  netPnl     Float      @default(0)
-  createdAt  DateTime   @default(now())
-  updatedAt  DateTime   @updatedAt
-
-  @@unique([userId, eventId, marketType])
-  @@index([userId])
-  @@index([eventId])
-  @@index([userId, eventId])
-  @@map("user_pnl")
-}
-
-model HierarchyPnl {
-  id         String     @id @default(cuid())
-  eventId    String
-  marketType MarketType
-  fromUserId String // client or child
-  toUserId   String // parent
-  amount     Float // profit (+) or loss (-)
-  percentage Float
-  createdAt  DateTime   @default(now())
-
-  // Performance indexes
-  @@index([eventId, marketType, fromUserId])
-  @@index([toUserId])
-  @@index([fromUserId])
-  @@map("hierarchy_pnl")
-}
-
-model Position {
-  id          String   @id @default(cuid())
-  userId      String
-  matchId     String
-  marketType  String   // MATCH_ODDS | FANCY | BOOKMAKER
-  selectionId Int
-  runnerName  String?
-
-  backStake   Float    @default(0)
-  backOdds    Float    @default(0)
-  layStake    Float    @default(0)
-  layOdds     Float    @default(0)
-
-  pnlIfWin    Float    @default(0)
-  pnlIfLose   Float    @default(0)
-
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  // Relations
-  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  // Unique constraint: one position per user/match/market/selection
-  @@unique([userId, matchId, marketType, selectionId])
-  @@index([userId])
-  @@index([userId, matchId])
-  @@index([matchId, marketType, selectionId])
-  @@map("positions")
-}
-
-model MatchVisibility {
-  id        Int      @id @default(autoincrement())
-  eventId   String   @unique
-  isEnabled Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@map("match_visibility")
-}
-
-model SiteVideo {
-  id        String   @id @default(uuid())
-  key       String   @unique
-  videoUrl  String   @map("video_url")
-  isActive  Boolean  @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
-
-  @@map("site_videos")
+  @@map("user_role")
 }
