@@ -4,6 +4,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AggregatorService } from '../cricketid/aggregator.service';
 import { PnlService } from './pnl.service';
 import { HierarchyPnlService } from './hierarchy-pnl.service';
+import { FancyExposureService } from '../bets/fancy-exposure.service';
+import { MatchOddsExposureService } from '../bets/matchodds-exposure.service';
+import { BookmakerExposureService } from '../bets/bookmaker-exposure.service';
 
 @Injectable()
 export class SettlementService {
@@ -18,6 +21,9 @@ export class SettlementService {
     private readonly aggregatorService: AggregatorService,
     private readonly pnlService: PnlService,
     private readonly hierarchyPnlService: HierarchyPnlService,
+    private readonly fancyExposureService: FancyExposureService,
+    private readonly matchOddsExposureService: MatchOddsExposureService,
+    private readonly bookmakerExposureService: BookmakerExposureService,
   ) {
     // Clean expired cache entries every 5 minutes
     setInterval(() => this.cleanExpiredCache(), 5 * 60 * 1000);
@@ -612,10 +618,10 @@ export class SettlementService {
       `winnerSelectionId: ${winnerSelectionId} (${winnerSelectionIdNum}), marketType: ${marketType}`,
     );
 
-    // 🔐 STRICT VALIDATION: Match Odds settlement only (Bookmaker uses separate function)
-    if (marketType !== MarketType.MATCH_ODDS) {
+    // 🔐 STRICT VALIDATION: Match Odds and Tied Match settlement (Bookmaker uses separate function)
+    if (marketType !== MarketType.MATCH_ODDS && marketType !== MarketType.TIED_MATCH) {
       throw new BadRequestException(
-        `Invalid marketType: ${marketType}. settleMarket only handles MATCH_ODDS. Bookmaker settlement uses a separate function.`,
+        `Invalid marketType: ${marketType}. settleMarket only handles MATCH_ODDS and TIED_MATCH. Bookmaker settlement uses a separate function.`,
       );
     }
 
@@ -2015,6 +2021,434 @@ export class SettlementService {
   }
 
   /**
+   * ✅ TIED MATCH SETTLEMENT (ISOLATED)
+   * 
+   * Handles settlement for Tied Match markets (Yes/No market).
+   * Tied Match is a binary market where:
+   * - Yes (selectionId 37302) = Match will be tied
+   * - No (selectionId 37303) = Match will not be tied
+   * 
+   * BUSINESS RULES:
+   * - ONLY BACK bets exist (NO LAY, NO exposure, NO offset)
+   * - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
+   * - LOSS → credit NOTHING (stake already deducted at placement)
+   * - NO liability changes (wallet.liability remains unchanged)
+   * - NO exposure calculations
+   * 
+   * @param eventId - Exchange event ID
+   * @param marketId - Exchange market ID
+   * @param winnerSelectionId - Winner selection ID (37302 for Yes, 37303 for No)
+   * @param adminId - Admin user ID who is settling
+   * @param betIds - Optional: settle only specific bets
+   */
+  async settleTiedMatchManual(
+    eventId: string,
+    marketId: string,
+    winnerSelectionId: string,
+    adminId: string,
+    betIds?: string[],
+  ) {
+    try {
+      // 🔐 STRICT VALIDATION: Validate required parameters
+      if (!eventId || eventId === 'undefined' || eventId.trim() === '') {
+        throw new BadRequestException('eventId is required and cannot be empty');
+      }
+      if (!marketId || marketId === 'undefined' || marketId.trim() === '') {
+        throw new BadRequestException('marketId is required and cannot be empty');
+      }
+      if (!winnerSelectionId || winnerSelectionId === 'undefined' || winnerSelectionId.trim() === '') {
+        throw new BadRequestException('winnerSelectionId is required and cannot be empty');
+      }
+      if (!adminId || adminId.trim() === '') {
+        throw new BadRequestException('adminId is required');
+      }
+
+      // 🔐 STRICT RULE: winnerSelectionId must be valid (37302 for Yes, 37303 for No)
+      const winnerSelectionIdNum = Number(winnerSelectionId);
+      if (isNaN(winnerSelectionIdNum) || (winnerSelectionIdNum !== 37302 && winnerSelectionIdNum !== 37303)) {
+        throw new BadRequestException(
+          `Invalid winnerSelectionId: ${winnerSelectionId}. Tied Match winnerSelectionId must be 37302 (Yes) or 37303 (No).`,
+        );
+      }
+
+      // Build settlement ID for Tied Match
+      const settlementId = `CRICKET:TIED_MATCH:${eventId}:${marketId}`;
+
+      // 🔐 STRICT VALIDATION: Check if settlement already exists (idempotency)
+      const existingSettlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
+
+      if (existingSettlement && !existingSettlement.isRollback) {
+        const settledBets = await this.prisma.bet.findMany({
+          where: {
+            settlementId,
+            status: { in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED] },
+          },
+        });
+
+        if (settledBets.length > 0) {
+          throw new BadRequestException(
+            `Settlement ${settlementId} already exists and all bets are settled. ` +
+            `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
+            `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
+          );
+        }
+      }
+
+      // 🔐 STRICT MATCHING: Find ONLY Tied Match bets
+      const allBets = await this.prisma.bet.findMany({
+        where: {
+          eventId: eventId,
+          marketId: marketId,
+          status: BetStatus.PENDING,
+          // Include bets that match Tied Match criteria
+          OR: [
+            // New format
+            { settlementId: { startsWith: 'CRICKET:TIED_MATCH:' } },
+            // Legacy format: eventId_selectionId where selectionId is 37302 or 37303
+            {
+              AND: [
+                { selectionId: { in: [37302, 37303] } },
+                { betName: { in: ['Yes', 'No'] } },
+              ],
+            },
+          ],
+          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+        },
+      });
+
+      // Filter to only Tied Match bets (exclude fancy YES/NO bets)
+      const bets = allBets.filter(bet => {
+        // Exclude if it's a fancy bet
+        if (bet.settlementId?.startsWith('CRICKET:FANCY:')) {
+          return false;
+        }
+        // Include if selectionId is 37302 or 37303 (Tied Match)
+        if (bet.selectionId === 37302 || bet.selectionId === 37303) {
+          return true;
+        }
+        // Include if settlementId matches Tied Match pattern
+        if (bet.settlementId?.startsWith('CRICKET:TIED_MATCH:')) {
+          return true;
+        }
+        return false;
+      });
+
+      // 🔐 STRICT VALIDATION: Validate that all bets belong to the same marketId
+      const invalidBets = bets.filter(bet => bet.marketId !== marketId);
+      if (invalidBets.length > 0) {
+        const invalidBetIds = invalidBets.map(b => b.id).join(', ');
+        throw new BadRequestException(
+          `CRITICAL: Found ${invalidBets.length} bets with mismatched marketId. ` +
+          `Expected marketId: ${marketId}, but found bets with different marketIds. ` +
+          `Invalid bet IDs: ${invalidBetIds}. ` +
+          `Settlement aborted - all bets must have matching marketId.`,
+        );
+      }
+
+      // 🔐 STRICT VALIDATION: No bets found
+      if (bets.length === 0) {
+        throw new BadRequestException(
+          `No pending Tied Match bets found for strict settlement criteria. ` +
+          `eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}. ` +
+          `Settlement requires exact matching: bet.eventId === ${eventId} AND bet.marketId === ${marketId} AND selectionId in [37302, 37303].`,
+        );
+      }
+
+      this.logger.log(
+        `Found ${bets.length} pending Tied Match bets for strict settlement. ` +
+        `settlementId: ${settlementId}, eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}`,
+      );
+
+      // ✅ NORMALIZE SETTLEMENT IDs: Update all bets to use new format
+      const betsToNormalize = bets.filter(bet => !bet.settlementId?.startsWith('CRICKET:TIED_MATCH:'));
+      if (betsToNormalize.length > 0) {
+        await this.prisma.bet.updateMany({
+          where: {
+            id: { in: betsToNormalize.map(b => b.id) },
+          },
+          data: {
+            settlementId: settlementId,
+          },
+        });
+        this.logger.log(
+          `Normalized ${betsToNormalize.length} Tied Match bet(s) to new settlementId format: ${settlementId}`,
+        );
+      }
+
+      // Create/update settlement record
+      await this.prisma.settlement.upsert({
+        where: { settlementId },
+        update: {
+          isRollback: false,
+          settledBy: adminId,
+          winnerId: winnerSelectionId,
+        },
+        create: {
+          settlementId,
+          eventId,
+          marketType: MarketType.TIED_MATCH,
+          marketId,
+          winnerId: winnerSelectionId,
+          settledBy: adminId,
+        },
+      });
+
+      // ✅ ISOLATED TIED MATCH SETTLEMENT ENGINE
+      const affectedUserIds = await this.settleTiedMatchBetsIsolated({
+        settlementId,
+        bets,
+        winnerSelectionIdNum,
+        adminId,
+      });
+
+      // Recalculate P/L (reporting only, no wallet mutation)
+      await this.recalculatePnLForUsers(affectedUserIds, eventId, MarketType.TIED_MATCH);
+
+      return { success: true, message: 'Tied Match bets settled successfully' };
+    } catch (error) {
+      this.logger.error(
+        `Error settling Tied Match for eventId ${eventId}, marketId ${marketId}: ${(error as Error).message}`,
+        (error as Error).stack,
+      );
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      throw new BadRequestException(
+        `Failed to settle Tied Match: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * ✅ ISOLATED TIED MATCH SETTLEMENT ENGINE
+   * 
+   * This function is COMPLETELY ISOLATED from other settlement logic.
+   * It handles ONLY Tied Match bets with the following rules:
+   * 
+   * - ONLY BACK bets exist (NO LAY)
+   * - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
+   * - LOSS → credit NOTHING (stake already deducted at placement)
+   * - NO liability changes
+   * - NO exposure calculations
+   * 
+   * @param settlementId - Settlement ID
+   * @param bets - Array of Tied Match bets to settle
+   * @param winnerSelectionIdNum - Winner selection ID (37302 or 37303)
+   * @param adminId - Admin user ID
+   * @returns Set of affected user IDs
+   */
+  private async settleTiedMatchBetsIsolated({
+    settlementId,
+    bets,
+    winnerSelectionIdNum,
+    adminId,
+  }: {
+    settlementId: string;
+    bets: any[];
+    winnerSelectionIdNum: number;
+    adminId: string;
+  }): Promise<Set<string>> {
+    const affectedUserIds = new Set<string>();
+
+    this.logger.log(
+      `Starting ISOLATED Tied Match settlement for ${bets.length} bets. ` +
+      `settlementId: ${settlementId}, winnerSelectionId: ${winnerSelectionIdNum}`,
+    );
+
+    await this.prisma.$transaction(
+      async (tx) => {
+        // 🔐 HARD GUARD: Abort if ANY bet is already settled (idempotency enforcement)
+        const alreadySettledBets = bets.filter(
+          bet => bet.status !== BetStatus.PENDING,
+        );
+        if (alreadySettledBets.length > 0) {
+          const settledBetIds = alreadySettledBets.map(b => b.id).join(', ');
+          const settledStatuses = alreadySettledBets.map(b => b.status).join(', ');
+          throw new BadRequestException(
+            `CRITICAL: Settlement aborted. Found ${alreadySettledBets.length} bets that are already settled. ` +
+            `Settled bet IDs: ${settledBetIds}. ` +
+            `Settled statuses: ${settledStatuses}. ` +
+            `Tied Match settlement requires ALL bets to be PENDING. ` +
+            `This prevents double settlement and wallet inflation.`,
+          );
+        }
+
+        // 1️⃣ Group by user (settle user wallets exactly once)
+        const betsByUser = new Map<string, typeof bets>();
+        for (const bet of bets) {
+          // 🔐 HARD GUARD: Each bet must be PENDING
+          if (bet.status !== BetStatus.PENDING) {
+            throw new BadRequestException(
+              `CRITICAL: Bet ${bet.id} is not PENDING (status: ${bet.status}). ` +
+              `Settlement aborted. All bets must be PENDING before settlement.`,
+            );
+          }
+
+          // 🔐 HARD GUARD: Tied Match ONLY supports BACK bets
+          const betType = (bet.betType || '').toUpperCase();
+          if (betType !== 'BACK' && betType !== 'YES') {
+            throw new BadRequestException(
+              `CRITICAL: Bet ${bet.id} has invalid betType: ${bet.betType}. ` +
+              `Tied Match ONLY supports BACK bets. LAY bets are not allowed.`,
+            );
+          }
+
+          // 🔐 HARD GUARD: Validate selectionId
+          if (bet.selectionId !== 37302 && bet.selectionId !== 37303) {
+            throw new BadRequestException(
+              `CRITICAL: Bet ${bet.id} has invalid selectionId: ${bet.selectionId}. ` +
+              `Tied Match selectionId must be 37302 (Yes) or 37303 (No).`,
+            );
+          }
+
+          if (!betsByUser.has(bet.userId)) {
+            betsByUser.set(bet.userId, []);
+          }
+          betsByUser.get(bet.userId)!.push(bet);
+        }
+
+        // 2️⃣ Settle user by user
+        for (const [userId, userBets] of betsByUser.entries()) {
+          const wallet = await tx.wallet.findUnique({
+            where: { userId },
+            select: { id: true, balance: true }, // Only need ID for transaction records, balance for logging
+          });
+
+          if (!wallet) {
+            this.logger.warn(`Wallet not found for user ${userId}`);
+            continue;
+          }
+
+          // Track balance delta for atomic update
+          let balanceDelta = 0;
+
+          // 🚀 OPTIMIZATION: Collect bet updates for batching
+          const betUpdates: Array<{ id: string; status: BetStatus; pnl: number; creditedAmount: number }> = [];
+
+          // 3️⃣ Process each bet with TIED MATCH-SPECIFIC rules
+          for (const bet of userBets) {
+            const betSelectionId = Number(bet.selectionId);
+            const isWinner = betSelectionId === winnerSelectionIdNum;
+
+            // ✅ TIED MATCH SETTLEMENT RULES:
+            // - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
+            // - LOSS → credit NOTHING (stake already deducted at placement)
+            // - NO liability changes
+            // - NO exposure calculations
+
+            if (isWinner) {
+              // ✅ BACK WIN: credit ONLY winAmount (NOT stake + winAmount)
+              const winAmount = bet.winAmount ?? 0;
+              balanceDelta += winAmount;
+              
+              betUpdates.push({
+                id: bet.id,
+                status: BetStatus.WON,
+                pnl: winAmount, // For reporting: profit = winAmount
+                creditedAmount: winAmount,
+              });
+
+              this.logger.log(
+                `Tied Match WIN: betId=${bet.id}, userId=${userId}, ` +
+                `selectionId=${betSelectionId}, winAmount=${winAmount}, creditedAmount=${winAmount}`,
+              );
+            } else {
+              // ✅ BACK LOSS: credit NOTHING (stake already deducted at placement)
+              const stake = bet.betValue ?? bet.amount ?? 0;
+              
+              betUpdates.push({
+                id: bet.id,
+                status: BetStatus.LOST,
+                pnl: -stake, // For reporting: loss = stake
+                creditedAmount: 0,
+              });
+
+              this.logger.log(
+                `Tied Match LOSS: betId=${bet.id}, userId=${userId}, ` +
+                `selectionId=${betSelectionId}, stake=${stake}, creditedAmount=0`,
+              );
+            }
+          }
+
+          // 🚀 BATCH UPDATE: Update all bets at once instead of individually
+          if (betUpdates.length > 0) {
+            const now = new Date();
+            await Promise.all(
+              betUpdates.map((update) =>
+                tx.bet.update({
+                  where: { id: update.id },
+                  data: {
+                    status: update.status,
+                    // @ts-ignore
+                    pnl: update.pnl,
+                    settledAt: now,
+                    updatedAt: now,
+                  },
+                }),
+              ),
+            );
+          }
+
+          // 4️⃣ Apply wallet changes ONCE per user (ATOMIC UPDATE ONLY)
+          // ✅ CRITICAL: Only update balance if there's a win (balanceDelta > 0)
+          // ✅ CRITICAL: NEVER touch liability (Tied Match has NO liability model)
+          if (balanceDelta > 0) {
+            await tx.wallet.update({
+              where: { userId },
+              data: {
+                balance: { increment: balanceDelta }, // ✅ ATOMIC: Never use direct assignment
+                // ✅ CRITICAL: NO liability update (Tied Match has NO liability)
+              },
+            });
+
+            // Create transaction record
+            await tx.transaction.create({
+              data: {
+                walletId: wallet.id,
+                amount: balanceDelta,
+                type: TransactionType.BET_WON,
+                description: `Tied Match Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+              },
+            });
+
+            this.logger.log(
+              `Tied Match wallet updated (ATOMIC) for userId=${userId}: ` +
+              `balanceDelta=${balanceDelta}, liabilityDelta=0 (NO liability changes). ` +
+              `Previous balance: ${wallet.balance}, New balance: ${wallet.balance + balanceDelta}`,
+            );
+
+            affectedUserIds.add(userId);
+          } else {
+            // No balance change (all bets lost)
+            this.logger.log(
+              `Tied Match settlement for userId=${userId}: ` +
+              `All bets lost, no balance change. ` +
+              `Settled ${betUpdates.length} bet(s).`,
+            );
+            affectedUserIds.add(userId); // Still mark as affected for P/L recalculation
+          }
+        }
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
+      },
+    );
+
+    this.logger.log(
+      `ISOLATED Tied Match settlement completed successfully. ` +
+      `Settled ${bets.length} bets for ${affectedUserIds.size} users. ` +
+      `settlementId: ${settlementId}`,
+    );
+
+    return affectedUserIds;
+  }
+
+  /**
    * Calculate NET P/L for a bet based on bet type and outcome
    * 
    * ⚠️ CRITICAL: This function is FOR REPORTING ONLY
@@ -2056,47 +2490,87 @@ export class SettlementService {
    *   - LOSS: no wallet change
    *   - CANCEL: credit stake
    */
+  /**
+   * ✅ PROPER LIABILITY RECALCULATION
+   * Uses market-specific exposure services to calculate liability correctly
+   * Handles Match Odds, Fancy, and Bookmaker markets properly
+   */
   private async recalcLiability(tx: any, userId: string): Promise<void> {
     const bets = await tx.bet.findMany({
       where: { userId, status: BetStatus.PENDING },
       select: {
-        matchId: true,
+        gtype: true,
+        marketId: true,
+        eventId: true,
         selectionId: true,
         betType: true,
         betValue: true,
         amount: true,
         odds: true,
         betRate: true,
+        winAmount: true,
+        lossAmount: true,
       },
     });
 
-    // REAL EXCHANGE: Calculate net exposure per selection using correct liability
-    const exposureBySelection = new Map<string, { back: number; lay: number }>();
-    
-    for (const bet of bets) {
-      const key = `${bet.matchId}_${bet.selectionId}`;
-      if (!exposureBySelection.has(key)) {
-        exposureBySelection.set(key, { back: 0, lay: 0 });
+    if (bets.length === 0) {
+      // No pending bets, liability should be 0
+      const wallet = await tx.wallet.findUnique({ where: { userId } });
+      if (wallet) {
+        await tx.wallet.update({
+          where: { userId },
+          data: { liability: 0 },
+        });
       }
-      const exposure = exposureBySelection.get(key)!;
-      
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const odds = bet.betRate ?? bet.odds ?? 0;
-      
-      if (bet.betType?.toUpperCase() === 'BACK') {
-        // BACK bet: liability = stake
-        exposure.back += stake;
-      } else if (bet.betType?.toUpperCase() === 'LAY') {
-        // LAY bet: liability = (odds - 1) * stake
-        exposure.lay += (odds - 1) * stake;
+      return;
+    }
+
+    // Group bets by market type for proper exposure calculation
+    const matchOddsBets: any[] = [];
+    const fancyBets: any[] = [];
+    const bookmakerBets: any[] = [];
+
+    for (const bet of bets) {
+      const gtype = (bet.gtype || '').toLowerCase();
+      if (gtype === 'matchodds' || gtype === 'match') {
+        matchOddsBets.push(bet);
+      } else if (gtype === 'fancy') {
+        fancyBets.push(bet);
+      } else if (gtype === 'bookmaker' || (gtype.startsWith('match') && gtype !== 'match' && gtype !== 'matchodds')) {
+        bookmakerBets.push(bet);
       }
     }
 
-    // Calculate total net liability: sum of |back liability - lay liability| for each selection
-    let newLiability = 0;
-    for (const [key, exposure] of exposureBySelection.entries()) {
-      const netExposure = Math.abs(exposure.back - exposure.lay);
-      newLiability += netExposure;
+    // Calculate exposure per market type using proper services
+    let totalLiability = 0;
+
+    // Match Odds exposure (grouped by marketId)
+    const matchOddsByMarket = new Map<string, any[]>();
+    for (const bet of matchOddsBets) {
+      if (!bet.marketId) continue;
+      if (!matchOddsByMarket.has(bet.marketId)) {
+        matchOddsByMarket.set(bet.marketId, []);
+      }
+      matchOddsByMarket.get(bet.marketId)!.push(bet);
+    }
+    for (const [, marketBets] of matchOddsByMarket) {
+      totalLiability += this.matchOddsExposureService.calculateMatchOddsExposureInMemory(marketBets);
+    }
+
+    // Fancy exposure (grouped by eventId + selectionId)
+    totalLiability += this.fancyExposureService.calculateFancyExposureInMemory(fancyBets);
+
+    // Bookmaker exposure (grouped by marketId)
+    const bookmakerByMarket = new Map<string, any[]>();
+    for (const bet of bookmakerBets) {
+      if (!bet.marketId) continue;
+      if (!bookmakerByMarket.has(bet.marketId)) {
+        bookmakerByMarket.set(bet.marketId, []);
+      }
+      bookmakerByMarket.get(bet.marketId)!.push(bet);
+    }
+    for (const [, marketBets] of bookmakerByMarket) {
+      totalLiability += this.bookmakerExposureService.calculateBookmakerExposureInMemory(marketBets);
     }
 
     const wallet = await tx.wallet.findUnique({ where: { userId } });
@@ -2106,210 +2580,249 @@ export class SettlementService {
     }
 
     const currentLiability = wallet.liability ?? 0;
-    const diff = newLiability - currentLiability;
+    const diff = totalLiability - currentLiability;
 
-    // CRITICAL FIX: ONLY update liability, NEVER touch balance
-    // Balance changes are handled explicitly in settlement methods
+    // Update liability only (balance is handled separately in settlement/rollback)
     await tx.wallet.update({
       where: { userId },
       data: {
-        liability: newLiability,
-        // ❌ REMOVED: balance update (causes fake refunds on LOSS)
-        // ✅ Wallet updates happen explicitly in settlement:
-        //    - WIN: credit profit only
-        //    - LOSS: no wallet change
-        //    - CANCEL: credit stake
+        liability: totalLiability,
       },
     });
 
-    if (diff < 0) {
-      this.logger.debug(
-        `Liability recalculation for user ${userId}: Liability decreased by ${Math.abs(diff)} (old: ${currentLiability}, new: ${newLiability}). Wallet will be updated explicitly in settlement.`,
-      );
-    } else if (diff > 0) {
-      // This shouldn't happen during settlement (liability should only decrease)
-      // But log it for debugging
-      this.logger.debug(
-        `Liability recalculation for user ${userId}: Increased by ${diff} (old: ${currentLiability}, new: ${newLiability})`,
-      );
-    }
+    this.logger.debug(
+      `Liability recalculation for user ${userId}: ${currentLiability} → ${totalLiability} (diff: ${diff > 0 ? '+' : ''}${diff})`,
+    );
   }
 
 
-  // async rollbackSettlement(settlementId: string, adminId: string, betIds?: string[]) {
-  //   try {
-  //     // @ts-ignore - settlement property exists after Prisma client regeneration
-  //     const settlement = await this.prisma.settlement.findUnique({
-  //       where: { settlementId },
-  //     });
+  async rollbackSettlement(settlementId: string, adminId: string, betIds?: string[]) {
+    try {
+      const settlement = await this.prisma.settlement.findUnique({
+        where: { settlementId },
+      });
 
-  //     if (!settlement) {
-  //       throw new BadRequestException(
-  //         `Settlement ${settlementId} not found`,
-  //       );
-  //     }
+      if (!settlement) {
+        throw new BadRequestException(
+          `Settlement ${settlementId} not found`,
+        );
+      }
 
-  //     if (settlement.isRollback) {
-  //       throw new BadRequestException(
-  //         `Settlement ${settlementId} has already been rolled back`,
-  //       );
-  //     }
+      if (settlement.isRollback) {
+        throw new BadRequestException(
+          `Settlement ${settlementId} has already been rolled back`,
+        );
+      }
 
-  //     this.logger.log(
-  //       `Rolling back settlement ${settlementId} by admin ${adminId}. Market: ${settlement.marketType}, Event: ${settlement.eventId}`,
-  //     );
+      this.logger.log(
+        `Rolling back settlement ${settlementId} by admin ${adminId}. Market: ${settlement.marketType}, Event: ${settlement.eventId}`,
+      );
 
-  //   const bets = await this.prisma.bet.findMany({
-  //     where: {
-  //       settlementId,
-  //       status: {
-  //         in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
-  //       },
-  //       // Filter by betIds if provided
-  //       ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
-  //     },
-  //   });
+      const bets = await this.prisma.bet.findMany({
+        where: {
+          settlementId,
+          status: {
+            in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+          },
+          // Filter by betIds if provided
+          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+        },
+      });
 
-  //   if (bets.length === 0) {
-  //     this.logger.warn(
-  //       `No settled bets found for settlement ${settlementId}. Proceeding with settlement rollback only.`,
-  //     );
-  //   }
+      if (bets.length === 0) {
+        this.logger.warn(
+          `No settled bets found for settlement ${settlementId}. Proceeding with settlement rollback only.`,
+        );
+      }
 
-  //   // CRITICAL FIX: Add transaction timeout to prevent "Transaction not found" errors
-  //   // This is especially important with pooled connections (Neon, etc.) and when rolling back many bets
-  //   await this.prisma.$transaction(
-  //     async (tx) => {
-  //       // Group bets by userId to optimize wallet updates (reduce number of updates)
-  //       const betsByUserId = new Map<string, typeof bets>();
-  //       for (const bet of bets) {
-  //         if (!betsByUserId.has(bet.userId)) {
-  //           betsByUserId.set(bet.userId, []);
-  //         }
-  //         betsByUserId.get(bet.userId)!.push(bet);
-  //       }
+      // CRITICAL FIX: Add transaction timeout to prevent "Transaction not found" errors
+      // This is especially important with pooled connections (Neon, etc.) and when rolling back many bets
+      await this.prisma.$transaction(
+        async (tx) => {
+          // Group bets by userId to optimize wallet updates (reduce number of updates)
+          const betsByUserId = new Map<string, typeof bets>();
+          for (const bet of bets) {
+            if (!betsByUserId.has(bet.userId)) {
+              betsByUserId.set(bet.userId, []);
+            }
+            betsByUserId.get(bet.userId)!.push(bet);
+          }
 
-  //       // Process each user's bets
-  //       const userIdsForRecalc = new Set<string>();
-        
-  //       for (const [userId, userBets] of betsByUserId.entries()) {
-  //         // Reset all bets for this user to PENDING
-  //         const betIds = userBets.map((b) => b.id);
-  //         await tx.bet.updateMany({
-  //           where: {
-  //             id: { in: betIds },
-  //           },
-  //           data: {
-  //             status: BetStatus.PENDING,
-  //             // @ts-ignore - pnl field exists after database migration
-  //             pnl: 0, // Reset PNL (reporting only)
-  //             rollbackAt: new Date(),
-  //             settledAt: null,
-  //             updatedAt: new Date(),
-  //           },
-  //         });
-          
-  //         userIdsForRecalc.add(userId);
-  //       }
+          // Process each user's bets
+          for (const [userId, userBets] of betsByUserId.entries()) {
+            const wallet = await tx.wallet.findUnique({ where: { userId } });
+            if (!wallet) {
+              this.logger.warn(`Wallet not found for user ${userId} during rollback`);
+              continue;
+            }
 
-  //       // CRITICAL: Use recalcLiability() to restore wallet state
-  //       // This is the ONLY place wallet.balance changes
-  //       // After resetting bets to PENDING, recalcLiability will:
-  //       // 1. Calculate new liability from all PENDING bets (including restored ones)
-  //       // 2. Restore balance based on liability difference
-  //       for (const userId of userIdsForRecalc) {
-  //         await this.recalcLiability(tx, userId);
-  //       }
+            // ✅ STEP 1: Calculate wallet balance reversal
+            // We need to reverse the balance changes that happened during settlement
+            // Settlement logic:
+            // - WIN: balance += profit, liability -= lockedAmount
+            // - LOSS: balance unchanged, liability -= lockedAmount
+            // - CANCEL: balance += refund, liability -= lockedAmount
+            // 
+            // Rollback reversal:
+            // - WIN: balance -= profit, liability += lockedAmount (will be recalculated)
+            // - LOSS: balance unchanged, liability += lockedAmount (will be recalculated)
+            // - CANCEL: balance -= refund, liability += lockedAmount (will be recalculated)
+            let balanceReversal = 0;
 
-  //       // Mark settlement as rollbacked
-  //       // @ts-ignore - settlement property exists after Prisma client regeneration
-  //       await tx.settlement.update({
-  //         where: { settlementId },
-  //         data: {
-  //           isRollback: true,
-  //           settledBy: adminId,
-  //         },
-  //       });
-  //     },
-  //     {
-  //       maxWait: 15000, // Maximum time to wait for a transaction slot (15 seconds)
-  //       timeout: 30000, // Maximum time the transaction can run (30 seconds - longer for rollback with many bets)
-  //     },
-  //   );
+            for (const bet of userBets) {
+              const betType = (bet.betType || '').toUpperCase();
+              const stake = bet.betValue ?? bet.amount ?? 0;
+              const winAmount = bet.winAmount ?? stake;
+              const lossAmount = bet.lossAmount ?? stake;
+              
+              // Determine liability that was locked (same as settlement logic)
+              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
 
-  //   // Delete hierarchical PnL ledger records (NO WALLET REVERSAL - wallet is never touched in PnL distribution)
-  //   const userIds = new Set(bets.map((b) => b.userId));
-  //   for (const userId of userIds) {
-  //     try {
-  //       // Delete hierarchical PnL ledger records
-  //       // Wallet balance is never updated by hierarchy PnL, so no reversal needed
-  //       // @ts-ignore - hierarchyPnl property exists after Prisma client regeneration
-  //       await this.prisma.hierarchyPnl.deleteMany({
-  //         where: {
-  //           eventId: settlement.eventId,
-  //           marketType: settlement.marketType,
-  //           fromUserId: userId, // sourceUserId (original client)
-  //         },
-  //       });
-  //     } catch (error) {
-  //       this.logger.warn(
-  //         `Failed to delete hierarchical PnL records for user ${userId} during rollback: ${(error as Error).message}`,
-  //       );
-  //     }
-  //   }
+              if (bet.status === BetStatus.WON) {
+                // WIN: Reverse the profit that was credited
+                if (betType === 'BACK' || betType === 'YES') {
+                  // BACK/YES WIN: was credited stake + winAmount, reverse it
+                  balanceReversal -= (stake + winAmount);
+                } else {
+                  // LAY/NO WIN: was credited lossAmount + winAmount, reverse it
+                  balanceReversal -= (lossAmount + winAmount);
+                }
+              } else if (bet.status === BetStatus.CANCELLED) {
+                // CANCEL: Reverse the refund that was credited
+                balanceReversal -= liabilityAmount;
+              }
+              // LOSS: No balance change during settlement, so no reversal needed
+            }
 
-  //     // Recalculate P/L for all affected users after rollback in parallel (OPTIMIZED)
-  //     await Promise.all(
-  //       Array.from(userIds).map(async (userId) => {
-  //         try {
-  //           await this.pnlService.recalculateUserPnlAfterSettlement(
-  //             userId,
-  //             settlement.eventId,
-  //           );
-  //         } catch (error) {
-  //           this.logger.warn(
-  //             `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
-  //           );
-  //         }
-  //       }),
-  //     );
+            // ✅ STEP 2: Reset bets to PENDING
+            const betIds = userBets.map((b) => b.id);
+            await tx.bet.updateMany({
+              where: {
+                id: { in: betIds },
+              },
+              data: {
+                status: BetStatus.PENDING,
+                pnl: 0, // Reset PNL (reporting only)
+                rollbackAt: new Date(),
+                settledAt: null,
+                updatedAt: new Date(),
+              },
+            });
 
-  //     this.logger.log(
-  //       `Settlement ${settlementId} rolled back successfully. ${bets.length} bets reset to PENDING.`,
-  //     );
+            // ✅ STEP 3: Reverse wallet balance changes
+            if (balanceReversal !== 0) {
+              await tx.wallet.update({
+                where: { userId },
+                data: {
+                  balance: wallet.balance + balanceReversal, // balanceReversal is negative, so this subtracts
+                },
+              });
 
-  //     return { success: true, message: 'Settlement rolled back successfully' };
-  //   } catch (error) {
-  //     this.logger.error(
-  //       `Error rolling back settlement ${settlementId}: ${(error as Error).message}`,
-  //       (error as Error).stack,
-  //     );
+              // Create transaction record for rollback
+              if (balanceReversal < 0) {
+                await tx.transaction.create({
+                  data: {
+                    walletId: wallet.id,
+                    amount: Math.abs(balanceReversal),
+                    type: TransactionType.REFUND,
+                    description: `Rollback: Reversed settlement balance changes - ${settlementId}`,
+                  },
+                });
+              }
+            }
 
-  //     // Re-throw BadRequestException as-is
-  //     if (error instanceof BadRequestException) {
-  //       throw error;
-  //     }
+            // ✅ STEP 4: Recalculate liability using proper exposure services
+            // This will calculate the correct liability based on all PENDING bets
+            await this.recalcLiability(tx, userId);
+          }
 
-  //     // Handle transaction errors specifically
-  //     const errorMessage = error instanceof Error ? error.message : String(error);
-  //     const isTransactionError =
-  //       errorMessage.includes('Transaction not found') ||
-  //       errorMessage.includes('Transaction') ||
-  //       errorMessage.includes('P2034') || // Prisma transaction timeout error code
-  //       errorMessage.includes('P2035'); // Prisma transaction error code
+          // Mark settlement as rollbacked
+          await tx.settlement.update({
+            where: { settlementId },
+            data: {
+              isRollback: true,
+              settledBy: adminId,
+            },
+          });
+        },
+        {
+          maxWait: 15000, // Maximum time to wait for a transaction slot (15 seconds)
+          timeout: 30000, // Maximum time the transaction can run (30 seconds - longer for rollback with many bets)
+        },
+      );
 
-  //     if (isTransactionError) {
-  //       throw new BadRequestException(
-  //         `Transaction failed during rollback. Please try again. If the issue persists, the database connection may be experiencing issues. Error: ${errorMessage}`,
-  //       );
-  //     }
+      // Delete hierarchical PnL ledger records (NO WALLET REVERSAL - wallet is never touched in PnL distribution)
+      const userIds = new Set(bets.map((b) => b.userId));
+      for (const userId of userIds) {
+        try {
+          // Delete hierarchical PnL ledger records
+          // Wallet balance is never updated by hierarchy PnL, so no reversal needed
+          await this.prisma.hierarchyPnl.deleteMany({
+            where: {
+              eventId: settlement.eventId,
+              marketType: settlement.marketType,
+              fromUserId: userId, // sourceUserId (original client)
+            },
+          });
+        } catch (error) {
+          this.logger.warn(
+            `Failed to delete hierarchical PnL records for user ${userId} during rollback: ${(error as Error).message}`,
+          );
+        }
+      }
 
-  //     // Wrap other errors in BadRequestException for proper HTTP response
-  //     throw new BadRequestException(
-  //       `Failed to rollback settlement: ${errorMessage}`,
-  //     );
-  //   }
-  // }
+      // Recalculate P/L for all affected users after rollback in parallel (OPTIMIZED)
+      await Promise.all(
+        Array.from(userIds).map(async (userId) => {
+          try {
+            await this.pnlService.recalculateUserPnlAfterSettlement(
+              userId,
+              settlement.eventId,
+            );
+          } catch (error) {
+            this.logger.warn(
+              `Failed to recalculate P/L for user ${userId} after rollback: ${(error as Error).message}`,
+            );
+          }
+        }),
+      );
+
+      this.logger.log(
+        `Settlement ${settlementId} rolled back successfully. ${bets.length} bets reset to PENDING.`,
+      );
+
+      return { success: true, message: 'Settlement rolled back successfully' };
+    } catch (error) {
+      this.logger.error(
+        `Error rolling back settlement ${settlementId}: ${(error as Error).message}`,
+        (error as Error).stack,
+      );
+
+      // Re-throw BadRequestException as-is
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      // Handle transaction errors specifically
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isTransactionError =
+        errorMessage.includes('Transaction not found') ||
+        errorMessage.includes('Transaction') ||
+        errorMessage.includes('P2034') || // Prisma transaction timeout error code
+        errorMessage.includes('P2035'); // Prisma transaction error code
+
+      if (isTransactionError) {
+        throw new BadRequestException(
+          `Transaction failed during rollback. Please try again. If the issue persists, the database connection may be experiencing issues. Error: ${errorMessage}`,
+        );
+      }
+
+      // Wrap other errors in BadRequestException for proper HTTP response
+      throw new BadRequestException(
+        `Failed to rollback settlement: ${errorMessage}`,
+      );
+    }
+  }
 
   /**
    * Delete a bet for a specific user (Admin only)
@@ -2550,6 +3063,51 @@ export class SettlementService {
               continue;
             }
 
+            // ✅ OFFSET DETECTION: Find BACK + LAY pairs with same marketId, selectionId, betValue
+            // Only for Match Odds bets (gtype === 'matchodds' or 'match')
+            // OFFSET bets are already neutralized at bet placement, so cancellation must skip refund
+            const offsetBetIds = new Set<string>();
+            const matchOddsBets = userBets.filter(
+              (bet) =>
+                (bet.gtype?.toLowerCase() === 'matchodds' ||
+                  bet.gtype?.toLowerCase() === 'match') &&
+                bet.marketId &&
+                bet.selectionId !== null &&
+                bet.selectionId !== undefined,
+            );
+
+            if (matchOddsBets.length > 0) {
+              const betMap = new Map<string, { back?: any; lay?: any }>();
+
+              for (const bet of matchOddsBets) {
+                const betKey = `${bet.marketId}_${bet.selectionId}_${
+                  bet.betValue ?? bet.amount ?? 0
+                }`;
+                if (!betMap.has(betKey)) {
+                  betMap.set(betKey, {});
+                }
+                const pair = betMap.get(betKey)!;
+                const betType = bet.betType?.toUpperCase();
+                if (betType === 'BACK') {
+                  pair.back = bet;
+                } else if (betType === 'LAY') {
+                  pair.lay = bet;
+                }
+              }
+
+              // Mark OFFSET pairs (both BACK and LAY exist with same key)
+              for (const [key, pair] of betMap.entries()) {
+                if (pair.back && pair.lay) {
+                  offsetBetIds.add(pair.back.id);
+                  offsetBetIds.add(pair.lay.id);
+                  this.logger.debug(
+                    `OFFSET detected in cancelBetsBulk: BACK bet ${pair.back.id} + LAY bet ${pair.lay.id} ` +
+                      `(marketId: ${pair.back.marketId}, selectionId: ${pair.back.selectionId}, betValue: ${pair.back.betValue ?? pair.back.amount})`,
+                  );
+                }
+              }
+            }
+
             let totalUserRefund = 0;
             let totalLiabilityRelease = 0;
 
@@ -2559,6 +3117,32 @@ export class SettlementService {
               const odds = bet.betRate ?? bet.odds ?? 0;
               const betType = bet.betType?.toUpperCase() || '';
 
+              // ✅ OFFSET: Skip refund/liability calculations for OFFSET bets
+              // OFFSET bets are already neutralized at bet placement, so no refund needed
+              if (offsetBetIds.has(bet.id)) {
+                // Update bet status to CANCELLED (no refund)
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.CANCELLED,
+                    // @ts-ignore
+                    pnl: 0, // No P/L for cancelled bets
+                    settledAt: new Date(),
+                    updatedAt: new Date(),
+                  },
+                });
+
+                cancelledBets.push({
+                  betId: bet.id,
+                  userId: bet.userId,
+                  userName: bet.user.name || bet.user.username || 'Unknown',
+                  refundAmount: 0, // OFFSET bets get no refund
+                });
+
+                continue; // Skip refund/liability calculations
+              }
+
+              // ✅ NON-OFFSET BETS: Calculate refund/liability (existing logic)
               // Calculate liability/refund amount based on bet type
               let refundAmount = 0;
               let liabilityRelease = 0;
@@ -2606,40 +3190,37 @@ export class SettlementService {
               });
             }
 
-            // Update wallet: credit refund and release liability
-            if (totalUserRefund > 0 || totalLiabilityRelease > 0) {
-              // Safety check: Ensure liability doesn't go negative
-              // Get current wallet state to check liability
-              const currentWallet = await tx.wallet.findUnique({
-                where: { userId },
-                select: { liability: true },
-              });
-              
-              const currentLiability = currentWallet?.liability ?? 0;
-              const newLiability = Math.max(0, currentLiability - totalLiabilityRelease);
-              
+            // Update wallet: credit refund
+            if (totalUserRefund > 0) {
               await tx.wallet.update({
                 where: { userId },
                 data: {
                   balance: { increment: totalUserRefund },
-                  liability: newLiability,
                 },
               });
 
               // Create refund transaction record
-              if (totalUserRefund > 0) {
-                await tx.transaction.create({
-                  data: {
-                    walletId: wallet.id,
-                    amount: totalUserRefund,
-                    type: TransactionType.REFUND,
-                    description: `Bulk bet cancellation by admin. ` +
-                      `Cancelled ${userBets.length} bet(s). ` +
-                      `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
-                  },
-                });
-              }
+              await tx.transaction.create({
+                data: {
+                  walletId: wallet.id,
+                  amount: totalUserRefund,
+                  type: TransactionType.REFUND,
+                  description:
+                    `Bulk bet cancellation by admin. ` +
+                    `Cancelled ${userBets.length} bet(s). ` +
+                    `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
+                },
+              });
             }
+
+            // ✅ RECALCULATE LIABILITY: After cancelling bets, recalculate liability properly
+            // This ensures Match Odds offset cancellation works correctly
+            // recalcLiability will:
+            // 1. Load all remaining PENDING bets (cancelled bets are excluded)
+            // 2. Calculate correct liability using proper exposure services
+            // 3. Update wallet.liability to the correct value
+            // This handles both offset and non-offset bets correctly
+            await this.recalcLiability(tx, userId);
 
             totalRefundAmount += totalUserRefund;
           }
@@ -5388,25 +5969,90 @@ export class SettlementService {
   /**
    * Get pending bets for a specific market type
    */
-  async getPendingBetsByMarketType(marketType: 'fancy' | 'match-odds' | 'bookmaker') {
-    const settlementPrefix =
-      marketType === 'fancy'
-        ? 'CRICKET:FANCY:'
-        : marketType === 'match-odds'
-          ? 'CRICKET:MATCHODDS:'
-          : 'CRICKET:BOOKMAKER:';
+  async getPendingBetsByMarketType(marketType: 'fancy' | 'match-odds' | 'bookmaker' | 'tied-match') {
+    // Build where clause based on market type
+    const whereClause: any = {
+      status: BetStatus.PENDING,
+      eventId: {
+        not: null,
+      },
+    };
+
+    if (marketType === 'fancy') {
+      whereClause.settlementId = {
+        startsWith: 'CRICKET:FANCY:',
+      };
+    } else if (marketType === 'match-odds') {
+      // Match Odds: CRICKET:MATCHODDS: prefix, but exclude tied match (Yes/No) and match odds including tie
+      whereClause.OR = [
+        {
+          settlementId: {
+            startsWith: 'CRICKET:MATCHODDS:',
+          },
+        },
+        {
+          AND: [
+            {
+              OR: [
+                { settlementId: { contains: '_' } }, // Old format: eventId_selectionId
+                { settlementId: { startsWith: 'CRICKET:MATCHODDS:' } },
+              ],
+            },
+            {
+              betName: {
+                notIn: ['Yes', 'No', 'yes', 'no', 'Tie', 'The Draw', 'tie', 'the draw'],
+              },
+            },
+          ],
+        },
+      ];
+    } else if (marketType === 'tied-match') {
+      // Tied Match: CRICKET:TIED_MATCH: prefix OR selectionId 37302/37303 OR betName Yes/No
+      whereClause.OR = [
+        {
+          settlementId: {
+            startsWith: 'CRICKET:TIED_MATCH:',
+          },
+        },
+        {
+          selectionId: {
+            in: [37302, 37303],
+          },
+        },
+        {
+          AND: [
+            {
+              betName: {
+                in: ['Yes', 'No', 'yes', 'no'],
+              },
+            },
+            {
+              OR: [
+                {
+                  marketName: {
+                    contains: 'tied match',
+                    mode: 'insensitive',
+                  },
+                },
+                {
+                  selectionId: {
+                    in: [37302, 37303],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ];
+    } else if (marketType === 'bookmaker') {
+      whereClause.settlementId = {
+        startsWith: 'CRICKET:BOOKMAKER:',
+      };
+    }
 
     // OPTIMIZED: Use select instead of include
     const pendingBets = await this.prisma.bet.findMany({
-      where: {
-        status: BetStatus.PENDING,
-        settlementId: {
-          startsWith: settlementPrefix,
-        },
-        eventId: {
-          not: null,
-        },
-      },
+      where: whereClause,
       select: {
         id: true,
         matchId: true,
@@ -5415,7 +6061,14 @@ export class SettlementService {
         odds: true,
         betType: true,
         betName: true,
+        marketName: true,
+        marketType: true,
         settlementId: true,
+        selectionId: true,
+        marketId: true,
+        betValue: true,
+        winAmount: true,
+        lossAmount: true,
         createdAt: true,
         match: {
           select: {
@@ -5433,6 +6086,38 @@ export class SettlementService {
       },
     });
 
+    // Filter bets to ensure they match the market type (post-filter for edge cases)
+    const filteredBets = pendingBets.filter((bet) => {
+      if (!bet.eventId) return false;
+
+      if (marketType === 'tied-match') {
+        // For tied-match, ensure it's actually a tied match bet
+        const betName = (bet.betName || '').toLowerCase();
+        const marketName = (bet.marketName || '').toLowerCase();
+        const selectionId = bet.selectionId ? Number(bet.selectionId) : null;
+
+        // Must be Yes/No with selectionId 37302/37303 or marketName contains 'tied match'
+        return (
+          (betName === 'yes' || betName === 'no') &&
+          (selectionId === 37302 || selectionId === 37303 || marketName.includes('tied match'))
+        );
+      } else if (marketType === 'match-odds') {
+        // For match-odds, exclude tied match and match odds including tie
+        const betName = (bet.betName || '').toLowerCase();
+        const marketName = (bet.marketName || '').toLowerCase();
+        return (
+          betName !== 'yes' &&
+          betName !== 'no' &&
+          betName !== 'tie' &&
+          betName !== 'the draw' &&
+          !marketName.includes('tied match') &&
+          !marketName.includes('match odds including tie')
+        );
+      }
+
+      return true; // For fancy and bookmaker, trust the settlementId prefix
+    });
+
     // Group by eventId
     const matchMap = new Map<
       string,
@@ -5444,10 +6129,11 @@ export class SettlementService {
         startTime: Date;
         bets: any[];
         totalAmount: number;
+        runners?: Array<{ selectionId: number; name: string }>;
       }
     >();
 
-    for (const bet of pendingBets) {
+    for (const bet of filteredBets) {
       if (!bet.eventId) continue;
 
       if (!matchMap.has(bet.eventId)) {
@@ -5463,6 +6149,7 @@ export class SettlementService {
           startTime: bet.match?.startTime || new Date(),
           bets: [],
           totalAmount: 0,
+          runners: marketType === 'tied-match' || marketType === 'match-odds' ? [] : undefined,
         });
       }
 
@@ -5473,10 +6160,38 @@ export class SettlementService {
         odds: bet.odds,
         betType: bet.betType,
         betName: bet.betName,
+        marketType: bet.marketType,
         settlementId: bet.settlementId,
+        eventId: bet.eventId,
+        selectionId: bet.selectionId ? Number(bet.selectionId) : null,
+        marketId: bet.marketId,
+        betValue: bet.betValue,
+        winAmount: bet.winAmount,
+        lossAmount: bet.lossAmount,
         createdAt: bet.createdAt,
       });
       matchData.totalAmount += bet.amount || 0;
+
+      // Add runners for tied-match and match-odds
+      if ((marketType === 'tied-match' || marketType === 'match-odds') && bet.selectionId) {
+        const selectionId = Number(bet.selectionId);
+        if (!isNaN(selectionId) && matchData.runners) {
+          const existingRunner = matchData.runners.find((r) => r.selectionId === selectionId);
+          if (!existingRunner) {
+            matchData.runners.push({
+              selectionId,
+              name: bet.betName || `Selection ${selectionId}`,
+            });
+          }
+        }
+      }
+    }
+
+    // Sort runners by selectionId for tied-match and match-odds
+    for (const match of matchMap.values()) {
+      if (match.runners) {
+        match.runners.sort((a, b) => a.selectionId - b.selectionId);
+      }
     }
 
     const matches = Array.from(matchMap.values()).sort(
@@ -5488,7 +6203,7 @@ export class SettlementService {
       marketType,
       data: matches,
       totalMatches: matches.length,
-      totalPendingBets: pendingBets.length,
+      totalPendingBets: filteredBets.length,
     };
   }
 

@@ -170,8 +170,12 @@ export class FancyExposureService {
       const betType = (bet.betType || '').toUpperCase();
       const line = bet.betRate ?? bet.odds ?? 0;
   
-      // ✅ Fancy stake is the ONLY value that matters
+      // ✅ Fancy stake is the base value
       const stake = bet.betValue ?? bet.amount ?? 0;
+      // ✅ For LAY bets, use lossAmount if provided (from payload), otherwise use stake
+      const lossAmount = bet.lossAmount ?? stake;
+      // ✅ For win, use winAmount if provided, otherwise use stake
+      const winAmount = bet.winAmount ?? stake;
   
       const isYes = betType === 'YES' || betType === 'BACK';
       const isNo = betType === 'NO' || betType === 'LAY';
@@ -188,11 +192,11 @@ export class FancyExposureService {
   
       // ✅ FANCY P/L RULE
       if (betWins) {
-        // Profit = +stake (NOT winAmount, NOT odds)
-        totalPl += stake;
+        // Profit = +winAmount (for LAY bets, this is typically stake)
+        totalPl += winAmount;
       } else {
-        // Loss = -stake
-        totalPl -= stake;
+        // Loss = -lossAmount (for LAY bets, this is the loss_amount from payload)
+        totalPl -= lossAmount;
       }
     }
   

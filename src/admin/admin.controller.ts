@@ -72,6 +72,7 @@ export class AdminController {
       const matchesWithVisibility = allMatches.map((match: any) => {
         const eventId = match?.event?.id;
         const eventName = match?.event?.name || 'Unknown Match';
+        const eventDate = match?.event?.openDate || null;
 
         // Get visibility status (default to true if not in DB)
         const isEnabled = visibilityMap.get(eventId) ?? true;
@@ -80,6 +81,7 @@ export class AdminController {
           eventId,
           name: eventName,
           isEnabled,
+          date: eventDate ? new Date(eventDate).toISOString() : null,
         };
       });
 
@@ -96,6 +98,7 @@ export class AdminController {
             eventId: visibility.eventId,
             name: 'Match not available in vendor API',
             isEnabled: visibility.isEnabled,
+            date: null, // No date available for matches not in vendor API
           });
         }
       }

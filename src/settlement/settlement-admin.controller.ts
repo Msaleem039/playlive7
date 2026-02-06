@@ -60,7 +60,26 @@ class SettleMarketDto {
 
   @IsNotEmpty()
   @IsString()
-  marketType: 'MATCH_ODDS' | 'BOOKMAKER'; // Market type: MATCH_ODDS or BOOKMAKER
+  marketType: 'MATCH_ODDS' | 'BOOKMAKER' | 'TIED_MATCH'; // Market type: MATCH_ODDS, BOOKMAKER, or TIED_MATCH
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
+}
+
+class SettleTiedMatchDto {
+  @IsNotEmpty()
+  @IsString()
+  eventId: string;
+
+  @IsNotEmpty()
+  @IsString()
+  marketId: string;
+
+  @IsNotEmpty()
+  @IsString()
+  winnerSelectionId: string; // 37302 for Yes, 37303 for No
 
   @IsOptional()
   @IsArray()
@@ -114,9 +133,9 @@ export class SettlementAdminController {
     }
 
     // Validate marketType
-    if (dto.marketType !== 'MATCH_ODDS' && dto.marketType !== 'BOOKMAKER') {
+    if (dto.marketType !== 'MATCH_ODDS' && dto.marketType !== 'BOOKMAKER' && dto.marketType !== 'TIED_MATCH') {
       throw new BadRequestException(
-        `Invalid marketType: ${dto.marketType}. Must be either 'MATCH_ODDS' or 'BOOKMAKER'`,
+        `Invalid marketType: ${dto.marketType}. Must be either 'MATCH_ODDS', 'BOOKMAKER', or 'TIED_MATCH'`,
       );
     }
 
@@ -131,12 +150,52 @@ export class SettlementAdminController {
       );
     }
 
+    if (dto.marketType === 'TIED_MATCH') {
+      return this.settlementService.settleTiedMatchManual(
+        dto.eventId,
+        dto.marketId,
+        dto.winnerSelectionId,
+        user.id,
+        dto.betIds,
+      );
+    }
+
     // MATCH_ODDS
     return this.settlementService.settleMarketManual(
       dto.eventId,
       dto.marketId,
       dto.winnerSelectionId,
       MarketType.MATCH_ODDS,
+      user.id,
+      dto.betIds,
+    );
+  }
+
+  /**
+   * Settle Tied Match bets manually (Admin only)
+   * POST /admin/settlement/tied-match
+   * 
+   * Tied Match is a Yes/No market where:
+   * - Yes (selectionId 37302) = Match will be tied
+   * - No (selectionId 37303) = Match will not be tied
+   * 
+   * Request Body:
+   * {
+   *   "eventId": "35226952",
+   *   "marketId": "1.253607053",
+   *   "winnerSelectionId": "37302",  // 37302 for Yes, 37303 for No
+   *   "betIds": ["bet1", "bet2"]      // Optional: settle only specific bets
+   * }
+   */
+  @Post('tied-match')
+  async settleTiedMatch(
+    @Body() dto: SettleTiedMatchDto,
+    @CurrentUser() user: User,
+  ) {
+    return this.settlementService.settleTiedMatchManual(
+      dto.eventId,
+      dto.marketId,
+      dto.winnerSelectionId,
       user.id,
       dto.betIds,
     );
@@ -221,12 +280,13 @@ export class SettlementAdminController {
    * GET /admin/settlement/pending/fancy
    * GET /admin/settlement/pending/match-odds
    * GET /admin/settlement/pending/bookmaker
+   * GET /admin/settlement/pending/tied-match
    */
   @Get('pending/:marketType')
   async getPendingBetsByMarketType(
     @Param('marketType') marketType: string,
   ) {
-    const validTypes = ['fancy', 'match-odds', 'bookmaker'];
+    const validTypes = ['fancy', 'match-odds', 'bookmaker', 'tied-match'];
     
     if (!validTypes.includes(marketType)) {
       throw new BadRequestException(
@@ -235,7 +295,7 @@ export class SettlementAdminController {
     }
 
     return this.settlementService.getPendingBetsByMarketType(
-      marketType as 'fancy' | 'match-odds' | 'bookmaker',
+      marketType as 'fancy' | 'match-odds' | 'bookmaker' | 'tied-match',
     );
   }
 
@@ -271,7 +331,7 @@ export class SettlementAdminController {
     }
 
     if (marketType) {
-      const validMarketTypes = ['FANCY', 'MATCH_ODDS', 'BOOKMAKER'];
+      const validMarketTypes = ['FANCY', 'MATCH_ODDS', 'BOOKMAKER', 'TIED_MATCH'];
       if (!validMarketTypes.includes(marketType.toUpperCase())) {
         throw new BadRequestException(
           `Invalid market type: ${marketType}. Must be one of: ${validMarketTypes.join(', ')}`,
@@ -419,6 +479,45 @@ export class SettlementAdminController {
     @CurrentUser() user: User,
   ) {
     return this.settlementService.deleteBet(betIdOrSettlementId, user.id);
+  }
+
+  /**
+   * Rollback a previously settled settlement (Admin only)
+   * POST /admin/settlement/rollback
+   * 
+   * This will:
+   * - Reset all settled bets (WON/LOST/CANCELLED) back to PENDING
+   * - Restore wallet balance and liability for all affected users
+   * - Mark the settlement as rolled back
+   * - Delete hierarchical PnL records
+   * - Recalculate P/L for all affected users
+   * 
+   * Request Body:
+   * {
+   *   "settlementId": "CRICKET:MATCHODDS:35100660:6571503686236",  // Required: Settlement ID to rollback
+   *   "betIds": ["bet1", "bet2", "bet3"]                           // Optional: Specific bet IDs to rollback. If not provided, rolls back ALL bets for the settlement
+   * }
+   * 
+   * Response:
+   * {
+   *   "success": true,
+   *   "message": "Settlement rolled back successfully"
+   * }
+   */
+  @Post('rollback')
+  async rollbackSettlement(
+    @Body() body: { settlementId: string; betIds?: string[] },
+    @CurrentUser() user: User,
+  ) {
+    if (!body.settlementId) {
+      throw new BadRequestException('settlementId is required');
+    }
+
+    return this.settlementService.rollbackSettlement(
+      body.settlementId,
+      user.id,
+      body.betIds,
+    );
   }
 
   /**
