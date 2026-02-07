@@ -6,3 +6,6 @@ EXCEPTION
         RAISE NOTICE 'TIED_MATCH already exists in market_type enum';
 END $$;
 
+
+
+

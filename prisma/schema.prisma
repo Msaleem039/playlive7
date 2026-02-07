@@ -33,6 +33,28 @@ model User {
   @@map("users")
 }
 
+model Setting {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+model Complaint {
+  id            String   @id @default(uuid())
+  name          String
+  contactNumber String   @map("contact_number")
+  message       String
+  status        String   @default("PENDING") @map("status") // PENDING, RESOLVED, CLOSED
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("complaints")
+}
+
+
 model Wallet {
   id              String        @id @default(dbgenerated("gen_random_uuid()"))
   userId          String        @unique @map("user_id")

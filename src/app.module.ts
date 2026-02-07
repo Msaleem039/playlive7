@@ -17,6 +17,8 @@ import { ResultsModule } from './results/results.module';
 import { SettlementModule } from './settlement/settlement.module';
 import { SiteVideoModule } from './site-video/site-video.module';
 import { PositionModule } from './positions/position.module';
+import { ComplaintModule } from './complaint/complaint.module';
+import { NewsModule } from './news/news.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { RedisModule } from './common/redis/redis.module';
 import { BackgroundProcessorModule } from './common/background/background-processor.module';
@@ -42,6 +44,8 @@ import { BackgroundProcessorModule } from './common/background/background-proces
     SettlementModule,
     SiteVideoModule,
     PositionModule,
+    ComplaintModule,
+    NewsModule,
   ],
   controllers: [AppController, BetfairController],
   providers: [AppService, BettingGateway],

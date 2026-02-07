@@ -2529,7 +2529,7 @@ export class SettlementService {
     const matchOddsBets: any[] = [];
     const fancyBets: any[] = [];
     const bookmakerBets: any[] = [];
-
+    
     for (const bet of bets) {
       const gtype = (bet.gtype || '').toLowerCase();
       if (gtype === 'matchodds' || gtype === 'match') {
@@ -2590,10 +2590,10 @@ export class SettlementService {
       },
     });
 
-    this.logger.debug(
+      this.logger.debug(
       `Liability recalculation for user ${userId}: ${currentLiability} → ${totalLiability} (diff: ${diff > 0 ? '+' : ''}${diff})`,
-    );
-  }
+      );
+    }
 
 
   async rollbackSettlement(settlementId: string, adminId: string, betIds?: string[]) {
@@ -2708,7 +2708,7 @@ export class SettlementService {
                 updatedAt: new Date(),
               },
             });
-
+          
             // ✅ STEP 3: Reverse wallet balance changes
             if (balanceReversal !== 0) {
               await tx.wallet.update({
@@ -3200,18 +3200,18 @@ export class SettlementService {
               });
 
               // Create refund transaction record
-              await tx.transaction.create({
-                data: {
-                  walletId: wallet.id,
-                  amount: totalUserRefund,
-                  type: TransactionType.REFUND,
+                await tx.transaction.create({
+                  data: {
+                    walletId: wallet.id,
+                    amount: totalUserRefund,
+                    type: TransactionType.REFUND,
                   description:
                     `Bulk bet cancellation by admin. ` +
-                    `Cancelled ${userBets.length} bet(s). ` +
-                    `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
-                },
-              });
-            }
+                      `Cancelled ${userBets.length} bet(s). ` +
+                      `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
+                  },
+                });
+              }
 
             // ✅ RECALCULATE LIABILITY: After cancelling bets, recalculate liability properly
             // This ensures Match Odds offset cancellation works correctly
@@ -5972,10 +5972,10 @@ export class SettlementService {
   async getPendingBetsByMarketType(marketType: 'fancy' | 'match-odds' | 'bookmaker' | 'tied-match') {
     // Build where clause based on market type
     const whereClause: any = {
-      status: BetStatus.PENDING,
-      eventId: {
-        not: null,
-      },
+        status: BetStatus.PENDING,
+        eventId: {
+          not: null,
+        },
     };
 
     if (marketType === 'fancy') {
