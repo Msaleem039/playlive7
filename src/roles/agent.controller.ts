@@ -13,6 +13,7 @@ import {
 import { IsString, IsOptional, IsNumber, Min, Max, MinLength, MaxLength } from 'class-validator';
 import { TransferService } from '../transfer/transfer.service';
 import { UsersService } from '../users/users.service';
+import { AgentMatchBookService } from './agent-match-book.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -55,7 +56,8 @@ export class UpdateClientCommissionDto {
 export class AgentController {
   constructor(
     private readonly transferService: TransferService,
-    private readonly usersService: UsersService
+    private readonly usersService: UsersService,
+    private readonly agentMatchBookService: AgentMatchBookService,
   ) {}
 
   /**
@@ -216,5 +218,51 @@ export class AgentController {
         'Client performance summary'
       ]
     };
+  }
+
+  /**
+   * ✅ GET /agent/match-book
+   * 
+   * Get Agent Match Book - aggregated positions from all clients' pending bets.
+   * 
+   * Query Parameters:
+   * - event (optional): Filter by event ID (e.g., ?event=5331)
+   * - eventId (optional): Filter by event ID (alternative to 'event')
+   * - marketId (optional): Filter by market ID
+   * - marketType (optional): Filter by market type ('match-odds' | 'fancy')
+   * 
+   * Returns:
+   * - Agent aggregated position (inverse of client positions)
+   * - Per-client positions (Match Odds and Fancy)
+   * - Total exposure calculations
+   * - Grouped by match/eventId
+   * 
+   * 🚨 CRITICAL:
+   * - Only uses PENDING bets
+   * - No wallet mutations (preview only)
+   * - Reuses existing position calculation logic
+   * 
+   * Examples:
+   * - GET /agent/match-book (all matches)
+   * - GET /agent/match-book?event=5331 (specific match)
+   * - GET /agent/match-book?event=5331&marketType=fancy (specific match, fancy only)
+   */
+  @Get('match-book')
+  async getMatchBook(
+    @CurrentUser() currentUser: User,
+    @Query('event') event?: string,
+    @Query('eventId') eventId?: string,
+    @Query('marketId') marketId?: string,
+    @Query('marketType') marketType?: string,
+  ) {
+    // Support both 'event' and 'eventId' parameters (event takes precedence)
+    const finalEventId = event || eventId;
+    
+    return this.agentMatchBookService.getAgentMatchBook(
+      currentUser.id,
+      finalEventId,
+      marketId,
+      marketType,
+    );
   }
 }

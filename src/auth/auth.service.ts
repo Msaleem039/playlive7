@@ -2,11 +2,12 @@ import { Injectable, ConflictException, UnauthorizedException, ForbiddenExceptio
 import { JwtService } from '@nestjs/jwt';
 import { UsersService } from '../users/users.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AccountStatementService, AccountStatementFilters } from '../roles/account-statement.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
-import { UserRole, BetStatus, type User } from '@prisma/client';
+import { UserRole, BetStatus, TransferLogType, type User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 @Injectable()
@@ -15,6 +16,7 @@ export class AuthService {
     private usersService: UsersService,
     private jwtService: JwtService,
     private prisma: PrismaService,
+    private accountStatementService: AccountStatementService,
   ) {}
 
   async login(loginDto: LoginDto): Promise<AuthResponseDto> {
@@ -379,6 +381,7 @@ export class AuthService {
    * - Default: Returns direct subordinates of current user
    * - With parentId: Returns children of specified parent (with access validation)
    * - With parentId + type=bets: Returns bet history for CLIENT
+   * - With type=statement: Returns subordinates with account statement details
    * 
    * BETFAIR STANDARD: Uses userPnl as single source of truth for P/L
    * 
@@ -395,6 +398,7 @@ export class AuthService {
     currentUser: User,
     parentId?: string,
     type?: string,
+    statementFilters?: AccountStatementFilters,
   ) {
     // 🔐 ACCESS VALIDATION: CLIENT role cannot access this endpoint
     if (currentUser.role === UserRole.CLIENT) {
@@ -454,6 +458,51 @@ export class AuthService {
       {} as Record<string, number>,
     );
 
+    // If type=statement and showCashEntry=true, fetch transfer transactions
+    const includeTransactions = type === 'statement' && statementFilters?.showCashEntry !== false;
+
+    // Fetch transfer logs for all users in parallel if needed
+    const transferLogsMap = new Map<string, any[]>();
+    if (includeTransactions) {
+      const transferLogsPromises = users.map(async (user) => {
+        try {
+          // Get transfer logs between user and their parent (or current user as parent)
+          const parentIdForTransfers = user.parentId || targetParentId;
+          
+          const logs = await this.prisma.transferLog.findMany({
+            where: {
+              OR: [
+                { fromUserId: parentIdForTransfers, toUserId: user.id, type: TransferLogType.TOPUP },
+                { fromUserId: user.id, toUserId: parentIdForTransfers, type: TransferLogType.TOPDOWN },
+              ],
+              ...(statementFilters?.fromDate || statementFilters?.toDate
+                ? {
+                    createdAt: {
+                      ...(statementFilters.fromDate ? { gte: statementFilters.fromDate } : {}),
+                      ...(statementFilters.toDate ? { lte: statementFilters.toDate } : {}),
+                    },
+                  }
+                : {}),
+            },
+            orderBy: { createdAt: 'desc' },
+            take: statementFilters?.limit || 1000,
+            skip: statementFilters?.offset || 0,
+          });
+
+          return { userId: user.id, logs };
+        } catch (error) {
+          console.error(`Failed to get transfer logs for user ${user.id}:`, error);
+          return { userId: user.id, logs: [] };
+        }
+      });
+
+      const transferLogsResults = await Promise.all(transferLogsPromises);
+      for (const result of transferLogsResults) {
+        transferLogsMap.set(result.userId, result.logs);
+      }
+    }
+
+    // Return basic subordinate information with optional transactions
     return users.map((user) => {
       const balance = user.wallet?.balance ?? 0;
       const liability = user.wallet?.liability ?? 0;
@@ -462,7 +511,7 @@ export class AuthService {
       // Balance already includes settled P/L from settlement.applyOutcome()
       const profitLoss = pnlMap[user.id] ?? 0;
 
-      return {
+      const baseResponse: any = {
         id: user.id,
         name: user.name,
         username: user.username,
@@ -483,6 +532,32 @@ export class AuthService {
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
       };
+
+      // Add transactions if requested
+      if (includeTransactions) {
+        const transferLogs = transferLogsMap.get(user.id) || [];
+        const transactions = transferLogs.map((log) => {
+          const isCashIn = log.type === TransferLogType.TOPUP && log.toUserId === user.id;
+          const isCashOut = log.type === TransferLogType.TOPDOWN && log.fromUserId === user.id;
+
+          return {
+            id: log.id,
+            date: log.createdAt,
+            type: isCashIn ? 'CashIn' : 'CashOut',
+            description: isCashIn 
+              ? `CashIn To ${log.remarks || ''}`.trim() || 'CashIn To'
+              : `CashOut From ${log.remarks || ''}`.trim() || 'CashOut From',
+            result: null,
+            credit: isCashIn ? log.amount : 0,
+            debit: isCashOut ? log.amount : 0,
+            balance: 0, // Will be calculated if needed
+          };
+        });
+
+        baseResponse.transactions = transactions;
+      }
+
+      return baseResponse;
     });
   }
 

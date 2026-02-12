@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { TransferService } from '../transfer/transfer.service';
 import { UsersService } from '../users/users.service';
+import { AccountStatementService } from './account-statement.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -23,7 +24,8 @@ import type { User } from '@prisma/client';
 export class ClientController {
   constructor(
     private readonly transferService: TransferService,
-    private readonly usersService: UsersService
+    private readonly usersService: UsersService,
+    private readonly accountStatementService: AccountStatementService,
   ) {}
 
   /**
@@ -181,6 +183,67 @@ export class ClientController {
       type: transferType,
       limit: limitValue,
       offset: offsetValue,
+    });
+  }
+
+  /**
+   * ✅ GET /client/account-statement-detailed
+   * 
+   * Comprehensive account statement with all filters matching the screenshot.
+   * 
+   * Query Parameters:
+   * - showCashEntry (optional, default: true): Show CashIn/CashOut transactions
+   * - showMarketPnl (optional, default: true): Show Market Profit & Loss from settlements
+   * - showMarketCommission (optional, default: false): Show Market Commission
+   * - showSessionPnl (optional, default: false): Show Session Profit & Loss
+   * - showTossPnl (optional, default: false): Show Toss Profit & Loss
+   * - fromDate (optional): Filter from date (ISO string)
+   * - toDate (optional): Filter to date (ISO string)
+   * - limit (optional, default: 1000): Maximum number of entries
+   * - offset (optional, default: 0): Pagination offset
+   * 
+   * Response includes:
+   * - Date, Type, Description, Result, CR (Credit), DR (Debit), Balance, hasBets flag
+   * - Running balance calculated from newest to oldest
+   * - Opening and closing balances
+   * 
+   * Example:
+   * GET /client/account-statement-detailed?showCashEntry=true&showMarketPnl=true&fromDate=2024-01-01T00:00:00.000Z
+   */
+  @Get('account-statement-detailed')
+  async getDetailedAccountStatement(
+    @CurrentUser() currentUser: User,
+    @Query('showCashEntry') showCashEntry?: string,
+    @Query('showMarketPnl') showMarketPnl?: string,
+    @Query('showMarketCommission') showMarketCommission?: string,
+    @Query('showSessionPnl') showSessionPnl?: string,
+    @Query('showTossPnl') showTossPnl?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
+    @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
+    @Query('offset', new ParseIntPipe({ optional: true })) offset?: number,
+  ) {
+    // Parse boolean filters
+    const showCashEntryBool = showCashEntry !== 'false';
+    const showMarketPnlBool = showMarketPnl !== 'false';
+    const showMarketCommissionBool = showMarketCommission === 'true';
+    const showSessionPnlBool = showSessionPnl === 'true';
+    const showTossPnlBool = showTossPnl === 'true';
+
+    // Parse dates
+    const fromDateObj = fromDate ? new Date(fromDate) : undefined;
+    const toDateObj = toDate ? new Date(toDate) : undefined;
+
+    return this.accountStatementService.getAccountStatement(currentUser.id, {
+      showCashEntry: showCashEntryBool,
+      showMarketPnl: showMarketPnlBool,
+      showMarketCommission: showMarketCommissionBool,
+      showSessionPnl: showSessionPnlBool,
+      showTossPnl: showTossPnlBool,
+      fromDate: fromDateObj,
+      toDate: toDateObj,
+      limit: limit || 1000,
+      offset: offset || 0,
     });
   }
 }

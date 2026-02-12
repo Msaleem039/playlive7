@@ -7,6 +7,7 @@ import { AuthController } from './auth.controller';
 import { UsersModule } from '../users/users.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { JwtStrategy } from './jwt.strategy';
+import { AccountStatementService } from '../roles/account-statement.service';
 
 @Module({
   imports: [
@@ -45,7 +46,7 @@ import { JwtStrategy } from './jwt.strategy';
       inject: [ConfigService],
     }),
   ],
-  providers: [AuthService, JwtStrategy],
+  providers: [AuthService, JwtStrategy, AccountStatementService],
   controllers: [AuthController],
   exports: [JwtModule, PassportModule],
 })

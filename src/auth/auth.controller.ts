@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Patch, BadRequestException, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Body, HttpCode, HttpStatus, ValidationPipe, UseGuards, Patch, BadRequestException, Param, Query, ParseIntPipe } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -150,14 +150,64 @@ export class AuthController {
     };
   }
   
+  /**
+   * ✅ GET /auth/subordinates
+   * 
+   * Get subordinates with optional account statement details.
+   * 
+   * Query Parameters:
+   * - parentId (optional): Get children of specific parent (default: current user)
+   * - type (optional): 
+   *   - "bets": Return bet history for a specific client (requires parentId)
+   *   - "statement": Return account statement for subordinates
+   * - showCashEntry (optional, default: true): Show CashIn/CashOut in statement
+   * - showMarketPnl (optional, default: true): Show Market Profit & Loss in statement
+   * - showMarketCommission (optional, default: false): Show Market Commission in statement
+   * - showSessionPnl (optional, default: false): Show Session Profit & Loss in statement
+   * - showTossPnl (optional, default: false): Show Toss Profit & Loss in statement
+   * - fromDate (optional): Filter statement from date (ISO string)
+   * - toDate (optional): Filter statement to date (ISO string)
+   * - limit (optional, default: 1000): Maximum statement entries per user
+   * - offset (optional, default: 0): Pagination offset for statement
+   * 
+   * Examples:
+   * - GET /auth/subordinates (returns list of subordinates)
+   * - GET /auth/subordinates?type=statement (returns subordinates with account statements)
+   * - GET /auth/subordinates?type=statement&showCashEntry=true&showMarketPnl=true
+   * - GET /auth/subordinates?parentId=xxx&type=bets (returns bet history for specific client)
+   */
   @Get('subordinates')
   @UseGuards(JwtAuthGuard)
   async getSubordinates(
     @CurrentUser() currentUser: User,
     @Query('parentId') parentId?: string,
     @Query('type') type?: string,
+    @Query('showCashEntry') showCashEntry?: string,
+    @Query('showMarketPnl') showMarketPnl?: string,
+    @Query('showMarketCommission') showMarketCommission?: string,
+    @Query('showSessionPnl') showSessionPnl?: string,
+    @Query('showTossPnl') showTossPnl?: string,
+    @Query('fromDate') fromDate?: string,
+    @Query('toDate') toDate?: string,
+    @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
+    @Query('offset', new ParseIntPipe({ optional: true })) offset?: number,
   ) {
-    return this.authService.getSubordinates(currentUser, parentId, type);
+    return this.authService.getSubordinates(
+      currentUser,
+      parentId,
+      type,
+      {
+        showCashEntry: showCashEntry !== 'false',
+        showMarketPnl: showMarketPnl !== 'false',
+        showMarketCommission: showMarketCommission === 'true',
+        showSessionPnl: showSessionPnl === 'true',
+        showTossPnl: showTossPnl === 'true',
+        fromDate: fromDate ? new Date(fromDate) : undefined,
+        toDate: toDate ? new Date(toDate) : undefined,
+        limit: limit || 1000,
+        offset: offset || 0,
+      },
+    );
   }
 
   /**

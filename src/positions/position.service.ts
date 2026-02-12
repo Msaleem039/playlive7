@@ -256,34 +256,36 @@ export function calculateFancyPosition(bets: BetForPosition[] | Bet[]): FancyPos
 
   for (const [fancyId, fancyBetsGroup] of betsByFancyId.entries()) {
     // ✅ Exchange Standard: Calculate net P/L for YES and NO outcomes
-    let sumYesStakes = 0; // Sum of all YES/BACK bet stakes
-    let sumNoStakes = 0;  // Sum of all NO/LAY bet stakes
+    // For BACK bets: use stake (win = stake, lose = -stake)
+    // For LAY bets: use winAmount/lossAmount (win = winAmount, lose = -lossAmount)
+    let yesPosition = 0; // Net P/L if YES wins
+    let noPosition = 0;  // Net P/L if NO wins
 
     for (const bet of fancyBetsGroup) {
       const betType = bet.betType?.toUpperCase() || '';
       const stake = bet.betValue ?? bet.amount ?? 0;
+      const winAmount = bet.winAmount ?? 0;
+      const lossAmount = bet.lossAmount ?? 0;
 
       if (stake <= 0) continue;
 
       if (betType === 'BACK' || betType === 'YES') {
-        sumYesStakes += stake;
+        // BACK bet: If YES wins, profit = stake; If NO wins, loss = -stake
+        yesPosition += stake;
+        noPosition -= stake;
       } else if (betType === 'LAY' || betType === 'NO') {
-        sumNoStakes += stake;
+        // LAY bet: If YES wins (bet loses), loss = -lossAmount; If NO wins (bet wins), profit = winAmount
+        // Use winAmount/lossAmount if available, otherwise fallback to stake
+        if (winAmount > 0 || lossAmount > 0) {
+          yesPosition -= lossAmount || stake; // If YES wins, LAY bet loses
+          noPosition += winAmount || stake;   // If NO wins, LAY bet wins
+        } else {
+          // Fallback to stake if winAmount/lossAmount not available
+          yesPosition -= stake;
+          noPosition += stake;
+        }
       }
     }
-
-    // ✅ Exchange Standard Calculation:
-    // YES position = Net P/L if YES wins
-    //   = sum(YES stakes) - sum(NO stakes)
-    //   (YES bets profit +stake each, NO bets lose -stake each)
-    // 
-    // NO position = Net P/L if NO wins
-    //   = sum(NO stakes) - sum(YES stakes)
-    //   (NO bets profit +stake each, YES bets lose -stake each)
-    // 
-    // Values can be NEGATIVE (hedged scenarios are valid)
-    const yesPosition = sumYesStakes - sumNoStakes;
-    const noPosition = sumNoStakes - sumYesStakes;
     
     fancyPositions.push({
       fancyId,
