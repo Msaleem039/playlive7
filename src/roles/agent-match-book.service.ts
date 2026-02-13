@@ -59,6 +59,7 @@ export interface MatchData {
   agentTotalIfLose: number;
   agentTotalFancyPosition: number;
   agentTotalMatchOddsPosition: number;
+  runners: Record<string, { net: number; name?: string }>; // Runner positions for UI
   clients: ClientPosition[];
 }
 
@@ -71,6 +72,7 @@ export interface AgentMatchBookResult {
   totalBets: number;
   totalClients: number;
   totalMatches: number;
+  runners: Record<string, { net: number; name?: string }>; // Aggregated runner positions across all matches
   matches: MatchData[];
 }
 
@@ -125,6 +127,7 @@ export class AgentMatchBookService {
         totalBets: 0,
         totalClients: 0,
         totalMatches: 0,
+        runners: {},
         matches: [],
       };
     }
@@ -298,12 +301,34 @@ export class AgentMatchBookService {
       }
     }
 
-    // 5️⃣ Process each match/eventId separately
+    // 5️⃣ Create runner name map (selectionId -> name) from market details
+    const runnerNameMap = new Map<string, string>();
+    for (const [eventId, matchDetails] of matchDetailsMap.entries()) {
+      if (matchDetails?.markets) {
+        for (const market of matchDetails.markets) {
+          if (market.runners && Array.isArray(market.runners)) {
+            for (const runner of market.runners) {
+              if (runner.selectionId !== null && runner.selectionId !== undefined) {
+                const selectionId = String(runner.selectionId);
+                const runnerName = runner.runnerName || runner.name || '';
+                // Only store if not already set or if this name is more descriptive
+                if (!runnerNameMap.has(selectionId) || runnerNameMap.get(selectionId) === '') {
+                  runnerNameMap.set(selectionId, runnerName);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 6️⃣ Process each match/eventId separately
     const matchesData: MatchData[] = [];
     let totalAgentIfWin = 0;
     let totalAgentIfLose = 0;
     let totalAgentFancyPosition = 0;
     let totalAgentMatchOddsPosition = 0;
+    const allRunners: Record<string, { net: number; name?: string }> = {}; // Aggregate all runners across matches
 
     for (const [eventIdKey, eventBets] of betsByEventId.entries()) {
       if (eventBets.length === 0) continue;
@@ -412,8 +437,8 @@ export class AgentMatchBookService {
       const fancyPositions = calculateFancyPosition(clientBetsForPosition);
 
       // Calculate totalIfWin and totalIfLose
-      // For Match Odds: sum of all positive net values (if any runner wins)
-      // For Fancy: sum of YES positions (if YES wins)
+      // ONLY Match Odds: sum of all positive net values (if any runner wins)
+      // Fancy positions are NOT included in totals
       let totalIfWin = 0;
       let totalIfLose = 0;
 
@@ -426,27 +451,8 @@ export class AgentMatchBookService {
         totalIfLose += maxLose;
       }
 
-      // For Fancy: Calculate best case (max win) and worst case (max loss)
-      // YES position = net P/L if YES wins (can be positive or negative)
-      // NO position = net P/L if NO wins (can be positive or negative)
-      // We want the best possible outcome (max of YES and NO) and worst possible outcome
-      for (const fancyPos of fancyPositions) {
-        const yesPos = fancyPos.positions.YES;
-        const noPos = fancyPos.positions.NO;
-        
-        // Best case: maximum of YES and NO positions
-        const bestCase = Math.max(yesPos, noPos);
-        // Worst case: minimum of YES and NO positions (most negative)
-        const worstCase = Math.min(yesPos, noPos);
-        
-        // Add to totals (best case = ifWin, worst case = ifLose)
-        if (bestCase > 0) {
-          totalIfWin += bestCase;
-        }
-        if (worstCase < 0) {
-          totalIfLose += Math.abs(worstCase);
-        }
-      }
+      // Fancy positions are NOT included in totalIfWin/totalIfLose
+      // They are only shown in per-client details
 
       clientPositions.push({
         clientId: client.id,
@@ -479,12 +485,33 @@ export class AgentMatchBookService {
         }
       }
 
+      // Add runner names to agentMatchOddsRunners
+      const agentMatchOddsRunnersWithNames: Record<string, { net: number; name?: string }> = {};
+      for (const [selectionId, runner] of Object.entries(agentMatchOddsRunners)) {
+        agentMatchOddsRunnersWithNames[selectionId] = {
+          net: runner.net,
+          name: runnerNameMap.get(selectionId) || undefined,
+        };
+        // Also aggregate into allRunners for top-level response
+        if (!allRunners[selectionId]) {
+          allRunners[selectionId] = { net: 0, name: runnerNameMap.get(selectionId) || undefined };
+        }
+        allRunners[selectionId].net += runner.net;
+      }
+
       if (Object.keys(agentMatchOddsRunners).length > 0) {
         const netValues = Object.values(agentMatchOddsRunners).map((r) => r.net);
         matchAgentMatchOddsPosition = netValues.reduce((sum, net) => sum + Math.abs(net), 0) / 2; // Average exposure
+        
+        // Calculate totalIfWin and totalIfLose from aggregated runner positions
+        // According to position.service.ts: find best case (max positive) and worst case (max negative)
+        const maxWin = Math.max(...netValues, 0);
+        const maxLose = Math.abs(Math.min(...netValues, 0));
+        matchAgentIfWin = maxWin;
+        matchAgentIfLose = maxLose;
       }
 
-      // Aggregate Fancy positions (inverse)
+      // Aggregate Fancy positions (inverse) - not used in totals
       const agentFancyPositions = new Map<string, { YES: number; NO: number }>();
       for (const clientPos of clientPositions) {
         for (const fancyPos of clientPos.fancyPosition) {
@@ -501,12 +528,6 @@ export class AgentMatchBookService {
         matchAgentFancyPosition += Math.max(Math.abs(fancyPos.YES), Math.abs(fancyPos.NO));
       }
 
-      // Agent totals are inverse of client totals for this match
-      for (const clientPos of clientPositions) {
-        matchAgentIfWin -= clientPos.totalIfWin;
-        matchAgentIfLose -= clientPos.totalIfLose;
-      }
-
       // Get match details
       const matchDetails = eventIdKey !== 'unknown' ? matchDetailsMap.get(eventIdKey) : null;
       const totalAmount = eventBets.reduce((sum, bet) => sum + (bet.betValue || bet.amount || 0), 0);
@@ -521,15 +542,16 @@ export class AgentMatchBookService {
         totalAmount,
         agentTotalIfWin: matchAgentIfWin,
         agentTotalIfLose: matchAgentIfLose,
-        agentTotalFancyPosition: matchAgentFancyPosition,
+        agentTotalFancyPosition: 0, // Not aggregated - only Match Odds in totals
         agentTotalMatchOddsPosition: matchAgentMatchOddsPosition,
+        runners: agentMatchOddsRunnersWithNames, // Runner positions for this match
         clients: clientPositions,
       });
 
-      // Accumulate totals
+      // Accumulate totals (only Match Odds)
       totalAgentIfWin += matchAgentIfWin;
       totalAgentIfLose += matchAgentIfLose;
-      totalAgentFancyPosition += matchAgentFancyPosition;
+      // totalFancyPosition is set to 0 (not aggregated)
       totalAgentMatchOddsPosition += matchAgentMatchOddsPosition;
     }
 
@@ -537,11 +559,12 @@ export class AgentMatchBookService {
       agentId,
       totalIfWin: totalAgentIfWin,
       totalIfLose: totalAgentIfLose,
-      totalFancyPosition: totalAgentFancyPosition,
+      totalFancyPosition: 0, // Not aggregated - only Match Odds in totals
       totalMatchOddsPosition: totalAgentMatchOddsPosition,
       totalBets: allBets.length,
       totalClients: clients.length,
       totalMatches: matchesData.length,
+      runners: allRunners, // Aggregated runner positions across all matches
       matches: matchesData,
     };
   }
