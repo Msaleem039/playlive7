@@ -3,10 +3,12 @@ import { JwtService } from '@nestjs/jwt';
 import { UsersService } from '../users/users.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountStatementService, AccountStatementFilters } from '../roles/account-statement.service';
+import { SettlementService } from '../settlement/settlement.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { UpdateClientDto } from './dto/update-client.dto';
 import { UserRole, BetStatus, TransferLogType, type User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
@@ -17,6 +19,7 @@ export class AuthService {
     private jwtService: JwtService,
     private prisma: PrismaService,
     private accountStatementService: AccountStatementService,
+    private settlementService: SettlementService,
   ) {}
 
   async login(loginDto: LoginDto): Promise<AuthResponseDto> {
@@ -502,7 +505,35 @@ export class AuthService {
       }
     }
 
-    // Return basic subordinate information with optional transactions
+    // If type=statement, fetch bet history for each client with pagination
+    const betHistoryMap = new Map<string, any>();
+    if (type === 'statement' && statementFilters) {
+      const betHistoryPromises = users
+        .filter(user => user.role === UserRole.CLIENT)
+        .map(async (user) => {
+          try {
+            const betHistory = await this.settlementService.getUserBetHistory({
+              userId: user.id,
+              status: statementFilters.betStatus,
+              limit: statementFilters.betLimit || 20,
+              offset: statementFilters.betOffset || 0,
+              startDate: statementFilters.betStartDate,
+              endDate: statementFilters.betEndDate,
+            });
+            return { userId: user.id, betHistory };
+          } catch (error) {
+            console.error(`Failed to get bet history for user ${user.id}:`, error);
+            return { userId: user.id, betHistory: { success: true, data: [], count: 0, total: 0, limit: statementFilters.betLimit || 20, offset: statementFilters.betOffset || 0, hasMore: false } };
+          }
+        });
+
+      const betHistoryResults = await Promise.all(betHistoryPromises);
+      for (const result of betHistoryResults) {
+        betHistoryMap.set(result.userId, result.betHistory);
+      }
+    }
+
+    // Return basic subordinate information with optional transactions and bet history
     return users.map((user) => {
       const balance = user.wallet?.balance ?? 0;
       const liability = user.wallet?.liability ?? 0;
@@ -555,6 +586,14 @@ export class AuthService {
         });
 
         baseResponse.transactions = transactions;
+      }
+
+      // Add bet history if type=statement
+      if (type === 'statement') {
+        const betHistory = betHistoryMap.get(user.id);
+        if (betHistory) {
+          baseResponse.betHistory = betHistory;
+        }
       }
 
       return baseResponse;
@@ -769,6 +808,83 @@ export class AuthService {
 
     return {
       message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
+      user: updatedUser,
+    };
+  }
+
+  /**
+   * Update client details (Agent only)
+   * Allows agents to update their client's name, password, commission, and maxWinLimit
+   * Username cannot be changed
+   */
+  async updateClient(currentUser: User, clientId: string, updateClientDto: UpdateClientDto) {
+    // Get target client
+    const targetClient = await this.prisma.user.findUnique({
+      where: { id: clientId },
+    });
+
+    if (!targetClient) {
+      throw new BadRequestException('Client not found');
+    }
+
+    // Validate that target is a CLIENT
+    if (targetClient.role !== UserRole.CLIENT) {
+      throw new BadRequestException('Can only update CLIENT users');
+    }
+
+    // Validate that current user is the parent of target client (agent can only edit their own clients)
+    if (currentUser.role === UserRole.AGENT && targetClient.parentId !== currentUser.id) {
+      throw new ForbiddenException('You can only update your own clients');
+    }
+
+    // For ADMIN and SUPER_ADMIN, validate hierarchy access
+    if (currentUser.role !== UserRole.AGENT) {
+      const isInHierarchy = await this.isUserInHierarchy(currentUser.id, clientId);
+      if (!isInHierarchy) {
+        throw new ForbiddenException('You do not have access to update this client');
+      }
+    }
+
+    // Build update data (only include fields that are provided)
+    const updateData: any = {};
+
+    if (updateClientDto.name !== undefined) {
+      updateData.name = updateClientDto.name;
+    }
+
+    if (updateClientDto.password !== undefined) {
+      // Hash the new password
+      const saltRounds = 10;
+      updateData.password = await bcrypt.hash(updateClientDto.password, saltRounds);
+    }
+
+    if (updateClientDto.commissionPercentage !== undefined) {
+      updateData.commissionPercentage = updateClientDto.commissionPercentage;
+    }
+
+    // Note: maxWinLimit is not in the User model, so we'll skip it for now
+    // If it needs to be added, it would require a database migration
+
+    // Update user
+    const updatedUser = await this.prisma.user.update({
+      where: { id: clientId },
+      data: updateData,
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        role: true,
+        commissionPercentage: true,
+        isActive: true,
+        parentId: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    return {
+      success: true,
+      message: 'Client updated successfully',
       user: updatedUser,
     };
   }

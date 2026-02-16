@@ -3,6 +3,7 @@ import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
+import { UpdateClientDto } from './dto/update-client.dto';
 import { AuthResponseDto } from './dto/auth-response.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from '../common/guards/optional-jwt-auth.guard';
@@ -191,6 +192,11 @@ export class AuthController {
     @Query('toDate') toDate?: string,
     @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
     @Query('offset', new ParseIntPipe({ optional: true })) offset?: number,
+    @Query('betLimit', new ParseIntPipe({ optional: true })) betLimit?: number,
+    @Query('betOffset', new ParseIntPipe({ optional: true })) betOffset?: number,
+    @Query('betStatus') betStatus?: string,
+    @Query('betStartDate') betStartDate?: string,
+    @Query('betEndDate') betEndDate?: string,
   ) {
     return this.authService.getSubordinates(
       currentUser,
@@ -206,6 +212,11 @@ export class AuthController {
         toDate: toDate ? new Date(toDate) : undefined,
         limit: limit || 1000,
         offset: offset || 0,
+        betLimit: betLimit || 20,
+        betOffset: betOffset || 0,
+        betStatus: betStatus,
+        betStartDate: betStartDate ? new Date(betStartDate) : undefined,
+        betEndDate: betEndDate ? new Date(betEndDate) : undefined,
       },
     );
   }
@@ -225,6 +236,25 @@ export class AuthController {
     @CurrentUser() currentUser: User,
   ) {
     return this.authService.toggleUserStatus(currentUser, targetUserId, body.isActive);
+  }
+
+  /**
+   * Update client details (Agent only)
+   * Allows agents to update their client's name, password, commission, and maxWinLimit
+   * Username cannot be changed
+   * 
+   * @example PATCH /auth/subordinates/:clientId
+   * Body: { "name": "New Name", "password": "newpassword123", "commissionPercentage": 5, "maxWinLimit": 100000 }
+   */
+  @Patch('subordinates/:clientId')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.AGENT, UserRole.ADMIN, UserRole.SUPER_ADMIN)
+  async updateClient(
+    @Param('clientId') clientId: string,
+    @Body(ValidationPipe) updateClientDto: UpdateClientDto,
+    @CurrentUser() currentUser: User,
+  ) {
+    return this.authService.updateClient(currentUser, clientId, updateClientDto);
   }
 }
 

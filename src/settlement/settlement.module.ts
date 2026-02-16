@@ -26,6 +26,6 @@ import { BookmakerExposureService } from '../bets/bookmaker-exposure.service';
     BookmakerExposureService,
   ],
   controllers: [SettlementController, SettlementAdminController],
-  exports: [PnlService, HierarchyPnlService],
+  exports: [PnlService, HierarchyPnlService, SettlementService],
 })
 export class SettlementModule {}

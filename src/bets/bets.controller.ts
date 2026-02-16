@@ -7,9 +7,11 @@ import {
   HttpException,
   HttpStatus,
   Logger,
+  UseGuards,
 } from '@nestjs/common';
 import { PlaceBetDto } from './bets.dto';
 import { BetsService } from './bets.service';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 
 @Controller('bf_placeBet_api')
 export class BetsController {
@@ -18,6 +20,7 @@ export class BetsController {
   constructor(private readonly betsService: BetsService) {}
 
   @Post()
+  @UseGuards(JwtAuthGuard)
   async placeBet(@Body() dto: PlaceBetDto) {
     try {
       return await this.betsService.placeBet(dto);

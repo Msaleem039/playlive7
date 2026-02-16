@@ -97,6 +97,237 @@ export class SettlementService {
    * @param actualRuns - Actual runs scored
    * @returns Map of betId -> isWin (true if bet wins, false if loses)
    */
+  // private evaluateFancySingle(
+  //   bets: Array<{
+  //     id: string;
+  //     betType: string | null;
+  //     betRate: number | null;
+  //     odds: number | null;
+  //   }>,
+  //   actualRuns: number,
+  // ): Map<string, boolean> {
+  //   const result = new Map<string, boolean>();
+  
+  //   for (const bet of bets) {
+  //     const line = bet.betRate ?? bet.odds ?? 0;
+  //     const type = bet.betType?.toUpperCase();
+  //     const isYes = type === 'YES' || type === 'BACK';
+  //     const isNo = type === 'NO' || type === 'LAY';
+  
+  //     const isWin =
+  //       (isYes && actualRuns >= line) ||
+  //       (isNo && actualRuns < line);
+  
+  //     result.set(bet.id, isWin);
+  //   }
+  
+  //   return result;
+  // }
+  
+  
+  // async settleFancyManual(
+  //   eventId: string,
+  //   selectionId: string,
+  //   decisionRun: number | null,
+  //   isCancel: boolean,
+  //   marketId: string | null,
+  //   adminId: string,
+  //   betIds?: string[],
+  // ) {
+  //   const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
+  
+  //   // 1️⃣ Fetch pending bets (new + legacy format)
+  //   let bets = await this.prisma.bet.findMany({
+  //     where: {
+  //       settlementId,
+  //       status: BetStatus.PENDING,
+  //       eventId,
+  //       selectionId: Number(selectionId),
+  //       ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //     },
+  //   });
+  
+  //   if (bets.length === 0) {
+  //     bets = await this.prisma.bet.findMany({
+  //       where: {
+  //         eventId,
+  //         selectionId: Number(selectionId),
+  //         status: BetStatus.PENDING,
+  //         ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //         OR: [
+  //           { gtype: { contains: 'fancy', mode: 'insensitive' } },
+  //           { marketType: { contains: 'fancy', mode: 'insensitive' } },
+  //         ],
+  //       },
+  //     });
+  
+  //     if (bets.length > 0) {
+  //       await this.prisma.bet.updateMany({
+  //         where: { id: { in: bets.map((b) => b.id) } },
+  //         data: { settlementId },
+  //       });
+  
+  //       bets = await this.prisma.bet.findMany({
+  //         where: { id: { in: bets.map((b) => b.id) } },
+  //       });
+  //     }
+  //   }
+  
+  //   if (bets.length === 0) {
+  //     return { success: true, message: 'No pending bets to settle' };
+  //   }
+  
+  //   // 2️⃣ Create / upsert settlement
+  //   await this.prisma.settlement.upsert({
+  //     where: { settlementId },
+  //     update: {
+  //       isRollback: false,
+  //       settledBy: adminId,
+  //       winnerId: isCancel ? null : (decisionRun?.toString() || null),
+  //     },
+  //     create: {
+  //       settlementId,
+  //       eventId,
+  //       marketType: MarketType.FANCY,
+  //       marketId: marketId || null,
+  //       winnerId: isCancel ? null : (decisionRun?.toString() || null),
+  //       settledBy: adminId,
+  //     },
+  //   });
+  
+  //   if (decisionRun === null && !isCancel) {
+  //     throw new BadRequestException('Either decisionRun or isCancel must be provided');
+  //   }
+  
+  //   const actualRuns = decisionRun ?? 0;
+  //   const affectedUserIds = new Set<string>();
+  
+  //   // 3️⃣ Transaction per user
+  //   await this.prisma.$transaction(async (tx) => {
+  //     const betsByUser = new Map<string, typeof bets>();
+  //     for (const bet of bets) {
+  //       if (!betsByUser.has(bet.userId)) betsByUser.set(bet.userId, []);
+  //       betsByUser.get(bet.userId)!.push(bet);
+  //     }
+  
+  //     for (const [userId, userBets] of betsByUser.entries()) {
+  //       const wallet = await tx.wallet.findUnique({ where: { userId } });
+  //       if (!wallet) continue;
+  
+  //       let balanceDelta = 0;
+  //       let liabilityDelta = 0;
+  
+  //       // 🔹 GOLA Detection from old file logic
+  //       let totalBack = 0;
+  //       let totalLay = 0;
+  //       let golaDetected = false;
+  
+  //       for (const bet of userBets) {
+  //         const type = bet.betType?.toUpperCase();
+  //         const stake = bet.amount ?? 0;
+  //         const lossAmount = bet.lossAmount ?? stake;
+  //         const lowerBound = (bet as any).lowerBound ?? 0;
+  //         const upperBound = (bet as any).upperBound ?? 0;
+  
+  //         if (type === 'BACK' || type === 'YES') totalBack += stake;
+  //         if (type === 'LAY' || type === 'NO') totalLay += lossAmount;
+  
+  //         if (actualRuns >= lowerBound && actualRuns <= upperBound) golaDetected = true;
+  //       }
+  
+  //       const isRangeStyleGroup = totalBack > 0 && totalLay > 0 && golaDetected && !isCancel;
+  
+  //       this.logger.log(
+  //         `[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: ` +
+  //         `totalBack=${totalBack}, totalLay=${totalLay}, golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, actualRuns=${actualRuns}, isCancel=${isCancel}`,
+  //       );
+  
+  //       const winMap = isCancel ? new Map<string, boolean>() : this.evaluateFancySingle(userBets, actualRuns);
+  //       const betAccountingChecks: Array<{ betId: string; isWin: boolean; liabilityReleased: number; balanceChange: number }> = [];
+  
+  //       if (isCancel) {
+  //         // CANCEL: Refund all bets
+  //         for (const bet of userBets) {
+  //           const type = bet.betType?.toUpperCase();
+  //           const stake = bet.amount ?? 0;
+  //           const lossAmount = bet.lossAmount ?? stake;
+  //           const liabilityAmount = type === 'LAY' || type === 'NO' ? lossAmount : stake;
+  
+  //           liabilityDelta -= liabilityAmount;
+  //           balanceDelta += liabilityAmount;
+  
+  //           await tx.bet.update({
+  //             where: { id: bet.id },
+  //             data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() },
+  //           });
+  //         }
+  //       } else if (isRangeStyleGroup) {
+  //         // GOLA branch (range-style settlement)
+  //         let netProfit = 0;
+  //         for (const bet of userBets) {
+  //           const isWin = winMap.get(bet.id) ?? false;
+  //           const winAmount = bet.winAmount ?? 0;
+  //           const lossAmount = bet.lossAmount ?? 0;
+  
+  //           netProfit += isWin ? winAmount : -lossAmount;
+  
+  //           await tx.bet.update({
+  //             where: { id: bet.id },
+  //             data: { status: isWin ? BetStatus.WON : BetStatus.LOST, pnl: isWin ? winAmount : -lossAmount, settledAt: new Date(), updatedAt: new Date() },
+  //           });
+  //         }
+  //         balanceDelta += Math.max(0, netProfit);
+  //         liabilityDelta = 0;
+  
+  //       } else {
+  //         // SINGLE fancy branch
+  //         for (const bet of userBets) {
+  //           const stake = bet.amount ?? 0;
+  //           const type = bet.betType?.toUpperCase();
+  //           const winAmount = bet.winAmount ?? 0;
+  //           const lossAmount = bet.lossAmount ?? stake;
+  //           const liabilityAmount = type === 'LAY' || type === 'NO' ? lossAmount : stake;
+  //           const isWin = winMap.get(bet.id) ?? false;
+  
+  //           liabilityDelta -= liabilityAmount;
+  
+  //           if (isWin) {
+  //             balanceDelta += liabilityAmount + winAmount;
+  //             betAccountingChecks.push({ betId: bet.id, isWin: true, liabilityReleased: liabilityAmount, balanceChange: liabilityAmount + winAmount });
+  //             await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.WON, pnl: winAmount, settledAt: new Date(), updatedAt: new Date() } });
+  //           } else {
+  //             betAccountingChecks.push({ betId: bet.id, isWin: false, liabilityReleased: liabilityAmount, balanceChange: 0 });
+  //             await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.LOST, pnl: -lossAmount, settledAt: new Date(), updatedAt: new Date() } });
+  //           }
+  //         }
+  //       }
+  
+  //       // Apply wallet update
+  //       if (balanceDelta !== 0 || liabilityDelta !== 0) {
+  //         await tx.wallet.update({ where: { userId }, data: { balance: wallet.balance + balanceDelta, liability: wallet.liability + liabilityDelta } });
+  
+  //         if (balanceDelta > 0) {
+  //           await tx.transaction.create({
+  //             data: {
+  //               walletId: wallet.id,
+  //               amount: balanceDelta,
+  //               type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+  //               description: isCancel
+  //                 ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
+  //                 : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+  //             },
+  //           });
+  //         }
+  //         affectedUserIds.add(userId);
+  //       }
+  //     }
+  //   }, { maxWait: 15000, timeout: 30000 });
+  
+  //   // 4️⃣ Recalculate P/L for affected users
+  //   await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
+  
+  //   return { success: true, message: 'Fancy bets settled successfully' };
+  // }
   private evaluateFancySingle(
     bets: Array<{
       id: string;
@@ -126,6 +357,317 @@ export class SettlementService {
     return result;
   }
 
+  // async settleFancyManual(
+  //   eventId: string,
+  //   selectionId: string,
+  //   decisionRun: number | null,
+  //   isCancel: boolean,
+  //   marketId: string | null,
+  //   adminId: string,
+  //   betIds?: string[],
+  // ) {
+  //   const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
+    
+  //   this.logger.log(
+  //     `[FANCY SETTLEMENT INIT] Starting settlement: ` +
+  //     `settlementId=${settlementId}, eventId=${eventId}, selectionId=${selectionId}, ` +
+  //     `decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, adminId=${adminId}, ` +
+  //     `betIds=${betIds ? betIds.length : 'all'}`,
+  //   );
+  
+  //   // ✅ Find bets (new + legacy)
+  //   let bets = await this.prisma.bet.findMany({
+  //     where: {
+  //       settlementId,
+  //       status: BetStatus.PENDING,
+  //       eventId: eventId,
+  //       selectionId: Number(selectionId),
+  //       ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //     },
+  //   });
+  
+  //   if (bets.length === 0) {
+  //     bets = await this.prisma.bet.findMany({
+  //       where: {
+  //         eventId,
+  //         selectionId: Number(selectionId),
+  //         status: BetStatus.PENDING,
+  //         ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //         OR: [
+  //           { gtype: { contains: 'fancy', mode: 'insensitive' } },
+  //           { marketType: { contains: 'fancy', mode: 'insensitive' } },
+  //         ],
+  //       },
+  //     });
+  
+  //     if (bets.length > 0) {
+  //       await this.prisma.bet.updateMany({
+  //         where: { id: { in: bets.map((b) => b.id) } },
+  //         data: { settlementId },
+  //       });
+  
+  //       bets = await this.prisma.bet.findMany({
+  //         where: { id: { in: bets.map((b) => b.id) } },
+  //       });
+  //     }
+  //   }
+  
+  //   if (bets.length === 0) {
+  //     this.logger.log(
+  //       `[FANCY SETTLEMENT SKIP] Settlement ${settlementId}: No pending bets found`,
+  //     );
+  //     return { success: true, message: 'No pending bets to settle' };
+  //   }
+    
+  //   this.logger.log(
+  //     `[FANCY SETTLEMENT BETS FOUND] Settlement ${settlementId}: ` +
+  //     `Found ${bets.length} pending bets to settle`,
+  //   );
+    
+  //   if (decisionRun === null && !isCancel)
+  //     throw new BadRequestException('Either decisionRun or isCancel must be provided');
+  
+  //   const actualRuns = decisionRun ?? 0;
+  //   const affectedUserIds = new Set<string>();
+    
+  //   this.logger.log(
+  //     `[FANCY SETTLEMENT PARAMS] Settlement ${settlementId}: ` +
+  //     `actualRuns=${actualRuns}, isCancel=${isCancel}`,
+  //   );
+  
+  //   await this.prisma.$transaction(async (tx) => {
+  //     const betsByUser = new Map<string, typeof bets>();
+  //     for (const bet of bets) {
+  //       if (!betsByUser.has(bet.userId)) betsByUser.set(bet.userId, []);
+  //       betsByUser.get(bet.userId)!.push(bet);
+  //     }
+  
+  //     for (const [userId, userBets] of betsByUser.entries()) {
+  //       const wallet = await tx.wallet.findUnique({ where: { userId } });
+  //       if (!wallet) continue;
+  
+  //       let balanceDelta = 0;
+  //       let liabilityDelta = 0;
+  
+  //       // 1️⃣ Check strict Gola condition
+  //       let totalBack = 0; // sum of Back/Yes stakes
+  //       let totalLay = 0;  // sum of Lay/No lossAmounts
+  //       let golaDetected = false;
+        
+  //       this.logger.log(
+  //         `[FANCY SETTLEMENT START] User ${userId}, Settlement ${settlementId}: ` +
+  //         `Processing ${userBets.length} bets, actualRuns=${actualRuns}, isCancel=${isCancel}`,
+  //       );
+        
+  //       for (const bet of userBets) {
+  //         const type = bet.betType?.toUpperCase();
+  //         const stake = bet.amount ?? 0;
+  //         const lossAmount = bet.lossAmount ?? stake;
+  //         const lowerBound = (bet as any).lowerBound ?? 0; // min score for fancy bet
+  //         const upperBound = (bet as any).upperBound ?? 0; // max score for fancy bet
+
+  //         // Sum Back/Yes stakes
+  //         if (type === 'BACK' || type === 'YES') {
+  //           totalBack += stake;
+  //         }
+
+  //         // Sum Lay/No lossAmounts
+  //         if (type === 'LAY' || type === 'NO') {
+  //           totalLay += lossAmount;
+  //         }
+
+  //         // 🔹 Score-based Gola Detection
+  //         // اگر actualRuns bet کے range میں آئے تو گولا فینسی بنے
+  //         if (actualRuns >= lowerBound && actualRuns <= upperBound) {
+  //           golaDetected = true;
+  //           this.logger.log(
+  //             `[GOLA DETECTION] Bet ${bet.id}: actualRuns=${actualRuns} falls within range [${lowerBound}-${upperBound}], ` +
+  //             `betType=${type}, stake=${stake}, lossAmount=${lossAmount}`,
+  //           );
+  //         }
+  //       }
+
+  //       // ✅ Final condition: at least one Back and one Lay, and score hits the range
+  //       const isRangeStyleGroup = totalBack > 0 && totalLay > 0 && golaDetected && !isCancel;
+
+  //       this.logger.log(
+  //         `[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: ` +
+  //         `totalBack=${totalBack}, totalLay=${totalLay}, ` +
+  //         `golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, ` +
+  //         `betsCount=${userBets.length}, actualRuns=${actualRuns}, isCancel=${isCancel}`,
+  //       );
+  
+  //       const winResultMap = isCancel
+  //         ? new Map<string, boolean>()
+  //         : this.evaluateFancySingle(userBets, actualRuns);
+  
+  //       if (isRangeStyleGroup) {
+  //         // ✅ RANGE-STYLE settlement (Gola Fancy)
+  //         this.logger.log(
+  //           `[GOLA FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
+  //           `Starting Gola settlement for ${userBets.length} bets`,
+  //         );
+          
+  //         let netProfit = 0;
+  //         let totalLiabilityRelease = 0;
+  
+  //         for (const bet of userBets) {
+  //           const betType = bet.betType?.toUpperCase();
+  //           const winAmount = bet.winAmount ?? bet.amount ?? 0;
+  //           const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
+  //           const liabilityAmount = betType === 'LAY' || betType === 'NO' ? lossAmount : bet.amount ?? 0;
+  
+  //           totalLiabilityRelease += liabilityAmount;
+  //           const isWin = winResultMap.get(bet.id) ?? false;
+  
+  //           if (isWin) {
+  //             netProfit += winAmount;
+  //             this.logger.log(
+  //               `[GOLA BET WIN] Bet ${bet.id}: type=${betType}, winAmount=${winAmount}, ` +
+  //               `liabilityAmount=${liabilityAmount}, netProfit contribution: +${winAmount}`,
+  //             );
+  //           } else {
+  //             netProfit -= lossAmount;
+  //             this.logger.log(
+  //               `[GOLA BET LOSS] Bet ${bet.id}: type=${betType}, lossAmount=${lossAmount}, ` +
+  //               `liabilityAmount=${liabilityAmount}, netProfit contribution: -${lossAmount}`,
+  //             );
+  //           }
+  
+  //           await tx.bet.update({
+  //             where: { id: bet.id },
+  //             data: {
+  //               status: isWin ? BetStatus.WON : BetStatus.LOST,
+  //               pnl: isWin ? winAmount : -lossAmount,
+  //               settledAt: new Date(),
+  //               updatedAt: new Date(),
+  //             },
+  //           });
+  //         }
+  
+  //         liabilityDelta -= totalLiabilityRelease;
+  //         if (netProfit > 0) balanceDelta += netProfit;
+          
+  //         this.logger.log(
+  //           `[GOLA FANCY FINAL] User ${userId}, Settlement ${settlementId}: ` +
+  //           `Total liability release=${totalLiabilityRelease}, netProfit=${netProfit}, ` +
+  //           `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
+  //         );
+  //       } else {
+  //         // ✅ NORMAL/SINGLE bets (or back+lay but not GOLA)
+  //         this.logger.log(
+  //           `[SINGLE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
+  //           `Starting Single fancy settlement for ${userBets.length} bets`,
+  //         );
+          
+  //         for (const bet of userBets) {
+  //           const stake = bet.amount ?? 0;
+  //           const betType = bet.betType?.toUpperCase();
+  //           const winAmount = bet.winAmount ?? stake;
+  //           const lossAmount = bet.lossAmount ?? stake;
+  //           const liabilityAmount = betType === 'LAY' || betType === 'NO' ? lossAmount : stake;
+  
+  //           if (isCancel) {
+  //             liabilityDelta -= liabilityAmount;
+  //             balanceDelta += liabilityAmount;
+  //             this.logger.log(
+  //               `[SINGLE BET CANCEL] Bet ${bet.id}: type=${betType}, ` +
+  //               `liabilityAmount=${liabilityAmount}, refunded to balance`,
+  //             );
+  //             await tx.bet.update({
+  //               where: { id: bet.id },
+  //               data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() },
+  //             });
+  //             continue;
+  //           }
+  
+  //           const isWin = winResultMap.get(bet.id) ?? false;
+  //           liabilityDelta -= liabilityAmount;
+  
+  //           if (isWin) {
+  //             balanceDelta += stake + winAmount;
+  //             this.logger.log(
+  //               `[SINGLE BET WIN] Bet ${bet.id}: type=${betType}, stake=${stake}, winAmount=${winAmount}, ` +
+  //               `liabilityAmount=${liabilityAmount}, balance increase: ${stake + winAmount} (stake + winAmount)`,
+  //             );
+  //             await tx.bet.update({
+  //               where: { id: bet.id },
+  //               data: { status: BetStatus.WON, pnl: winAmount, settledAt: new Date(), updatedAt: new Date() },
+  //             });
+  //           } else {
+  //             this.logger.log(
+  //               `[SINGLE BET LOSS] Bet ${bet.id}: type=${betType}, stake=${stake}, lossAmount=${lossAmount}, ` +
+  //               `liabilityAmount=${liabilityAmount}, balance unchanged (liability released only)`,
+  //             );
+  //             await tx.bet.update({
+  //               where: { id: bet.id },
+  //               data: { status: BetStatus.LOST, pnl: -lossAmount, settledAt: new Date(), updatedAt: new Date() },
+  //             });
+  //           }
+  //         }
+          
+  //         this.logger.log(
+  //           `[SINGLE FANCY FINAL] User ${userId}, Settlement ${settlementId}: ` +
+  //           `Total bets processed=${userBets.length}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`,
+  //         );
+  //       }
+  
+  //       if (balanceDelta !== 0 || liabilityDelta !== 0) {
+  //         const oldBalance = wallet.balance;
+  //         const oldLiability = wallet.liability;
+  //         const newBalance = wallet.balance + balanceDelta;
+  //         const newLiability = wallet.liability + liabilityDelta;
+          
+  //         this.logger.log(
+  //           `[WALLET UPDATE] User ${userId} (${isRangeStyleGroup ? 'GOLA' : 'SINGLE'} FANCY): ` +
+  //           `balance: ${oldBalance} → ${newBalance} (delta: ${balanceDelta > 0 ? '+' : ''}${balanceDelta}), ` +
+  //           `liability: ${oldLiability} → ${newLiability} (delta: ${liabilityDelta > 0 ? '+' : ''}${liabilityDelta})`,
+  //         );
+          
+  //         await tx.wallet.update({
+  //           where: { userId },
+  //           data: { balance: newBalance, liability: newLiability },
+  //         });
+  
+  //         if (balanceDelta > 0) {
+  //           await tx.transaction.create({
+  //             data: {
+  //               walletId: wallet.id,
+  //               amount: balanceDelta,
+  //               type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+  //               description: isCancel
+  //                 ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
+  //                 : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+  //             },
+  //           });
+  //           this.logger.log(
+  //             `[TRANSACTION CREATED] User ${userId}: ` +
+  //             `amount=${balanceDelta}, type=${isCancel ? 'REFUND' : 'BET_WON'}, ` +
+  //             `description=${isCancel ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}` : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`}`,
+  //           );
+  //         }
+  
+  //         affectedUserIds.add(userId);
+  //       } else {
+  //         this.logger.log(
+  //           `[WALLET NO CHANGE] User ${userId}: ` +
+  //           `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}, no wallet update needed`,
+  //         );
+  //       }
+  //     }
+  //   }, { maxWait: 15000, timeout: 30000 });
+  
+  //   this.logger.log(
+  //     `[FANCY SETTLEMENT COMPLETE] Settlement ${settlementId}: ` +
+  //     `Total bets settled=${bets.length}, ` +
+  //     `Affected users=${affectedUserIds.size}, ` +
+  //     `actualRuns=${actualRuns}, isCancel=${isCancel}`,
+  //   );
+  
+  //   await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
+  
+  //   return { success: true, message: 'Fancy bets settled successfully' };
+  // }
   async settleFancyManual(
     eventId: string,
     selectionId: string,
@@ -133,385 +675,169 @@ export class SettlementService {
     isCancel: boolean,
     marketId: string | null,
     adminId: string,
-    betIds?: string[], // Optional: settle only specific bets
+    betIds?: string[],
   ) {
     const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
-
-    // Find bets with new format first
+  
+    this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement: settlementId=${settlementId}, eventId=${eventId}, selectionId=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds ? betIds.join(',') : 'all'}`);
+  
+    // 1️⃣ Fetch pending bets (new + legacy)
     let bets = await this.prisma.bet.findMany({
       where: {
         settlementId,
         status: BetStatus.PENDING,
-        eventId: eventId,
+        eventId,
         selectionId: Number(selectionId),
-        // Filter by betIds if provided
         ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
       },
     });
-
-    // If no bets found with new format, try to find bets with old format (legacy: ${match_id}_${selection_id})
-    // For fancy, the old format was ${match_id}_${selection_id}, so we can match by eventId and selectionId
+  
     if (bets.length === 0) {
-      // Try finding bets by eventId and selectionId
       bets = await this.prisma.bet.findMany({
         where: {
-          eventId: eventId,
+          eventId,
           selectionId: Number(selectionId),
           status: BetStatus.PENDING,
-          // Filter by betIds if provided
           ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
-          // Fancy bets typically have gtype containing "fancy"
           OR: [
             { gtype: { contains: 'fancy', mode: 'insensitive' } },
             { marketType: { contains: 'fancy', mode: 'insensitive' } },
           ],
         },
       });
-
-      // If we found bets with old format, update their settlementId to the new format
+  
       if (bets.length > 0) {
-        this.logger.log(
-          `Found ${bets.length} bets with legacy format for eventId ${eventId}, selectionId ${selectionId}. Updating settlementId to new format.`,
-        );
-        
-        // Update settlementId for all found bets
         await this.prisma.bet.updateMany({
-          where: {
-            id: { in: bets.map((b) => b.id) },
-          },
-          data: {
-            settlementId: settlementId,
-          },
-        });
-
-        // Refresh bets to get updated settlementId
-        bets = await this.prisma.bet.findMany({
-          where: {
-            id: { in: bets.map((b) => b.id) },
-          },
+          where: { id: { in: bets.map(b => b.id) } },
+          data: { settlementId },
         });
       }
     }
-
-    if (bets.length === 0) {
-      // Check if settlement exists and all bets are already settled
-      // @ts-ignore - settlement property exists after Prisma client regeneration
-      const existingSettlement = await this.prisma.settlement.findUnique({
-        where: { settlementId },
-      });
-
-      if (existingSettlement && !existingSettlement.isRollback) {
-        // Check if there are any settled bets for this settlement
-        const settledBets = await this.prisma.bet.findMany({
-          where: {
-            settlementId,
-            status: {
-              in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
-            },
-          },
-        });
-
-        if (settledBets.length > 0) {
-          throw new BadRequestException(
-            `Settlement ${settlementId} already exists and all bets are settled. ` +
-            `It was settled by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}. ` +
-            `To re-settle, please rollback the existing settlement first using POST /admin/settlement/rollback`,
-          );
-        }
-      }
-
-      return { success: true, message: 'No pending bets to settle' };
-    }
-
-    // Check if settlement already exists (but allow re-settlement if there are pending bets)
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    const existingSettlement = await this.prisma.settlement.findUnique({
-      where: { settlementId },
-    });
-
-    if (existingSettlement && !existingSettlement.isRollback) {
-      // Allow re-settlement if there are pending bets (some bets might have been missed)
-      this.logger.warn(
-        `Settlement ${settlementId} already exists, but ${bets.length} pending bets found. ` +
-        `Proceeding with re-settlement. Original settlement by ${existingSettlement.settledBy} on ${existingSettlement.createdAt.toISOString()}`,
-      );
-    }
-
-    // Create settlement record FIRST (or update if exists)
-    // @ts-ignore - settlement property exists after Prisma client regeneration
-    await this.prisma.settlement.upsert({
-      where: { settlementId },
-      update: {
-        isRollback: false,
-        settledBy: adminId,
-        winnerId: isCancel ? null : (decisionRun?.toString() || null), // Update winner in case it changed
-      },
-      create: {
-        settlementId,
-        eventId,
-        marketType: MarketType.FANCY,
-        marketId: marketId || null,
-        winnerId: isCancel ? null : (decisionRun?.toString() || null),
-        settledBy: adminId,
-      },
-    });
-
-    if (decisionRun === null && !isCancel) {
-      throw new BadRequestException(
-        'Either decisionRun or isCancel must be provided',
-      );
-    }
-
+  
+    this.logger.log(`[FANCY SETTLEMENT BETS FOUND] Settlement ${settlementId}: Found ${bets.length} pending bets to settle`);
+  
+    if (bets.length === 0) return { success: true, message: 'No pending bets to settle' };
+    if (decisionRun === null && !isCancel) throw new BadRequestException('Either decisionRun or isCancel must be provided');
+  
     const actualRuns = decisionRun ?? 0;
+    this.logger.log(`[FANCY SETTLEMENT PARAMS] Settlement ${settlementId}: actualRuns=${actualRuns}, isCancel=${isCancel}`);
+  
     const affectedUserIds = new Set<string>();
-
-    // ✅ CLEAN FANCY SETTLEMENT ENGINE
-    await this.prisma.$transaction(
-      async (tx) => {
-        // 1️⃣ Group by user
-        const betsByUser = new Map<string, typeof bets>();
-        for (const bet of bets) {
-          if (!betsByUser.has(bet.userId)) {
-            betsByUser.set(bet.userId, []);
-          }
-          betsByUser.get(bet.userId)!.push(bet);
-        }
-
-        // 2️⃣ Settle user by user
-        for (const [userId, userBets] of betsByUser.entries()) {
-          const wallet = await tx.wallet.findUnique({
-            where: { userId },
-          });
-
-          if (!wallet) {
-            this.logger.warn(`Wallet not found for user ${userId}`);
-            continue;
-          }
-
-          let balanceDelta = 0;
-          let liabilityDelta = 0;
-
-          // ✅ SYSTEM-LEVEL RANGE FANCY DETECTION
-          // A settlement group is treated as RANGE FANCY when:
-          // - Multiple bets share the same settlementId (they already do in this function)
-          // - There is at least one BACK and one LAY bet in that group
-          const hasBack = userBets.some(
-            (b) => (b.betType?.toUpperCase() === 'BACK' || b.betType?.toUpperCase() === 'YES'),
-          );
-          const hasLay = userBets.some(
-            (b) => (b.betType?.toUpperCase() === 'LAY' || b.betType?.toUpperCase() === 'NO'),
-          );
+  
+    await this.prisma.$transaction(async (tx) => {
+      // 2️⃣ Group bets by userId AND marketId + selectionId
+      const betsByUserAndMarket = new Map<string, Map<string, typeof bets>>();
+      for (const bet of bets) {
+        const userMap = betsByUserAndMarket.get(bet.userId) || new Map();
+        const marketKey = `${bet.marketId}_${bet.selectionId}`;
+        const marketBets = userMap.get(marketKey) || [];
+        marketBets.push(bet);
+        userMap.set(marketKey, marketBets);
+        betsByUserAndMarket.set(bet.userId, userMap);
+      }
+  
+      for (const [userId, userMarkets] of betsByUserAndMarket.entries()) {
+        const wallet = await tx.wallet.findUnique({ where: { userId } });
+        if (!wallet) continue;
+  
+        let balanceDelta = 0;
+        let liabilityDelta = 0;
+  
+        for (const [marketKey, userBets] of userMarkets.entries()) {
+          const hasBack = userBets.some(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() || ''));
+          const hasLay = userBets.some(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() || ''));
           const isRangeStyleGroup = hasBack && hasLay && userBets.length > 1;
-
-          // ✅ Evaluate normal fancy bets only (for non-range-style groups)
-          const winResultMap = isCancel
-            ? new Map<string, boolean>() // Cancel doesn't need evaluation
-            : this.evaluateFancySingle(userBets, actualRuns);
-
-          // ✅ RANGE-STYLE GROUP SETTLEMENT (if detected)
+  
+          let golaDetected = false;
           if (isRangeStyleGroup) {
-            if (isCancel) {
-              // CANCEL: Refund all locked liabilities for range-style group
-              let totalLiabilityRelease = 0;
-            for (const bet of userBets) {
-                const betType = bet.betType?.toUpperCase();
-                const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
-                const liabilityAmount =
-                  betType === 'LAY' || betType === 'NO' ? lossAmount : bet.amount ?? 0;
-
-                totalLiabilityRelease += liabilityAmount;
-
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.CANCELLED,
-                    // @ts-ignore
-                    pnl: 0,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-              }
-
-              liabilityDelta -= totalLiabilityRelease;
-              balanceDelta += totalLiabilityRelease; // Refund all locked amounts
-            } else {
-              // Calculate net profit across all bets in the group
-              let netProfit = 0;
-              let totalLiabilityRelease = 0;
-
-              for (const bet of userBets) {
-                const betType = bet.betType?.toUpperCase();
-                const winAmount = bet.winAmount ?? bet.amount ?? 0;
-                const lossAmount = bet.lossAmount ?? bet.amount ?? 0;
-                const liabilityAmount =
-                  betType === 'LAY' || betType === 'NO' ? lossAmount : bet.amount ?? 0;
-
-                // Always release liability for each bet
-                totalLiabilityRelease += liabilityAmount;
-
-                // Determine win/loss for this bet
-                const isWin = winResultMap.get(bet.id) ?? false;
-
-                if (isWin) {
-                  // Winning bet contributes profit
-                  netProfit += winAmount;
-                } else {
-                  // Losing bet contributes negative (loss)
-                  netProfit -= lossAmount;
-                }
-
-                // Mark bet as settled
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: isWin ? BetStatus.WON : BetStatus.LOST,
-                    // @ts-ignore
-                    pnl: isWin ? winAmount : -lossAmount,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-                  }
-                  
-              // Release all liabilities
-              liabilityDelta -= totalLiabilityRelease;
-
-              // ✅ RANGE-STYLE SETTLEMENT RULE:
-              // If net profit > 0: credit wallet ONCE per settlementId
-              // If net profit <= 0: no wallet balance change
-              if (netProfit > 0) {
-                balanceDelta += netProfit;
-              }
-              // If netProfit <= 0, balanceDelta remains 0 (no wallet change)
-            }
-
-            // Skip per-bet processing for range-style groups
-            // Wallet update will happen once per user below
-          } else {
-            // ✅ NORMAL FANCY SETTLEMENT (per-bet processing)
-          // 3️⃣ Process each bet
-          for (const bet of userBets) {
-            // ✅ CORRECT FANCY FIELD MAPPING
-            const stake = bet.amount ?? 0; // stake amount
-            const betType = bet.betType?.toUpperCase(); // BACK / LAY or YES / NO
-              const winAmount = bet.winAmount ?? stake; // profit amount when bet wins
-            const lossAmount = bet.lossAmount ?? stake; // loss amount when bet loses
-            
-            // Determine liability amount: BACK uses stake, LAY uses lossAmount
-            const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-
-              // 🔁 CANCEL: Refund the amount that was deducted (liabilityAmount)
-            if (isCancel) {
-              liabilityDelta -= liabilityAmount; // release the liability that was locked
-              balanceDelta += liabilityAmount; // refund the amount that was deducted
-
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.CANCELLED,
-                  // @ts-ignore
-                  pnl: 0,
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
-              continue;
-            }
-
-              /* =========================================
-                 ✅ NORMAL FANCY — EXISTING LOGIC
-                 ========================================= */
-
-            const isWin = winResultMap.get(bet.id) ?? false;
-            
-              // Always release liability
-            liabilityDelta -= liabilityAmount;
-
-            if (isWin) {
-                    if (betType === 'BACK' || betType === 'YES') {
-                  // BACK/YES WIN: return stake + profit
-                  balanceDelta += stake + winAmount;
-
-                  //  balanceDelta += winAmount;
-                    } else {
-                  // LAY/NO WIN: return locked stake (lossAmount) + profit
-                  balanceDelta += lossAmount + winAmount;
-              }
-
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.WON,
-                  // @ts-ignore
-                  pnl: winAmount, // Reporting: profit = winAmount
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
-            } else {
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: {
-                  status: BetStatus.LOST,
-                  // @ts-ignore
-                  pnl: -lossAmount, // Reporting: loss amount
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
-                },
-              });
-              // 🔐 CRITICAL: NO balance change for loss
-              // ASSUMPTION: At bet placement, we MUST have done:
-              //   BACK: wallet.balance -= stake, wallet.liability += stake
-              //   LAY: wallet.balance -= lossAmount, wallet.liability += lossAmount
-              // If this assumption is false, fancy wallet math is broken.
-              // NOTE: PNL = -lossAmount for reporting, but walletImpact = 0
-              // The deducted amount (stake for BACK, lossAmount for LAY) was already locked at placement
-              // Reporting layer should expose: { pnl: -lossAmount, walletImpact: 0, liabilityReleased: liabilityAmount }
-              }
-            }
+            const minLine = Math.min(...userBets.map(b => b.betRate ?? b.odds ?? 0));
+            const maxLine = Math.max(...userBets.map(b => b.betRate ?? b.odds ?? 0));
+            if (actualRuns >= minLine && actualRuns <= maxLine) golaDetected = true;
           }
-
-          // 4️⃣ Apply wallet changes ONCE per user
-          if (balanceDelta !== 0 || liabilityDelta !== 0) {
-            await tx.wallet.update({
-              where: { userId },
+  
+          this.logger.log(`[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: totalBack=${userBets.filter(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, totalLay=${userBets.filter(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, betsCount=${userBets.length}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
+  
+          if (isCancel || !golaDetected) {
+            this.logger.log(`[SINGLE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: Starting Single fancy settlement for ${userBets.length} bets`);
+            for (const bet of userBets) {
+              const stake = bet.amount ?? 0;
+              const betType = bet.betType?.toUpperCase() ?? '';
+              const winAmount = bet.winAmount ?? stake;
+              const lossAmount = bet.lossAmount ?? stake;
+              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+  
+              if (isCancel) {
+                balanceDelta += liabilityAmount;
+                liabilityDelta -= liabilityAmount;
+                await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() } });
+                continue;
+              }
+  
+              const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
+  
+              liabilityDelta -= liabilityAmount;
+              balanceDelta += isWin ? (betType === 'BACK' || betType === 'YES' ? stake + winAmount : lossAmount + winAmount) : 0;
+  
+              this.logger.log(`[SINGLE BET ${isWin ? 'WIN' : 'LOSS'}] Bet ${bet.id}: type=${betType}, stake=${stake}, winAmount=${winAmount}, liabilityAmount=${liabilityAmount}, balance impact=${isWin ? (betType==='BACK'||betType==='YES'?stake+winAmount:lossAmount+winAmount) : 0}`);
+  
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: { status: isWin ? BetStatus.WON : BetStatus.LOST, pnl: isWin ? winAmount : -lossAmount, settledAt: new Date(), updatedAt: new Date() },
+              });
+            }
+          } else {
+            this.logger.log(`[RANGE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: GOLA detected, processing range-style bets (${userBets.length})`);
+            let netProfit = 0;
+  
+            for (const bet of userBets) {
+              const stake = bet.amount ?? 0;
+              const betType = bet.betType?.toUpperCase() ?? '';
+              const winAmount = bet.winAmount ?? stake;
+              const lossAmount = bet.lossAmount ?? stake;
+              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+  
+              const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
+              netProfit += isWin ? winAmount : -lossAmount;
+              liabilityDelta -= liabilityAmount;
+  
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: { status: isWin ? BetStatus.WON : BetStatus.LOST, pnl: isWin ? winAmount : -lossAmount, settledAt: new Date(), updatedAt: new Date() },
+              });
+            }
+  
+            if (netProfit > 0) balanceDelta += netProfit;
+          }
+        }
+  
+        if (balanceDelta !== 0 || liabilityDelta !== 0) {
+          await tx.wallet.update({ where: { userId }, data: { balance: wallet.balance + balanceDelta, liability: wallet.liability + liabilityDelta } });
+          if (balanceDelta > 0) {
+            await tx.transaction.create({
               data: {
-                balance: wallet.balance + balanceDelta,
-                liability: wallet.liability + liabilityDelta,
+                walletId: wallet.id,
+                amount: balanceDelta,
+                type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+                description: isCancel
+                  ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
+                  : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
               },
             });
-
-            // Create transaction record
-            if (balanceDelta > 0) {
-              await tx.transaction.create({
-                data: {
-                  walletId: wallet.id,
-                  amount: balanceDelta,
-                  type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
-                  description: isCancel
-                    ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
-                    : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
-                },
-              });
-            }
-
-            affectedUserIds.add(userId);
           }
+          this.logger.log(`[SINGLE FANCY FINAL] User ${userId}, Settlement ${settlementId}: Total bets processed=${bets.length}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`);
+          affectedUserIds.add(userId);
         }
-      },
-      {
-        maxWait: 15000,
-        timeout: 30000,
-      },
-    );
-
-    // Recalculate P/L for all affected users (Fancy-specific)
+      }
+    });
+  
     await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
-
+  
+    this.logger.log(`[FANCY SETTLEMENT COMPLETE] Settlement ${settlementId}: Total bets settled=${bets.length}, Affected users=${affectedUserIds.size}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
+  
     return { success: true, message: 'Fancy bets settled successfully' };
   }
-
+  
+  
   /**
    * ✅ MATCH ODDS EXPOSURE CALCULATION (MARKET-SPECIFIC)
    * 
@@ -2529,7 +2855,7 @@ export class SettlementService {
     const matchOddsBets: any[] = [];
     const fancyBets: any[] = [];
     const bookmakerBets: any[] = [];
-    
+
     for (const bet of bets) {
       const gtype = (bet.gtype || '').toLowerCase();
       if (gtype === 'matchodds' || gtype === 'match') {
@@ -2590,10 +2916,10 @@ export class SettlementService {
       },
     });
 
-      this.logger.debug(
+    this.logger.debug(
       `Liability recalculation for user ${userId}: ${currentLiability} → ${totalLiability} (diff: ${diff > 0 ? '+' : ''}${diff})`,
-      );
-    }
+    );
+  }
 
 
   async rollbackSettlement(settlementId: string, adminId: string, betIds?: string[]) {
@@ -2708,7 +3034,7 @@ export class SettlementService {
                 updatedAt: new Date(),
               },
             });
-          
+
             // ✅ STEP 3: Reverse wallet balance changes
             if (balanceReversal !== 0) {
               await tx.wallet.update({
@@ -3200,18 +3526,18 @@ export class SettlementService {
               });
 
               // Create refund transaction record
-                await tx.transaction.create({
-                  data: {
-                    walletId: wallet.id,
-                    amount: totalUserRefund,
-                    type: TransactionType.REFUND,
+              await tx.transaction.create({
+                data: {
+                  walletId: wallet.id,
+                  amount: totalUserRefund,
+                  type: TransactionType.REFUND,
                   description:
                     `Bulk bet cancellation by admin. ` +
-                      `Cancelled ${userBets.length} bet(s). ` +
-                      `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
-                  },
-                });
-              }
+                    `Cancelled ${userBets.length} bet(s). ` +
+                    `Settlement ID: ${userBets[0]?.settlementId || 'N/A'}`,
+                },
+              });
+            }
 
             // ✅ RECALCULATE LIABILITY: After cancelling bets, recalculate liability properly
             // This ensures Match Odds offset cancellation works correctly
@@ -5972,10 +6298,10 @@ export class SettlementService {
   async getPendingBetsByMarketType(marketType: 'fancy' | 'match-odds' | 'bookmaker' | 'tied-match') {
     // Build where clause based on market type
     const whereClause: any = {
-        status: BetStatus.PENDING,
-        eventId: {
-          not: null,
-        },
+      status: BetStatus.PENDING,
+      eventId: {
+        not: null,
+      },
     };
 
     if (marketType === 'fancy') {

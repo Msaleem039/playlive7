@@ -8,11 +8,13 @@ import { UsersModule } from '../users/users.module';
 import { PrismaModule } from '../prisma/prisma.module';
 import { JwtStrategy } from './jwt.strategy';
 import { AccountStatementService } from '../roles/account-statement.service';
+import { SettlementModule } from '../settlement/settlement.module';
 
 @Module({
   imports: [
     UsersModule, // Import UsersModule to access UsersService
     PrismaModule, // Import PrismaModule to access PrismaService
+    SettlementModule, // Import SettlementModule to access SettlementService
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
       useFactory: (configService: ConfigService) => {

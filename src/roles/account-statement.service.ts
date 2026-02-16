@@ -49,6 +49,11 @@ export interface AccountStatementFilters {
   toDate?: Date;
   limit?: number;
   offset?: number;
+  betLimit?: number;
+  betOffset?: number;
+  betStatus?: string;
+  betStartDate?: Date;
+  betEndDate?: Date;
 }
 
 @Injectable()

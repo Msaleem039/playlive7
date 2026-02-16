@@ -8,6 +8,7 @@ import {
   UseGuards,
   BadRequestException,
   Delete,
+  ValidationPipe,
 } from '@nestjs/common';
 import { IsNotEmpty, IsString, IsOptional, IsBoolean, IsNumber, IsArray } from 'class-validator';
 import { SettlementService } from './settlement.service';
@@ -189,7 +190,7 @@ export class SettlementAdminController {
    */
   @Post('tied-match')
   async settleTiedMatch(
-    @Body() dto: SettleTiedMatchDto,
+    @Body(ValidationPipe) dto: SettleTiedMatchDto,
     @CurrentUser() user: User,
   ) {
     return this.settlementService.settleTiedMatchManual(

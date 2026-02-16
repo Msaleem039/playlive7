@@ -414,6 +414,7 @@ export class BetsService {
     
     // Normalize win amount from input (defensive: handle null/undefined)
     let normalizedWinAmount = Number(win_amount) || 0;
+    let normalizedLossAmount = 0;
     
     // Calculate winAmount if not provided or invalid
     if (normalizedBetValue > 0 && normalizedBetRate > 0) {
@@ -477,15 +478,17 @@ export class BetsService {
       betGtype = 'bookmaker';
     }
 
-    // ✅ FIX: Fancy BACK/YES bets use fixed winAmount = stake (bet_rate is only a comparison line)
-    if (betGtype === 'fancy' && (isBackBet || normalizedBetType === 'BACK')) {
-      // Fancy profit is FIXED: winAmount = stake, lossAmount = stake
-      // bet_rate is ONLY a comparison line, NEVER a multiplier
-      normalizedWinAmount = normalizedBetValue; // winAmount = stake
+    // if (betGtype === 'fancy' && isBackBet) {
+    //   normalizedWinAmount = (normalizedBetValue * normalizedBetRate) / 100;
+    //   normalizedLossAmount = normalizedBetValue;
+    // }
+    if (betGtype === 'fancy' && isBackBet) {
+      // TRUST FRONTEND PAYROLL VALUE (ONLY FOR FANCY BACK)
+      normalizedWinAmount = Number(win_amount) || 0;
+      normalizedLossAmount = normalizedBetValue; 
     }
-
+    
     // Calculate lossAmount based on market type
-    let normalizedLossAmount = 0;
 
     // ✅ FIXED: Fancy LAY bets use loss_amount from payload if provided
     if (betGtype === 'fancy') {
