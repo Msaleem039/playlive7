@@ -744,21 +744,84 @@ export class SettlementService {
         let liabilityDelta = 0;
   
         for (const [marketKey, userBets] of userMarkets.entries()) {
-          const hasBack = userBets.some(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() || ''));
-          const hasLay = userBets.some(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() || ''));
-          const isRangeStyleGroup = hasBack && hasLay && userBets.length > 1;
-  
+          const onlyBacks = userBets.every(b => ['BACK','YES'].includes(b.betType?.toUpperCase() ?? ''));
+          const onlyLays = userBets.every(b => ['LAY','NO'].includes(b.betType?.toUpperCase() ?? ''));
+          
+          const isRangeStyleGroup = (onlyBacks || onlyLays) && userBets.length > 1;
+          
+  console.log(isRangeStyleGroup);
+  console.log(userBets);
+  console.log(actualRuns);
+  console.log(onlyBacks);
+  console.log(onlyLays);
           let golaDetected = false;
           if (isRangeStyleGroup) {
             const minLine = Math.min(...userBets.map(b => b.betRate ?? b.odds ?? 0));
             const maxLine = Math.max(...userBets.map(b => b.betRate ?? b.odds ?? 0));
             if (actualRuns >= minLine && actualRuns <= maxLine) golaDetected = true;
           }
-  
+  console.log(golaDetected);
+
           this.logger.log(`[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: totalBack=${userBets.filter(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, totalLay=${userBets.filter(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, betsCount=${userBets.length}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
   
           if (isCancel || !golaDetected) {
             this.logger.log(`[SINGLE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: Starting Single fancy settlement for ${userBets.length} bets`);
+            // ✅ EMERGENCY BOTH WIN CHECK
+const evaluatedBets = userBets.map(bet => {
+  const betType = bet.betType?.toUpperCase() ?? '';
+  const line = Number(bet.betRate ?? bet.odds ?? 0);
+
+  const isWin =
+    betType === 'BACK' || betType === 'YES'
+      ? actualRuns >= line
+      : actualRuns < line;
+
+  return { bet, isWin };
+});
+
+const allWin = evaluatedBets.every(b => b.isWin);
+const hasBack = evaluatedBets.some(b => ['BACK','YES'].includes(b.bet.betType?.toUpperCase() ?? ''));
+const hasLay  = evaluatedBets.some(b => ['LAY','NO'].includes(b.bet.betType?.toUpperCase() ?? ''));
+
+if (!isCancel && allWin && hasBack && hasLay) {
+
+  let totalStake = 0;
+  let totalReturn = 0;
+
+  for (const { bet } of evaluatedBets) {
+    const stake = bet.amount ?? 0;
+    const winAmount = bet.winAmount ?? stake;
+    const lossAmount = bet.lossAmount ?? stake;
+    const betType = bet.betType?.toUpperCase() ?? '';
+    const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+
+    totalStake += stake;
+    totalReturn += (stake + winAmount);
+
+    liabilityDelta -= liabilityAmount;
+
+    await tx.bet.update({
+      where: { id: bet.id },
+      data: {
+        status: BetStatus.WON,
+        pnl: winAmount,
+        settledAt: new Date(),
+        updatedAt: new Date()
+      }
+    });
+  }
+
+  const netProfit = totalReturn - totalStake;
+
+  if (netProfit > 0) {
+    balanceDelta += netProfit;
+  }
+
+  this.logger.log(`[BOTH WIN PATCH APPLIED] Net profit=${netProfit}`);
+
+  continue; // ⚠️ IMPORTANT — normal loop skip کرے
+}
+
             for (const bet of userBets) {
               const stake = bet.amount ?? 0;
               const betType = bet.betType?.toUpperCase() ?? '';
@@ -772,8 +835,14 @@ export class SettlementService {
                 await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() } });
                 continue;
               }
-  
-              const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
+              const line = Number(bet.betRate ?? bet.odds ?? 0);
+
+              const isWin =
+                betType === 'BACK' || betType === 'YES'
+                  ? actualRuns >= line
+                  : actualRuns < line;
+              
+              // const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
   
               liabilityDelta -= liabilityAmount;
               balanceDelta += isWin ? (betType === 'BACK' || betType === 'YES' ? stake + winAmount : lossAmount + winAmount) : 0;
@@ -795,8 +864,18 @@ export class SettlementService {
               const winAmount = bet.winAmount ?? stake;
               const lossAmount = bet.lossAmount ?? stake;
               const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-  
-              const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
+              const line = Number(bet.betRate ?? bet.odds ?? 0);
+              console.log("DEBUG CHECK:", {
+                actualRuns: Number(actualRuns),
+                line: Number(line),
+                comparison: Number(actualRuns) >= Number(line)
+              });
+              const isWin =
+                betType === 'BACK' || betType === 'YES'
+                  ? actualRuns >= line
+                  : actualRuns < line;
+              
+              // const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
               netProfit += isWin ? winAmount : -lossAmount;
               liabilityDelta -= liabilityAmount;
   
