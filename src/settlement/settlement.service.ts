@@ -746,14 +746,17 @@ export class SettlementService {
         for (const [marketKey, userBets] of userMarkets.entries()) {
           const onlyBacks = userBets.every(b => ['BACK','YES'].includes(b.betType?.toUpperCase() ?? ''));
           const onlyLays = userBets.every(b => ['LAY','NO'].includes(b.betType?.toUpperCase() ?? ''));
-          
+          const hasMultipleSameSide =
+  (onlyBacks || onlyLays) && userBets.length > 1;
+
+          console.log("hasMultipleSameSide", hasMultipleSameSide);
           const isRangeStyleGroup = (onlyBacks || onlyLays) && userBets.length > 1;
           
-  console.log(isRangeStyleGroup);
-  console.log(userBets);
-  console.log(actualRuns);
-  console.log(onlyBacks);
-  console.log(onlyLays);
+  console.log("isRangeStyleGroup", isRangeStyleGroup);
+  console.log("userBets", userBets);
+  console.log("actualRuns", actualRuns);
+  console.log("onlyBacks", onlyBacks);
+  console.log("onlyLays", onlyLays);
           let golaDetected = false;
           if (isRangeStyleGroup) {
             const minLine = Math.min(...userBets.map(b => b.betRate ?? b.odds ?? 0));
@@ -764,7 +767,8 @@ export class SettlementService {
 
           this.logger.log(`[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: totalBack=${userBets.filter(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, totalLay=${userBets.filter(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, betsCount=${userBets.length}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
   
-          if (isCancel || !golaDetected) {
+          if (isCancel || !golaDetected || hasMultipleSameSide) {
+
             this.logger.log(`[SINGLE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: Starting Single fancy settlement for ${userBets.length} bets`);
             // ✅ EMERGENCY BOTH WIN CHECK
 const evaluatedBets = userBets.map(bet => {
@@ -843,9 +847,27 @@ if (!isCancel && allWin && hasBack && hasLay) {
                   : actualRuns < line;
               
               // const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
-  
+              // liabilityDelta -= liabilityAmount;
+
+              // if (isWin) {
+              //   balanceDelta += winAmount;   // ✅ صرف profit add ہوگا
+              // }
               liabilityDelta -= liabilityAmount;
-              balanceDelta += isWin ? (betType === 'BACK' || betType === 'YES' ? stake + winAmount : lossAmount + winAmount) : 0;
+
+if (isWin) {
+
+  if (hasMultipleSameSide) {
+    // 🔥 SAME SIDE SPECIAL PATCH
+    balanceDelta += (stake + winAmount);
+  } else {
+    // Normal behaviour
+    balanceDelta += winAmount;
+  }
+
+}
+
+              // liabilityDelta -= liabilityAmount;
+              // balanceDelta += isWin ? (betType === 'BACK' || betType === 'YES' ? stake + winAmount : lossAmount + winAmount) : 0;
   
               this.logger.log(`[SINGLE BET ${isWin ? 'WIN' : 'LOSS'}] Bet ${bet.id}: type=${betType}, stake=${stake}, winAmount=${winAmount}, liabilityAmount=${liabilityAmount}, balance impact=${isWin ? (betType==='BACK'||betType==='YES'?stake+winAmount:lossAmount+winAmount) : 0}`);
   
