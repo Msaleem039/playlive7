@@ -725,6 +725,64 @@ export class SettlementService {
     const affectedUserIds = new Set<string>();
   
     await this.prisma.$transaction(async (tx) => {
+      // ✅ STEP 1: Build a map of refund pairs
+      // Key: bet.id that has isRefunded=true and refundedByBetId
+      // Value: the paired bet fetched using refundedByBetId
+      const refundPairMap = new Map<string, typeof bets[0]>();
+      const processedBetIds = new Set<string>();
+      
+      // Identify bets that are part of refund pairs
+      const refundedBets = bets.filter(b => b.isRefunded === true && b.refundedByBetId !== null);
+      
+      this.logger.log(
+        `[REFUND PAIR DETECTION] Found ${refundedBets.length} bets with isRefunded=true and refundedByBetId`
+      );
+      
+      // Build refund pair map by fetching paired bets
+      for (const refundedBet of refundedBets) {
+        if (!refundedBet.refundedByBetId) continue;
+        
+        // Fetch the paired bet using refundedByBetId
+        const pairedBet = bets.find(b => b.id === refundedBet.refundedByBetId);
+        
+        if (pairedBet) {
+          refundPairMap.set(refundedBet.id, pairedBet);
+          refundPairMap.set(pairedBet.id, refundedBet);
+          this.logger.log(
+            `[REFUND PAIR FOUND] Bet ${refundedBet.id} paired with bet ${pairedBet.id}`
+          );
+        } else {
+          // Paired bet might not be in the current settlement batch, fetch from DB
+          // Only include if it matches the same settlement criteria
+          const pairedBetFromDb = await tx.bet.findUnique({
+            where: { id: refundedBet.refundedByBetId },
+          });
+          
+          if (
+            pairedBetFromDb &&
+            pairedBetFromDb.status === BetStatus.PENDING &&
+            pairedBetFromDb.eventId === eventId &&
+            pairedBetFromDb.selectionId === Number(selectionId)
+          ) {
+            refundPairMap.set(refundedBet.id, pairedBetFromDb as any);
+            refundPairMap.set(pairedBetFromDb.id, refundedBet);
+            // Add to bets array so it gets processed (avoid duplicates)
+            if (!bets.find(b => b.id === pairedBetFromDb.id)) {
+              bets.push(pairedBetFromDb as any);
+            }
+            this.logger.log(
+              `[REFUND PAIR FOUND DB] Bet ${refundedBet.id} paired with bet ${pairedBetFromDb.id} (fetched from DB, added to settlement)`
+            );
+          } else if (pairedBetFromDb) {
+            this.logger.warn(
+              `[REFUND PAIR SKIPPED] Bet ${refundedBet.id} has paired bet ${refundedBet.refundedByBetId} ` +
+              `but it doesn't match settlement criteria (status=${pairedBetFromDb.status}, ` +
+              `eventId=${pairedBetFromDb.eventId}, selectionId=${pairedBetFromDb.selectionId})`
+            );
+          }
+        }
+      }
+
       // 2️⃣ Group bets by userId AND marketId + selectionId
       const betsByUserAndMarket = new Map<string, Map<string, typeof bets>>();
       for (const bet of bets) {
@@ -744,170 +802,174 @@ export class SettlementService {
         let liabilityDelta = 0;
   
         for (const [marketKey, userBets] of userMarkets.entries()) {
-          const onlyBacks = userBets.every(b => ['BACK','YES'].includes(b.betType?.toUpperCase() ?? ''));
-          const onlyLays = userBets.every(b => ['LAY','NO'].includes(b.betType?.toUpperCase() ?? ''));
-          const hasMultipleSameSide =
-  (onlyBacks || onlyLays) && userBets.length > 1;
-
-          console.log("hasMultipleSameSide", hasMultipleSameSide);
-          const isRangeStyleGroup = (onlyBacks || onlyLays) && userBets.length > 1;
-          
-  console.log("isRangeStyleGroup", isRangeStyleGroup);
-  console.log("userBets", userBets);
-  console.log("actualRuns", actualRuns);
-  console.log("onlyBacks", onlyBacks);
-  console.log("onlyLays", onlyLays);
-          let golaDetected = false;
-          if (isRangeStyleGroup) {
-            const minLine = Math.min(...userBets.map(b => b.betRate ?? b.odds ?? 0));
-            const maxLine = Math.max(...userBets.map(b => b.betRate ?? b.odds ?? 0));
-            if (actualRuns >= minLine && actualRuns <= maxLine) golaDetected = true;
-          }
-  console.log(golaDetected);
-
-          this.logger.log(`[FANCY SETTLEMENT DEBUG] User ${userId}, Settlement ${settlementId}: totalBack=${userBets.filter(b => ['BACK', 'YES'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, totalLay=${userBets.filter(b => ['LAY', 'NO'].includes(b.betType?.toUpperCase() ?? '')).reduce((a,b)=>a+(b.amount??0),0)}, golaDetected=${golaDetected}, isRangeStyleGroup=${isRangeStyleGroup}, betsCount=${userBets.length}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
-  
-          if (isCancel || !golaDetected || hasMultipleSameSide) {
-
-            this.logger.log(`[SINGLE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: Starting Single fancy settlement for ${userBets.length} bets`);
-            // ✅ EMERGENCY BOTH WIN CHECK
-const evaluatedBets = userBets.map(bet => {
-  const betType = bet.betType?.toUpperCase() ?? '';
-  const line = Number(bet.betRate ?? bet.odds ?? 0);
-
-  const isWin =
-    betType === 'BACK' || betType === 'YES'
-      ? actualRuns >= line
-      : actualRuns < line;
-
-  return { bet, isWin };
-});
-
-const allWin = evaluatedBets.every(b => b.isWin);
-const hasBack = evaluatedBets.some(b => ['BACK','YES'].includes(b.bet.betType?.toUpperCase() ?? ''));
-const hasLay  = evaluatedBets.some(b => ['LAY','NO'].includes(b.bet.betType?.toUpperCase() ?? ''));
-
-if (!isCancel && allWin && hasBack && hasLay) {
-
-  let totalStake = 0;
-  let totalReturn = 0;
-
-  for (const { bet } of evaluatedBets) {
-    const stake = bet.amount ?? 0;
-    const winAmount = bet.winAmount ?? stake;
-    const lossAmount = bet.lossAmount ?? stake;
-    const betType = bet.betType?.toUpperCase() ?? '';
-    const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-
-    totalStake += stake;
-    totalReturn += (stake + winAmount);
-
-    liabilityDelta -= liabilityAmount;
-
-    await tx.bet.update({
-      where: { id: bet.id },
-      data: {
-        status: BetStatus.WON,
-        pnl: winAmount,
-        settledAt: new Date(),
-        updatedAt: new Date()
-      }
-    });
-  }
-
-  const netProfit = totalReturn - totalStake;
-
-  if (netProfit > 0) {
-    balanceDelta += netProfit;
-  }
-
-  this.logger.log(`[BOTH WIN PATCH APPLIED] Net profit=${netProfit}`);
-
-  continue; // ⚠️ IMPORTANT — normal loop skip کرے
-}
-
-            for (const bet of userBets) {
-              const stake = bet.amount ?? 0;
-              const betType = bet.betType?.toUpperCase() ?? '';
-              const winAmount = bet.winAmount ?? stake;
-              const lossAmount = bet.lossAmount ?? stake;
-              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-  
+          // ✅ Process refund pairs first
+          for (const bet of userBets) {
+            // Skip if already processed
+            if (processedBetIds.has(bet.id)) continue;
+            
+            // Check if this bet is part of a refund pair
+            const isRefundedBet = bet.isRefunded === true && bet.refundedByBetId !== null;
+            
+            if (isRefundedBet && refundPairMap.has(bet.id)) {
+              const pairedBet = refundPairMap.get(bet.id);
+              if (!pairedBet) continue;
+              
+              // Mark both bets as processed
+              processedBetIds.add(bet.id);
+              processedBetIds.add(pairedBet.id);
+              
+              this.logger.log(
+                `[REFUND PAIR SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
+                `Processing refund pair: bet ${bet.id} + bet ${pairedBet.id}`
+              );
+              
+              // Calculate range from both bets
+              const bet1Line = Number(bet.betRate ?? bet.odds ?? 0);
+              const bet2Line = Number(pairedBet.betRate ?? pairedBet.odds ?? 0);
+              const minLine = Math.min(bet1Line, bet2Line);
+              const maxLine = Math.max(bet1Line, bet2Line);
+              
+              // Check if actualRuns falls within the range
+              const isRangeHit = actualRuns >= minLine && actualRuns <= maxLine;
+              
+              this.logger.log(
+                `[REFUND PAIR RANGE] User ${userId}, Settlement ${settlementId}: ` +
+                `Range: ${minLine} to ${maxLine}, actualRuns=${actualRuns}, isRangeHit=${isRangeHit}, isCancel=${isCancel}`
+              );
+              
               if (isCancel) {
-                balanceDelta += liabilityAmount;
-                liabilityDelta -= liabilityAmount;
-                await tx.bet.update({ where: { id: bet.id }, data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() } });
+                // On cancel: mark both bets as cancelled
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
+                });
+                await tx.bet.update({
+                  where: { id: pairedBet.id },
+                  data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
+                });
                 continue;
               }
-              const line = Number(bet.betRate ?? bet.odds ?? 0);
-
-              const isWin =
-                betType === 'BACK' || betType === 'YES'
-                  ? actualRuns >= line
-                  : actualRuns < line;
               
-              // const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
-              // liabilityDelta -= liabilityAmount;
+              if (isRangeHit) {
+                // ✅ RANGE HIT: Both bets WON
+                // Credit winAmount for BOTH bets
+                const bet1WinAmount = bet.winAmount ?? bet.amount ?? 0;
+                const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
+                const totalWinAmount = bet1WinAmount + bet2WinAmount;
+                
+                balanceDelta += totalWinAmount;
+                
+                // Update both bets as WON
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.WON,
+                    pnl: bet1WinAmount,
+                    settledAt: new Date(),
+                    updatedAt: new Date()
+                  }
+                });
+                await tx.bet.update({
+                  where: { id: pairedBet.id },
+                  data: {
+                    status: BetStatus.WON,
+                    pnl: bet2WinAmount,
+                    settledAt: new Date(),
+                    updatedAt: new Date()
+                  }
+                });
+                
+                this.logger.log(
+                  `[REFUND PAIR WON] User ${userId}, Settlement ${settlementId}: ` +
+                  `Both bets WON, totalWinAmount=${totalWinAmount}`
+                );
+              } else {
+                // ✅ RANGE MISS: Both bets LOST
+                // Do NOT credit anything (liability was already released at placement)
+                const bet1LossAmount = bet.lossAmount ?? bet.amount ?? 0;
+                const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
+                
+                // Update both bets as LOST
+                await tx.bet.update({
+                  where: { id: bet.id },
+                  data: {
+                    status: BetStatus.LOST,
+                    pnl: -bet1LossAmount,
+                    settledAt: new Date(),
+                    updatedAt: new Date()
+                  }
+                });
+                await tx.bet.update({
+                  where: { id: pairedBet.id },
+                  data: {
+                    status: BetStatus.LOST,
+                    pnl: -bet2LossAmount,
+                    settledAt: new Date(),
+                    updatedAt: new Date()
+                  }
+                });
+                
+                this.logger.log(
+                  `[REFUND PAIR LOST] User ${userId}, Settlement ${settlementId}: ` +
+                  `Both bets LOST, no balance credit (liability already released)`
+                );
+              }
+              
+              // ✅ IMPORTANT: Do NOT adjust liability for refund pairs
+              // Liability was already released at placement time
+              continue;
+            }
+          }
 
-              // if (isWin) {
-              //   balanceDelta += winAmount;   // ✅ صرف profit add ہوگا
-              // }
+          // ✅ Handle individual bets (not part of refund pairs)
+          for (const bet of userBets) {
+            // Skip if already processed as part of a refund pair
+            if (processedBetIds.has(bet.id)) continue;
+            
+            this.logger.log(
+              `[INDIVIDUAL FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
+              `Processing individual bet ${bet.id}`
+            );
+            
+            const stake = bet.amount ?? 0;
+            const betType = bet.betType?.toUpperCase() ?? '';
+            const winAmount = bet.winAmount ?? stake;
+            const lossAmount = bet.lossAmount ?? stake;
+            const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+            
+            if (isCancel) {
+              balanceDelta += liabilityAmount;
               liabilityDelta -= liabilityAmount;
-
-if (isWin) {
-
-  if (hasMultipleSameSide) {
-    // 🔥 SAME SIDE SPECIAL PATCH
-    balanceDelta += (stake + winAmount);
-  } else {
-    // Normal behaviour
-    balanceDelta += winAmount;
-  }
-
-}
-
-              // liabilityDelta -= liabilityAmount;
-              // balanceDelta += isWin ? (betType === 'BACK' || betType === 'YES' ? stake + winAmount : lossAmount + winAmount) : 0;
-  
-              this.logger.log(`[SINGLE BET ${isWin ? 'WIN' : 'LOSS'}] Bet ${bet.id}: type=${betType}, stake=${stake}, winAmount=${winAmount}, liabilityAmount=${liabilityAmount}, balance impact=${isWin ? (betType==='BACK'||betType==='YES'?stake+winAmount:lossAmount+winAmount) : 0}`);
-  
               await tx.bet.update({
                 where: { id: bet.id },
-                data: { status: isWin ? BetStatus.WON : BetStatus.LOST, pnl: isWin ? winAmount : -lossAmount, settledAt: new Date(), updatedAt: new Date() },
+                data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
               });
+              continue;
             }
-          } else {
-            this.logger.log(`[RANGE FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: GOLA detected, processing range-style bets (${userBets.length})`);
-            let netProfit = 0;
-  
-            for (const bet of userBets) {
-              const stake = bet.amount ?? 0;
-              const betType = bet.betType?.toUpperCase() ?? '';
-              const winAmount = bet.winAmount ?? stake;
-              const lossAmount = bet.lossAmount ?? stake;
-              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-              const line = Number(bet.betRate ?? bet.odds ?? 0);
-              console.log("DEBUG CHECK:", {
-                actualRuns: Number(actualRuns),
-                line: Number(line),
-                comparison: Number(actualRuns) >= Number(line)
-              });
-              const isWin =
-                betType === 'BACK' || betType === 'YES'
-                  ? actualRuns >= line
-                  : actualRuns < line;
-              
-              // const isWin = (betType === 'BACK' || betType === 'YES') ? (actualRuns >= (bet.betRate ?? bet.odds ?? 0)) : (actualRuns < (bet.betRate ?? bet.odds ?? 0));
-              netProfit += isWin ? winAmount : -lossAmount;
-              liabilityDelta -= liabilityAmount;
-  
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: { status: isWin ? BetStatus.WON : BetStatus.LOST, pnl: isWin ? winAmount : -lossAmount, settledAt: new Date(), updatedAt: new Date() },
-              });
+            
+            const line = Number(bet.betRate ?? bet.odds ?? 0);
+            const isWin = (betType === 'BACK' || betType === 'YES')
+              ? actualRuns >= line
+              : actualRuns < line;
+            
+            liabilityDelta -= liabilityAmount;
+            
+            // ✅ On win: add winAmount + stake for individual bets
+            // ✅ On loss: only release liability, do not increment balance
+            if (isWin) {
+              balanceDelta += winAmount + stake; // winAmount + stake
             }
-  
-            if (netProfit > 0) balanceDelta += netProfit;
+            // On loss: balanceDelta remains 0 (only liability released)
+            
+            await tx.bet.update({
+              where: { id: bet.id },
+              data: {
+                status: isWin ? BetStatus.WON : BetStatus.LOST,
+                pnl: isWin ? winAmount : -lossAmount,
+                settledAt: new Date(),
+                updatedAt: new Date()
+              }
+            });
           }
         }
   
@@ -3964,6 +4026,7 @@ if (isWin) {
       },
       select: {
         id: true,
+        userId: true,
         matchId: true,
         eventId: true,
         amount: true,
@@ -3979,6 +4042,7 @@ if (isWin) {
         betValue: true,
         winAmount: true,
         lossAmount: true,
+        isRangeConsumed: true,
         createdAt: true,
         match: {
           select: {
@@ -3995,6 +4059,191 @@ if (isWin) {
         createdAt: 'desc',
       },
     });
+
+    // ✅ STEP 1: Fetch refund transactions and match to exact bets that caused them
+    const refundMetadataByBetId = new Map<string, {
+      isRefunded: boolean;
+      refundTransactionId: string;
+    }>();
+
+    if (pendingBets.length > 0) {
+      // Get unique eventIds and marketIds from pending bets
+      const eventIds = [...new Set(pendingBets.map(b => b.eventId).filter(Boolean))];
+      const marketIds = [...new Set(pendingBets.map(b => b.marketId).filter(Boolean))];
+      const userIds = [...new Set(pendingBets.map(b => b.userId))];
+
+      // Fetch wallets for user lookup
+      const wallets = await this.prisma.wallet.findMany({
+        where: { userId: { in: userIds } },
+        select: { id: true, userId: true },
+      });
+      const walletIdMap = new Map(wallets.map(w => [w.userId, w.id]));
+
+      // Fetch refund transactions for these events and markets
+      const refundTransactions = await this.prisma.transaction.findMany({
+        where: {
+          walletId: { in: wallets.map(w => w.id) },
+          type: TransactionType.REFUND,
+          description: { contains: 'Fancy' },
+        },
+        select: { id: true, walletId: true, amount: true, description: true, createdAt: true },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      this.logger.log(
+        `[REFUND DETECTION] Found ${refundTransactions.length} refund transactions for ${pendingBets.length} pending bets`
+      );
+
+      // ✅ STEP 2: Match each refund to the exact two bets that caused it
+      for (const refund of refundTransactions) {
+        // Find wallet's userId
+        const wallet = wallets.find(w => w.id === refund.walletId);
+        if (!wallet) continue;
+
+        const refundUserId = wallet.userId;
+        const refundTime = new Date(refund.createdAt).getTime();
+        
+        // Try to extract eventId and marketId from description if available
+        let refundEventId: string | null = null;
+        let refundMarketId: string | null = null;
+        let refundSelectionId: number | null = null;
+        
+        if (refund.description) {
+          // Try to extract eventId
+          const eventIdMatch = refund.description.match(/event[_\s]?id[:\s]+([a-zA-Z0-9]+)/i);
+          if (eventIdMatch) {
+            refundEventId = eventIdMatch[1];
+          }
+          
+          // Try to extract marketId
+          const marketIdMatch = refund.description.match(/market[_\s]?id[:\s]+([a-zA-Z0-9]+)/i);
+          if (marketIdMatch) {
+            refundMarketId = marketIdMatch[1];
+          }
+          
+          // Try to extract selectionId
+          const selectionIdMatch = refund.description.match(/selection[_\s]?id[:\s]+(\d+)/i);
+          if (selectionIdMatch) {
+            refundSelectionId = parseInt(selectionIdMatch[1], 10);
+          }
+        }
+
+        // Find bets that match the refund criteria:
+        // 1. Same userId
+        // 2. Same eventId (if available in refund description)
+        // 3. Same marketId (if available in refund description)
+        // 4. Same selectionId (if available in refund description)
+        // 5. Created just before the refund (within 5 seconds)
+        // 6. isRangeConsumed = true (these are the bets that caused the refund)
+        const candidateBets = pendingBets.filter(bet => {
+          if (bet.userId !== refundUserId) return false;
+          // if (bet.isRangeConsumed !== true) return false;
+           
+          // Match eventId if available in refund
+          if (refundEventId && bet.eventId !== refundEventId) return false;
+          
+          // Match marketId if available in refund
+          if (refundMarketId && bet.marketId !== refundMarketId) return false;
+          
+          // Match selectionId if available in refund
+          if (refundSelectionId !== null && bet.selectionId !== refundSelectionId) return false;
+          
+          // Match by createdAt proximity (bets placed just before refund, within 5 seconds)
+          const betTime = new Date(bet.createdAt).getTime();
+          const timeDiff = Math.abs(refundTime - betTime);
+          if (timeDiff > 5000) return false; // 5 seconds threshold
+          
+          return true;
+        });
+
+        // Sort by createdAt to get the two most recent bets that match
+        candidateBets.sort((a, b) => 
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+        );
+
+        // Match the two bets that caused the refund (typically the last two bets with isRangeConsumed=true)
+        // When two bets fall into range, the second bet triggers the refund
+        const matchedBets = candidateBets.slice(0, 2).filter(bet => 
+          !refundMetadataByBetId.has(bet.id) // Don't match if already matched to another refund
+        );
+
+        if (matchedBets.length > 0) {
+          for (const bet of matchedBets) {
+            refundMetadataByBetId.set(bet.id, {
+              isRefunded: true,
+              refundTransactionId: refund.id,
+            });
+            
+            this.logger.log(
+              `[REFUND MATCH] Bet ${bet.id} (userId=${bet.userId}, eventId=${bet.eventId}, ` +
+              `marketId=${bet.marketId}, selectionId=${bet.selectionId}) matched to refund ${refund.id} ` +
+              `(amount: ${refund.amount}, timeDiff: ${Math.abs(new Date(refund.createdAt).getTime() - new Date(bet.createdAt).getTime())}ms)`
+            );
+          }
+        } else {
+          this.logger.debug(
+            `[REFUND NO MATCH] Refund ${refund.id} (userId=${refundUserId}, amount=${refund.amount}) ` +
+            `could not be matched to any bets. Candidate bets found: ${candidateBets.length}`
+          );
+        }
+      }
+
+      this.logger.log(
+        `[REFUND DETECTION COMPLETE] Matched ${refundMetadataByBetId.size} bets with refunds ` +
+        `out of ${pendingBets.length} total pending bets`
+      );
+
+      // ✅ STEP 3: Find the paired bet for each refunded bet
+      // When a refund occurs, two bets cause it - we need to mark both
+      for (const [betId, refundMetadata] of refundMetadataByBetId.entries()) {
+        if (!refundMetadata.isRefunded || !refundMetadata.refundTransactionId) continue;
+
+        // Find the refunded bet
+        const refundedBet = pendingBets.find(b => b.id === betId);
+        if (!refundedBet) continue;
+
+        // Find the second bet that caused the range consumption (the pair)
+        // Match criteria:
+        // - Same userId, eventId, marketId, selectionId
+        // - Different betType (one BACK, one LAY)
+        // - Not already matched to a refund
+        // - Created before the refunded bet
+        const pairedBet = pendingBets.find(bet =>
+          bet.userId === refundedBet.userId &&
+          bet.eventId === refundedBet.eventId &&
+          bet.marketId === refundedBet.marketId &&
+          bet.selectionId === refundedBet.selectionId &&
+          bet.betType !== refundedBet.betType &&
+          !refundMetadataByBetId.has(bet.id) &&
+          new Date(bet.createdAt) < new Date(refundedBet.createdAt)
+        );
+
+        if (pairedBet) {
+          // Mark the paired bet with the same refund metadata
+          refundMetadataByBetId.set(pairedBet.id, {
+            isRefunded: true,
+            refundTransactionId: refundMetadata.refundTransactionId,
+          });
+
+          this.logger.log(
+            `[REFUND PAIR MATCH] Found paired bet ${pairedBet.id} (${pairedBet.betType}) for refunded bet ${betId} (${refundedBet.betType}). ` +
+            `Both bets (userId=${refundedBet.userId}, eventId=${refundedBet.eventId}, ` +
+            `marketId=${refundedBet.marketId}, selectionId=${refundedBet.selectionId}) ` +
+            `marked with refundTransactionId=${refundMetadata.refundTransactionId}`
+          );
+        } else {
+          this.logger.debug(
+            `[REFUND PAIR NOT FOUND] Could not find paired bet for refunded bet ${betId}. ` +
+            `This refund may have been caused by a single bet or the pair was already settled.`
+          );
+        }
+      }
+
+      this.logger.log(
+        `[REFUND PAIRING COMPLETE] Total bets marked with refunds: ${refundMetadataByBetId.size} ` +
+        `(including paired bets)`
+      );
+    }
 
     // Group by matchId (since eventId might be null)
     const matchMap = new Map<
@@ -4050,6 +4299,9 @@ if (isWin) {
         }
       }
 
+      // Get refund metadata if this bet was matched to a refund
+      const refundMetadata = refundMetadataByBetId.get(bet.id);
+
       matchData.fancy.bets.push({
         id: bet.id,
         amount: bet.amount,
@@ -4064,6 +4316,9 @@ if (isWin) {
         betValue: bet.betValue,
         winAmount: bet.winAmount,
         lossAmount: bet.lossAmount,
+        // isRangeConsumed: bet.isRangeConsumed,
+        isRefunded: refundMetadata?.isRefunded || false,
+        refundTransactionId: refundMetadata?.refundTransactionId || null,
         createdAt: bet.createdAt,
       });
     }
