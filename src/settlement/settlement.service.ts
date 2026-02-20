@@ -823,18 +823,44 @@ export class SettlementService {
                 `Processing refund pair: bet ${bet.id} + bet ${pairedBet.id}`
               );
               
-              // Calculate range from both bets
+              // ✅ REFUND PAIR SETTLEMENT: Both bets win/lose together based on GOLA ZONE
+              // Gola zone = [minLine, maxLine) where minLine is BACK line, maxLine is NO line
+              // - If actualRuns is IN gola zone: BOTH WIN, credit both winAmounts
+              // - If actualRuns is OUTSIDE gola zone: BOTH LOSE, NO credit
               const bet1Line = Number(bet.betRate ?? bet.odds ?? 0);
               const bet2Line = Number(pairedBet.betRate ?? pairedBet.odds ?? 0);
-              const minLine = Math.min(bet1Line, bet2Line);
-              const maxLine = Math.max(bet1Line, bet2Line);
+              const bet1Type = bet.betType?.toUpperCase() ?? '';
+              const bet2Type = pairedBet.betType?.toUpperCase() ?? '';
               
-              // Check if actualRuns falls within the range
-              const isRangeHit = actualRuns >= minLine && actualRuns <= maxLine;
+              // Determine which bet is BACK and which is NO
+              const isbet1Back = (bet1Type === 'BACK' || bet1Type === 'YES');
+              const isbet2Back = (bet2Type === 'BACK' || bet2Type === 'YES');
+              
+              // Calculate gola range: minLine (BACK line) to maxLine (NO line)
+              // Gola zone is where BOTH bets win
+              let minLine: number, maxLine: number;
+              if (isbet1Back && !isbet2Back) {
+                // bet1 is BACK, bet2 is NO
+                minLine = bet1Line;
+                maxLine = bet2Line;
+              } else if (!isbet1Back && isbet2Back) {
+                // bet1 is NO, bet2 is BACK
+                minLine = bet2Line;
+                maxLine = bet1Line;
+              } else {
+                // Both same type - use min/max
+                minLine = Math.min(bet1Line, bet2Line);
+                maxLine = Math.max(bet1Line, bet2Line);
+              }
+              
+              // ✅ GOLA ZONE CHECK: actualRuns >= minLine AND actualRuns < maxLine
+              // Score must be >= BACK line AND < NO line (strictly less than, NOT equal)
+              const isGolaHit = actualRuns >= minLine && actualRuns < maxLine;
               
               this.logger.log(
-                `[REFUND PAIR RANGE] User ${userId}, Settlement ${settlementId}: ` +
-                `Range: ${minLine} to ${maxLine}, actualRuns=${actualRuns}, isRangeHit=${isRangeHit}, isCancel=${isCancel}`
+                `[REFUND PAIR GOLA CHECK] User ${userId}, Settlement ${settlementId}: ` +
+                `Bet1 (${bet1Type} @ ${bet1Line}), Bet2 (${bet2Type} @ ${bet2Line}), ` +
+                `Gola Zone: [${minLine}, ${maxLine}), actualRuns=${actualRuns}, isGolaHit=${isGolaHit}, isCancel=${isCancel}`
               );
               
               if (isCancel) {
@@ -850,16 +876,15 @@ export class SettlementService {
                 continue;
               }
               
-              if (isRangeHit) {
-                // ✅ RANGE HIT: Both bets WON
-                // Credit winAmount for BOTH bets
-                const bet1WinAmount = bet.winAmount ?? bet.amount ?? 0;
-                const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
-                const totalWinAmount = bet1WinAmount + bet2WinAmount;
+              const bet1WinAmount = bet.winAmount ?? bet.amount ?? 0;
+              const bet1LossAmount = bet.lossAmount ?? bet.amount ?? 0;
+              const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
+              const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
+              
+              if (isGolaHit) {
+                // ✅ GOLA HIT: BOTH bets WIN, credit both winAmounts
+                balanceDelta += bet1WinAmount + bet2WinAmount;
                 
-                balanceDelta += totalWinAmount;
-                
-                // Update both bets as WON
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
@@ -880,16 +905,11 @@ export class SettlementService {
                 });
                 
                 this.logger.log(
-                  `[REFUND PAIR WON] User ${userId}, Settlement ${settlementId}: ` +
-                  `Both bets WON, totalWinAmount=${totalWinAmount}`
+                  `[REFUND PAIR GOLA WIN] User ${userId}, Settlement ${settlementId}: ` +
+                  `BOTH bets WON (gola hit), totalWinAmount=${bet1WinAmount + bet2WinAmount}, balanceDelta=${balanceDelta}`
                 );
               } else {
-                // ✅ RANGE MISS: Both bets LOST
-                // Do NOT credit anything (liability was already released at placement)
-                const bet1LossAmount = bet.lossAmount ?? bet.amount ?? 0;
-                const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
-                
-                // Update both bets as LOST
+                // ✅ GOLA MISS: BOTH bets LOSE, NO credit to wallet
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
@@ -910,8 +930,8 @@ export class SettlementService {
                 });
                 
                 this.logger.log(
-                  `[REFUND PAIR LOST] User ${userId}, Settlement ${settlementId}: ` +
-                  `Both bets LOST, no balance credit (liability already released)`
+                  `[REFUND PAIR GOLA MISS] User ${userId}, Settlement ${settlementId}: ` +
+                  `BOTH bets LOST (gola miss), NO balance credit, actualRuns=${actualRuns} is outside [${minLine}, ${maxLine})`
                 );
               }
               

@@ -8,3 +8,4 @@ ALTER TABLE "bets" ADD COLUMN "refund_amount" DOUBLE PRECISION;
 ALTER TABLE "bets" ADD COLUMN "refunded_by_bet_id" TEXT;
 
 
+

@@ -6,3 +6,4 @@ AND (column_name LIKE '%range%' OR column_name LIKE '%Range%' OR column_name LIK
 ORDER BY column_name;
 
 
+
