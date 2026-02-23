@@ -22,29 +22,32 @@ export class CricketIdController {
    * Get all competitions/series for a specific sport
    * GET /cricketid/series?sportId=4
    * Returns list of competitions with competition.id, competition.name, etc.
-   * @param sportId - Sport ID (4 for cricket)
+   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
+   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
   @Get('series')
-  getSeriesList(@Query('sportId') sportId: number) {
-    return this.cricketIdService.getSeriesList(sportId);
+  getSeriesList(@Query('sportId') sportId?: number) {
+    // Default to 4 (Cricket) for backward compatibility
+    const normalizedSportId = sportId ? Number(sportId) : 4;
+    return this.cricketIdService.getSeriesList(normalizedSportId);
   }
 
   /**
    * Get match details by competition ID
    * GET /cricketid/matches?sportId=4&competitionId={competitionId}
    * Example: GET /cricketid/matches?sportId=4&competitionId=9992899
+   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
    * @param competitionId - Competition ID from the series list (e.g., "9992899")
-   * @param sportId - Sport ID (default: 4 for cricket)
+   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
   @Get('matches')
   getMatchDetails(
     @Query('competitionId') competitionId: string | number,
     @Query('sportId') sportId?: number,
   ) {
-    return this.cricketIdService.getMatchDetails(
-      competitionId,
-      sportId ? Number(sportId) : 4,
-    );
+    // Default to 4 (Cricket) for backward compatibility
+    const normalizedSportId = sportId ? Number(sportId) : 4;
+    return this.cricketIdService.getMatchDetails(competitionId, normalizedSportId);
   }
 
   /**

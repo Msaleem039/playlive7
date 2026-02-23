@@ -5,10 +5,19 @@ import { AggregatorService } from './aggregator.service';
 export class AggregatorController {
   constructor(private service: AggregatorService) {}
 
-  // GET /cricketid/aggregator/cricket
+  // GET /cricketid/aggregator/cricket (backward compatible, defaults to sportId=4)
   @Get('cricket')
   async getCricketMatches() {
-    return this.service.getAllCricketMatches();
+    return this.service.getAllCricketMatches('4');
+  }
+
+  // GET /cricketid/aggregator/matches?sportId=4 (generic endpoint for all sports)
+  // ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
+  @Get('matches')
+  async getMatches(@Query('sportId') sportId?: string | number) {
+    // Default to 4 (Cricket) for backward compatibility
+    const normalizedSportId = sportId ? String(sportId) : '4';
+    return this.service.getAllCricketMatches(normalizedSportId);
   }
 
   // GET /cricketid/aggregator/match/35044997

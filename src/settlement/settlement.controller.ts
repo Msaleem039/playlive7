@@ -42,4 +42,23 @@ export class SettlementController {
   ) {
     return this.settlementService.getUserBets(user.id, status);
   }
+
+  /**
+   * Get settlement results for the current user
+   * GET /settlement/results
+   * Returns all settled bets (WON, LOST, CANCELLED) with settlement details
+   */
+  @Get('results')
+  async getMySettlementResults(@CurrentUser() user: User) {
+    const result = await this.settlementService.getUserSettledBets(user.id);
+    // Ensure response always has the expected structure
+    return {
+      success: result.success ?? true,
+      data: result.data ?? [],
+      count: result.count ?? 0,
+      message: result.count === 0 
+        ? 'No settled bets found. Bets will appear here once they are settled (WON, LOST, or CANCELLED).'
+        : `Found ${result.count} settled bet(s)`,
+    };
+  }
 }

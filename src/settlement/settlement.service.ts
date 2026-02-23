@@ -678,7 +678,7 @@ export class SettlementService {
     betIds?: string[],
   ) {
     const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
-  
+    this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement for event=${eventId}, selection=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds?.join(',') || 'all'}`);
     this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement: settlementId=${settlementId}, eventId=${eventId}, selectionId=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds ? betIds.join(',') : 'all'}`);
   
     // 1️⃣ Fetch pending bets (new + legacy)
@@ -802,25 +802,86 @@ export class SettlementService {
         let liabilityDelta = 0;
   
         for (const [marketKey, userBets] of userMarkets.entries()) {
+          this.logger.log(
+            `[GOLA RANGE FANCY] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+            `Processing ${userBets.length} bets for gola/range fancy settlement`
+          );
+
+          // Step: Identify refund bets
+          const refundBets = userBets.filter(b => b.isRefunded && b.refundedByBetId !== null);
+
+          this.logger.log(
+            `[GOLA DEBUG] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+            `Refund bets found=${refundBets.length}, all user bets=${userBets.length}`
+          );
+
+          this.logger.log(
+            `[GOLA RANGE FANCY] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+            `Found ${refundBets.length} refund bets (isRefunded=true, refundedByBetId != null)`
+          );
+
+          // Step: Only pick two closest bets to actual score for gola
+          let golaPair: [typeof userBets[0], typeof userBets[0]] | null = null;
+
+          if (refundBets.length >= 2) {
+            // Sort by distance to actualRuns
+            const sortedBets = refundBets.sort((a, b) => Math.abs(Number(a.betRate ?? a.odds ?? 0) - actualRuns) - Math.abs(Number(b.betRate ?? b.odds ?? 0) - actualRuns));
+            
+            // Pick closest YES and closest NO (or first two if same type)
+            golaPair = [sortedBets[0], sortedBets[1]];
+            
+            this.logger.log(
+              `[GOLA PAIR SELECTED] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+              `Selected gola pair from ${refundBets.length} refund bets - ` +
+              `Bet1: id=${golaPair[0].id}, type=${golaPair[0].betType}, line=${golaPair[0].betRate ?? golaPair[0].odds}, distance=${Math.abs(Number(golaPair[0].betRate ?? golaPair[0].odds ?? 0) - actualRuns)}, ` +
+              `Bet2: id=${golaPair[1].id}, type=${golaPair[1].betType}, line=${golaPair[1].betRate ?? golaPair[1].odds}, distance=${Math.abs(Number(golaPair[1].betRate ?? golaPair[1].odds ?? 0) - actualRuns)}, ` +
+              `actualRuns=${actualRuns}`
+            );
+          } else if (refundBets.length > 0) {
+            this.logger.log(
+              `[GOLA PAIR INSUFFICIENT] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+              `Only ${refundBets.length} refund bet(s) found, need at least 2 for gola pair. Skipping gola settlement.`
+            );
+          }
+
           // ✅ Process refund pairs first
           for (const bet of userBets) {
-            // Skip if already processed
+            // Skip if already processe
             if (processedBetIds.has(bet.id)) continue;
             
             // Check if this bet is part of a refund pair
             const isRefundedBet = bet.isRefunded === true && bet.refundedByBetId !== null;
             
+            // If we have a gola pair, only process those two bets
+            if (golaPair && isRefundedBet) {
+              if (bet.id !== golaPair[0].id && bet.id !== golaPair[1].id) {
+                continue; // Skip other refund bets if we have a gola pair
+              }
+            }
+            
             if (isRefundedBet && refundPairMap.has(bet.id)) {
               const pairedBet = refundPairMap.get(bet.id);
               if (!pairedBet) continue;
+              
+              // If we have a gola pair, only process if this bet is part of it
+              if (golaPair) {
+                const isInGolaPair = bet.id === golaPair[0].id || bet.id === golaPair[1].id || 
+                                    pairedBet.id === golaPair[0].id || pairedBet.id === golaPair[1].id;
+                if (!isInGolaPair) {
+                  continue;
+                }
+              }
               
               // Mark both bets as processed
               processedBetIds.add(bet.id);
               processedBetIds.add(pairedBet.id);
               
               this.logger.log(
-                `[REFUND PAIR SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
-                `Processing refund pair: bet ${bet.id} + bet ${pairedBet.id}`
+                `[GOLA REFUND PAIR] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                `Processing refund pair - Bet1: id=${bet.id}, type=${bet.betType}, line=${bet.betRate ?? bet.odds}, ` +
+                `amount=${bet.amount}, winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
+                `Bet2: id=${pairedBet.id}, type=${pairedBet.betType}, line=${pairedBet.betRate ?? pairedBet.odds}, ` +
+                `amount=${pairedBet.amount}, winAmount=${pairedBet.winAmount}, lossAmount=${pairedBet.lossAmount}`
               );
               
               // ✅ REFUND PAIR SETTLEMENT: Both bets win/lose together based on GOLA ZONE
@@ -858,9 +919,11 @@ export class SettlementService {
               const isGolaHit = actualRuns >= minLine && actualRuns < maxLine;
               
               this.logger.log(
-                `[REFUND PAIR GOLA CHECK] User ${userId}, Settlement ${settlementId}: ` +
-                `Bet1 (${bet1Type} @ ${bet1Line}), Bet2 (${bet2Type} @ ${bet2Line}), ` +
-                `Gola Zone: [${minLine}, ${maxLine}), actualRuns=${actualRuns}, isGolaHit=${isGolaHit}, isCancel=${isCancel}`
+                `[GOLA ZONE EVALUATION] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                `Bet1: ${bet1Type} @ ${bet1Line}, Bet2: ${bet2Type} @ ${bet2Line}, ` +
+                `Gola Zone: [${minLine}, ${maxLine}) [minLine inclusive, maxLine exclusive], ` +
+                `actualRuns=${actualRuns}, Condition: ${actualRuns} >= ${minLine} && ${actualRuns} < ${maxLine} = ${isGolaHit}, ` +
+                `isCancel=${isCancel}`
               );
               
               if (isCancel) {
@@ -881,9 +944,24 @@ export class SettlementService {
               const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
               const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
               
+              this.logger.log(
+                `[GOLA AMOUNTS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                `Bet1: winAmount=${bet1WinAmount}, lossAmount=${bet1LossAmount}, ` +
+                `Bet2: winAmount=${bet2WinAmount}, lossAmount=${bet2LossAmount}, ` +
+                `Total winAmount=${bet1WinAmount + bet2WinAmount}, ` +
+                `isGolaHit=${isGolaHit}, balanceDelta before=${balanceDelta}`
+              );
+              
               if (isGolaHit) {
                 // ✅ GOLA HIT: BOTH bets WIN, credit both winAmounts
+                const previousBalanceDelta = balanceDelta;
                 balanceDelta += bet1WinAmount + bet2WinAmount;
+                
+                this.logger.log(
+                  `[GOLA HIT - UPDATING BETS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                  `Marking both bets as WON - Bet1: id=${bet.id}, pnl=${bet1WinAmount}, ` +
+                  `Bet2: id=${pairedBet.id}, pnl=${bet2WinAmount}`
+                );
                 
                 await tx.bet.update({
                   where: { id: bet.id },
@@ -894,6 +972,7 @@ export class SettlementService {
                     updatedAt: new Date()
                   }
                 });
+                
                 await tx.bet.update({
                   where: { id: pairedBet.id },
                   data: {
@@ -905,11 +984,20 @@ export class SettlementService {
                 });
                 
                 this.logger.log(
-                  `[REFUND PAIR GOLA WIN] User ${userId}, Settlement ${settlementId}: ` +
-                  `BOTH bets WON (gola hit), totalWinAmount=${bet1WinAmount + bet2WinAmount}, balanceDelta=${balanceDelta}`
+                  `[GOLA HIT - SUCCESS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                  `BOTH bets WON (gola hit), ` +
+                  `Bet1 winAmount=${bet1WinAmount}, Bet2 winAmount=${bet2WinAmount}, ` +
+                  `Total winAmount=${bet1WinAmount + bet2WinAmount}, ` +
+                  `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${bet1WinAmount + bet2WinAmount})`
                 );
               } else {
                 // ✅ GOLA MISS: BOTH bets LOSE, NO credit to wallet
+                this.logger.log(
+                  `[GOLA MISS - UPDATING BETS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                  `Marking both bets as LOST - Bet1: id=${bet.id}, pnl=-${bet1LossAmount}, ` +
+                  `Bet2: id=${pairedBet.id}, pnl=-${bet2LossAmount}`
+                );
+                
                 await tx.bet.update({
                   where: { id: bet.id },
                   data: {
@@ -919,6 +1007,7 @@ export class SettlementService {
                     updatedAt: new Date()
                   }
                 });
+                
                 await tx.bet.update({
                   where: { id: pairedBet.id },
                   data: {
@@ -930,16 +1019,33 @@ export class SettlementService {
                 });
                 
                 this.logger.log(
-                  `[REFUND PAIR GOLA MISS] User ${userId}, Settlement ${settlementId}: ` +
-                  `BOTH bets LOST (gola miss), NO balance credit, actualRuns=${actualRuns} is outside [${minLine}, ${maxLine})`
+                  `[GOLA MISS - SUCCESS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                  `BOTH bets LOST (gola miss), ` +
+                  `Bet1 lossAmount=${bet1LossAmount}, Bet2 lossAmount=${bet2LossAmount}, ` +
+                  `NO balance credit (balanceDelta remains ${balanceDelta}), ` +
+                  `actualRuns=${actualRuns} is outside gola zone [${minLine}, ${maxLine})`
                 );
               }
               
               // ✅ IMPORTANT: Do NOT adjust liability for refund pairs
               // Liability was already released at placement time
+              this.logger.log(
+                `[GOLA REFUND PAIR COMPLETE] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+                `Refund pair settlement completed - Bet1: ${bet.id}, Bet2: ${pairedBet.id}, ` +
+                `isGolaHit=${isGolaHit}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta} (no liability change for refund pairs)`
+              );
               continue;
             }
           }
+
+          this.logger.log(
+            `[GOLA RANGE FANCY COMPLETE] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+            `Gola/range fancy processing completed - ` +
+            `Total refund bets found=${refundBets.length}, ` +
+            `Gola pair selected=${golaPair ? 'YES' : 'NO'}, ` +
+            `Processed refund pairs=${processedBetIds.size / 2}, ` +
+            `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+          );
 
           // ✅ Handle individual bets (not part of refund pairs)
           for (const bet of userBets) {
@@ -981,15 +1087,29 @@ export class SettlementService {
             }
             // On loss: balanceDelta remains 0 (only liability released)
             
+            const finalStatus = isWin ? BetStatus.WON : BetStatus.LOST;
+            const finalPnl = isWin ? winAmount : -lossAmount;
+            
+            this.logger.log(
+              `[INDIVIDUAL BET UPDATE] User ${userId}, Bet ${bet.id}, Settlement ${settlementId}: ` +
+              `Updating bet status to ${finalStatus}, pnl=${finalPnl}, ` +
+              `isWin=${isWin}, line=${line}, actualRuns=${actualRuns}, betType=${betType}`
+            );
+            
             await tx.bet.update({
               where: { id: bet.id },
               data: {
-                status: isWin ? BetStatus.WON : BetStatus.LOST,
-                pnl: isWin ? winAmount : -lossAmount,
+                status: finalStatus,
+                pnl: finalPnl,
                 settledAt: new Date(),
                 updatedAt: new Date()
               }
             });
+            
+            this.logger.log(
+              `[INDIVIDUAL BET UPDATED] User ${userId}, Bet ${bet.id}, Settlement ${settlementId}: ` +
+              `Bet status successfully updated to ${finalStatus}`
+            );
           }
         }
   
@@ -1019,7 +1139,7 @@ export class SettlementService {
   
     return { success: true, message: 'Fancy bets settled successfully' };
   }
-  
+
   
   /**
    * ✅ MATCH ODDS EXPOSURE CALCULATION (MARKET-SPECIFIC)
@@ -3828,7 +3948,35 @@ export class SettlementService {
       ? ([status] as BetStatus[])
       : [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED];
 
-    // OPTIMIZED: Use select instead of include
+    this.logger.log(
+      `[GET USER SETTLED BETS] userId=${userId}, statusFilter=${statusFilter.join(',')}`
+    );
+
+    // Debug: Check total bets for this user
+    const totalBetsCount = await this.prisma.bet.count({
+      where: { userId },
+    });
+    const pendingBetsCount = await this.prisma.bet.count({
+      where: { userId, status: BetStatus.PENDING },
+    });
+    const wonBetsCount = await this.prisma.bet.count({
+      where: { userId, status: BetStatus.WON },
+    });
+    const lostBetsCount = await this.prisma.bet.count({
+      where: { userId, status: BetStatus.LOST },
+    });
+    const cancelledBetsCount = await this.prisma.bet.count({
+      where: { userId, status: BetStatus.CANCELLED },
+    });
+
+    this.logger.log(
+      `[GET USER SETTLED BETS DEBUG] userId=${userId}: ` +
+      `Total bets=${totalBetsCount}, PENDING=${pendingBetsCount}, ` +
+      `WON=${wonBetsCount}, LOST=${lostBetsCount}, CANCELLED=${cancelledBetsCount}`
+    );
+
+    // Query ALL settled bets - match the structure of getUserBetHistory
+    // This ensures we get all WON, LOST, or CANCELLED bets with the same fields
     const bets = await this.prisma.bet.findMany({
       where: {
         userId,
@@ -3836,19 +3984,39 @@ export class SettlementService {
           in: statusFilter,
         },
       },
+      // Match the exact structure from getUserBetHistory to ensure consistency
       select: {
         id: true,
+        userId: true,
         matchId: true,
         amount: true,
+        betValue: true,
         odds: true,
+        betRate: true,
         betType: true,
         betName: true,
         marketName: true,
         marketType: true,
+        gtype: true,
+        marketId: true,
+        eventId: true,
+        selectionId: true,
         status: true,
         pnl: true,
+        winAmount: true,
+        lossAmount: true,
+        settlementId: true,
         settledAt: true,
         createdAt: true,
+        updatedAt: true,
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            email: true,
+          },
+        },
         match: {
           select: {
             id: true,
@@ -3861,10 +4029,37 @@ export class SettlementService {
           },
         },
       },
+      // Order by createdAt to match getUserBetHistory
       orderBy: {
-        settledAt: 'desc',
+        createdAt: 'desc',
       },
     });
+
+    this.logger.log(
+      `[GET USER SETTLED BETS RESULT] userId=${userId}: ` +
+      `Query returned ${bets.length} bets. ` +
+      `Status breakdown: WON=${bets.filter(b => b.status === BetStatus.WON).length}, ` +
+      `LOST=${bets.filter(b => b.status === BetStatus.LOST).length}, ` +
+      `CANCELLED=${bets.filter(b => b.status === BetStatus.CANCELLED).length}`
+    );
+
+    // Sort by settledAt if available, otherwise use updatedAt
+    bets.sort((a, b) => {
+      if (a.settledAt && b.settledAt) {
+        return b.settledAt.getTime() - a.settledAt.getTime();
+      }
+      if (a.settledAt) return -1;
+      if (b.settledAt) return 1;
+      // Fallback to updatedAt
+      if (a.updatedAt && b.updatedAt) {
+        return b.updatedAt.getTime() - a.updatedAt.getTime();
+      }
+      return 0;
+    });
+
+    this.logger.log(
+      `[GET USER SETTLED BETS] Found ${bets.length} settled bets for userId=${userId}`
+    );
 
     return {
       success: true,
@@ -6328,6 +6523,13 @@ export class SettlementService {
     limit?: number;
     offset?: number;
   }) {
+    this.logger.log(
+      `[GET ALL SETTLEMENTS] Filters: eventId=${filters?.eventId}, ` +
+      `marketType=${filters?.marketType}, isRollback=${filters?.isRollback}, ` +
+      `settledBy=${filters?.settledBy}, startDate=${filters?.startDate}, ` +
+      `endDate=${filters?.endDate}, limit=${filters?.limit}, offset=${filters?.offset}`
+    );
+
     const where: any = {};
 
     if (filters?.eventId) {
@@ -6349,12 +6551,30 @@ export class SettlementService {
     if (filters?.startDate || filters?.endDate) {
       where.createdAt = {};
       if (filters.startDate) {
-        where.createdAt.gte = filters.startDate;
+        // Ensure date is valid
+        const startDate = new Date(filters.startDate);
+        if (isNaN(startDate.getTime())) {
+          this.logger.warn(`Invalid startDate: ${filters.startDate}`);
+        } else {
+          where.createdAt.gte = startDate;
+          this.logger.log(`[GET ALL SETTLEMENTS] Filtering by startDate: ${startDate.toISOString()}`);
+        }
       }
       if (filters.endDate) {
-        where.createdAt.lte = filters.endDate;
+        // Ensure date is valid
+        const endDate = new Date(filters.endDate);
+        if (isNaN(endDate.getTime())) {
+          this.logger.warn(`Invalid endDate: ${filters.endDate}`);
+        } else {
+          where.createdAt.lte = endDate;
+          this.logger.log(`[GET ALL SETTLEMENTS] Filtering by endDate: ${endDate.toISOString()}`);
+        }
       }
     }
+
+    // Debug: Check total settlements before filtering
+    const totalSettlementsCount = await this.prisma.settlement.count({});
+    this.logger.log(`[GET ALL SETTLEMENTS] Total settlements in database: ${totalSettlementsCount}`);
 
     const settlements = await this.prisma.settlement.findMany({
       where,
@@ -6365,8 +6585,19 @@ export class SettlementService {
       skip: filters?.offset || 0,
     });
 
+    this.logger.log(
+      `[GET ALL SETTLEMENTS] Found ${settlements.length} settlements matching filters. ` +
+      `Where clause: ${JSON.stringify(where)}`
+    );
+
     // OPTIMIZED: Batch fetch all bets for all settlements in a single query
     const settlementIds = settlements.map((s) => s.settlementId);
+    
+    this.logger.log(
+      `[GET ALL SETTLEMENTS] Fetching bets for ${settlementIds.length} settlement IDs: ${settlementIds.slice(0, 5).join(', ')}${settlementIds.length > 5 ? '...' : ''}`
+    );
+    
+    // First, try to find bets by settlementId
     const allBetsRaw = settlementIds.length > 0
       ? await this.prisma.bet.findMany({
           where: {
@@ -6385,6 +6616,9 @@ export class SettlementService {
             settledAt: true,
             rollbackAt: true,
             createdAt: true,
+            eventId: true,
+            marketId: true,
+            selectionId: true,
             match: {
               select: {
                 id: true,
@@ -6397,6 +6631,215 @@ export class SettlementService {
           },
         })
       : [];
+
+    this.logger.log(
+      `[GET ALL SETTLEMENTS] Found ${allBetsRaw.length} bets with matching settlementId. ` +
+      `Settlement IDs searched: ${settlementIds.length}`
+    );
+
+    // If no bets found by settlementId, try to find by eventId and marketId/selectionId
+    // This handles cases where settlementId might not be set on bets
+    if (allBetsRaw.length === 0 && settlements.length > 0) {
+      this.logger.log(
+        `[GET ALL SETTLEMENTS] No bets found by settlementId. Trying to find bets by eventId and marketId/selectionId...`
+      );
+      
+      // Separate settlements by type: FANCY uses selectionId, others use marketId
+      const fancySettlements: Array<{ settlementId: string; eventId: string; selectionId: string }> = [];
+      const marketSettlements: Array<{ settlementId: string; eventId: string; marketId: string }> = [];
+      
+      for (const settlement of settlements) {
+        if (settlement.settlementId?.startsWith('CRICKET:FANCY:')) {
+          // Parse FANCY settlement: CRICKET:FANCY:eventId:selectionId
+          const parts = settlement.settlementId.split(':');
+          if (parts.length === 4 && settlement.eventId) {
+            const selectionId = parts[3];
+            fancySettlements.push({
+              settlementId: settlement.settlementId,
+              eventId: settlement.eventId,
+              selectionId,
+            });
+          }
+        } else if (settlement.eventId && settlement.marketId) {
+          // MATCH_ODDS, BOOKMAKER, TIED_MATCH use marketId
+          marketSettlements.push({
+            settlementId: settlement.settlementId,
+            eventId: settlement.eventId,
+            marketId: settlement.marketId,
+          });
+        }
+      }
+      
+      this.logger.log(
+        `[GET ALL SETTLEMENTS] Found ${fancySettlements.length} FANCY settlements and ${marketSettlements.length} market-based settlements`
+      );
+      
+      // Handle FANCY settlements (match by eventId + selectionId)
+      if (fancySettlements.length > 0) {
+        const fancyOrConditions = fancySettlements.map(({ eventId, selectionId }) => ({
+          AND: [
+            { eventId },
+            { selectionId: Number(selectionId) },
+            {
+              status: {
+                in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+              },
+            },
+          ],
+        }));
+
+        const fancyBets = await this.prisma.bet.findMany({
+          where: {
+            OR: fancyOrConditions,
+          },
+          select: {
+            id: true,
+            userId: true,
+            settlementId: true,
+            amount: true,
+            odds: true,
+            betType: true,
+            betName: true,
+            status: true,
+            pnl: true,
+            settledAt: true,
+            rollbackAt: true,
+            createdAt: true,
+            eventId: true,
+            marketId: true,
+            selectionId: true,
+            match: {
+              select: {
+                id: true,
+                homeTeam: true,
+                awayTeam: true,
+                eventName: true,
+                eventId: true,
+              },
+            },
+          },
+        });
+
+        this.logger.log(
+          `[GET ALL SETTLEMENTS] Found ${fancyBets.length} FANCY bets by eventId/selectionId`
+        );
+
+        // Map FANCY bets to their settlements
+        for (const bet of fancyBets) {
+          if (bet.eventId && bet.selectionId) {
+            for (const { settlementId, eventId, selectionId } of fancySettlements) {
+              if (bet.eventId === eventId && String(bet.selectionId) === selectionId) {
+                if (!allBetsRaw.find(b => b.id === bet.id)) {
+                  const betWithSettlementId = {
+                    ...bet,
+                    settlementId: settlementId,
+                  };
+                  allBetsRaw.push(betWithSettlementId);
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // Build a map of eventId -> marketId for market-based settlements
+      const settlementMap = new Map<string, { eventId: string; marketId: string }>();
+      for (const settlement of marketSettlements) {
+        settlementMap.set(settlement.settlementId, {
+          eventId: settlement.eventId,
+          marketId: settlement.marketId,
+        });
+      }
+
+      // Find bets that match eventId and marketId, and have been settled (WON, LOST, CANCELLED)
+      const eventMarketPairs = Array.from(settlementMap.values());
+      if (eventMarketPairs.length > 0) {
+        // Build OR conditions for each eventId/marketId pair
+        const orConditions = eventMarketPairs.map(({ eventId, marketId }) => ({
+          AND: [
+            { eventId },
+            { marketId },
+            {
+              status: {
+                in: [BetStatus.WON, BetStatus.LOST, BetStatus.CANCELLED],
+              },
+            },
+          ],
+        }));
+
+        const betsByEventMarket = await this.prisma.bet.findMany({
+          where: {
+            OR: orConditions,
+          },
+          select: {
+            id: true,
+            userId: true,
+            settlementId: true,
+            amount: true,
+            odds: true,
+            betType: true,
+            betName: true,
+            status: true,
+            pnl: true,
+            settledAt: true,
+            rollbackAt: true,
+            createdAt: true,
+            eventId: true,
+            marketId: true,
+            selectionId: true,
+            match: {
+              select: {
+                id: true,
+                homeTeam: true,
+                awayTeam: true,
+                eventName: true,
+                eventId: true,
+              },
+            },
+          },
+        });
+
+        this.logger.log(
+          `[GET ALL SETTLEMENTS] Found ${betsByEventMarket.length} bets by eventId/marketId matching`
+        );
+
+        // Map these bets to their settlements and assign settlementId
+        let matchedBetsCount = 0;
+        for (const bet of betsByEventMarket) {
+          if (bet.eventId && bet.marketId) {
+            let matched = false;
+            for (const [settlementId, { eventId, marketId }] of settlementMap.entries()) {
+              if (bet.eventId === eventId && bet.marketId === marketId) {
+                // Add to allBetsRaw if not already there, and assign settlementId
+                if (!allBetsRaw.find(b => b.id === bet.id)) {
+                  // Assign settlementId to the bet for proper grouping
+                  const betWithSettlementId = {
+                    ...bet,
+                    settlementId: settlementId, // Assign the settlementId
+                  };
+                  allBetsRaw.push(betWithSettlementId);
+                  matchedBetsCount++;
+                  matched = true;
+                }
+                break; // Match to first settlement found
+              }
+            }
+            if (!matched) {
+              this.logger.warn(
+                `[GET ALL SETTLEMENTS] Bet ${bet.id} (eventId=${bet.eventId}, marketId=${bet.marketId}) ` +
+                `could not be matched to any settlement`
+              );
+            }
+          }
+        }
+        
+        this.logger.log(
+          `[GET ALL SETTLEMENTS] Matched ${matchedBetsCount} bets to settlements. ` +
+          `Total bets in allBetsRaw: ${allBetsRaw.length}`
+        );
+      }
+    }
 
     // Fetch users separately to handle missing users gracefully
     const userIds = [...new Set(allBetsRaw.map(b => b.userId).filter((id): id is string => id !== null))];
@@ -6427,8 +6870,52 @@ export class SettlementService {
           betsBySettlementId.set(bet.settlementId, []);
         }
         betsBySettlementId.get(bet.settlementId)!.push(bet);
+      } else {
+        // If bet doesn't have settlementId, try to match by eventId and marketId/selectionId
+        if (bet.eventId) {
+          let matched = false;
+          
+          // First try FANCY settlements (match by eventId + selectionId)
+          const betSelectionId = (bet as any).selectionId;
+          if (betSelectionId !== null && betSelectionId !== undefined) {
+            for (const settlement of settlements) {
+              if (settlement.settlementId?.startsWith('CRICKET:FANCY:')) {
+                const parts = settlement.settlementId.split(':');
+                if (parts.length === 4 && settlement.eventId === bet.eventId) {
+                  const settlementSelectionId = parts[3];
+                  if (String(betSelectionId) === settlementSelectionId) {
+                    if (!betsBySettlementId.has(settlement.settlementId)) {
+                      betsBySettlementId.set(settlement.settlementId, []);
+                    }
+                    betsBySettlementId.get(settlement.settlementId)!.push(bet);
+                    matched = true;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          
+          // If not matched as FANCY, try market-based settlements (match by eventId + marketId)
+          if (!matched && bet.marketId) {
+            for (const settlement of settlements) {
+              if (settlement.eventId === bet.eventId && settlement.marketId === bet.marketId) {
+                if (!betsBySettlementId.has(settlement.settlementId)) {
+                  betsBySettlementId.set(settlement.settlementId, []);
+                }
+                betsBySettlementId.get(settlement.settlementId)!.push(bet);
+                break; // Match to first settlement found
+              }
+            }
+          }
+        }
       }
     }
+
+    this.logger.log(
+      `[GET ALL SETTLEMENTS] Grouped bets: ${betsBySettlementId.size} settlements have bets. ` +
+      `Total bets: ${allBets.length}`
+    );
 
     // OPTIMIZED: Batch fetch all matches for settlements without bets
     const eventIds = settlements.map((s) => s.eventId).filter((id) => id);
@@ -6535,6 +7022,11 @@ export class SettlementService {
 
     // Get total count for pagination
     const totalCount = await this.prisma.settlement.count({ where });
+
+    this.logger.log(
+      `[GET ALL SETTLEMENTS RESULT] Returning ${settlementsWithDetails.length} settlements. ` +
+      `Total count: ${totalCount}, Limit: ${filters?.limit || 100}, Offset: ${filters?.offset || 0}`
+    );
 
     return {
       success: true,
@@ -6889,10 +7381,40 @@ export class SettlementService {
       }
     }
 
-    // Sort runners by selectionId for tied-match and match-odds
-    for (const match of matchMap.values()) {
-      if (match.runners) {
+    // For tied-match: Always include both Yes (37302) and No (37303) options
+    if (marketType === 'tied-match') {
+      for (const match of matchMap.values()) {
+        if (!match.runners) {
+          match.runners = [];
+        }
+        
+        // Ensure Yes option (37302) exists
+        const hasYes = match.runners.some(r => r.selectionId === 37302);
+        if (!hasYes) {
+          match.runners.push({
+            selectionId: 37302,
+            name: 'Yes',
+          });
+        }
+        
+        // Ensure No option (37303) exists
+        const hasNo = match.runners.some(r => r.selectionId === 37303);
+        if (!hasNo) {
+          match.runners.push({
+            selectionId: 37303,
+            name: 'No',
+          });
+        }
+        
+        // Sort runners by selectionId
         match.runners.sort((a, b) => a.selectionId - b.selectionId);
+      }
+    } else {
+      // Sort runners by selectionId for match-odds
+      for (const match of matchMap.values()) {
+        if (match.runners) {
+          match.runners.sort((a, b) => a.selectionId - b.selectionId);
+        }
       }
     }
 

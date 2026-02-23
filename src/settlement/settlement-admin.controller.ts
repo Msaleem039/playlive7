@@ -350,11 +350,27 @@ export class SettlementAdminController {
     }
 
     if (startDate) {
-      filters.startDate = new Date(startDate);
+      try {
+        const parsedStartDate = new Date(startDate);
+        if (isNaN(parsedStartDate.getTime())) {
+          throw new BadRequestException(`Invalid startDate format: ${startDate}. Expected ISO 8601 format.`);
+        }
+        filters.startDate = parsedStartDate;
+      } catch (error) {
+        throw new BadRequestException(`Invalid startDate: ${startDate}. ${(error as Error).message}`);
+      }
     }
 
     if (endDate) {
-      filters.endDate = new Date(endDate);
+      try {
+        const parsedEndDate = new Date(endDate);
+        if (isNaN(parsedEndDate.getTime())) {
+          throw new BadRequestException(`Invalid endDate format: ${endDate}. Expected ISO 8601 format.`);
+        }
+        filters.endDate = parsedEndDate;
+      } catch (error) {
+        throw new BadRequestException(`Invalid endDate: ${endDate}. ${(error as Error).message}`);
+      }
     }
 
     if (limit) {

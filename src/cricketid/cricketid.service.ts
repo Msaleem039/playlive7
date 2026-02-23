@@ -9,6 +9,10 @@ import { RedisService } from '../common/redis/redis.service';
 @Injectable()
 export class CricketIdService {
   private readonly logger = new Logger(CricketIdService.name);
+  
+  // ✅ MULTI-SPORT: Supported sport IDs
+  // 1 = Soccer, 2 = Tennis, 4 = Cricket
+  private readonly DEFAULT_SPORT_ID = 4; // Cricket (backward compatibility)
   private readonly baseUrl = 'https://vendorapi.tresting.com';
   private readonly maxRetries = 3;
   private readonly retryDelay = 1000; // Initial delay in ms
@@ -244,19 +248,21 @@ export class CricketIdService {
    * Get all competitions/series for a specific sport
    * Endpoint: /v3/seriesList?sportId={sportId}
    * Returns list of competitions with competition.id, competition.name, etc.
-   * @param sportId - Sport ID (4 for cricket)
+   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
+   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
-  async getSeriesList(sportId: number) {
+  async getSeriesList(sportId: number = this.DEFAULT_SPORT_ID) {
     return this.fetch('/v3/seriesList', { sportId });
   }
 
   /**
    * Get match details by competition ID
    * Endpoint: /v3/matchList?sportId={sportId}&competitionId={competitionId}
+   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
    * @param competitionId - Competition ID from the series list (e.g., "9992899")
-   * @param sportId - Sport ID (default: 4 for cricket)
+   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
-  async getMatchDetails(competitionId: string | number, sportId: number = 4) {
+  async getMatchDetails(competitionId: string | number, sportId: number = this.DEFAULT_SPORT_ID) {
     return this.fetch('/v3/matchList', { 
       sportId,
       competitionId 
