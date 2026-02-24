@@ -4774,7 +4774,6 @@ export class SettlementService {
           );
         }
       }
-
       this.logger.debug(
         `[REFUND PAIRING COMPLETE] Total bets marked with refunds: ${refundMetadataByBetId.size} ` +
         `(including paired bets)`
