@@ -856,7 +856,7 @@ export class SettlementService {
         `[BET GROUPING COMPLETE] Settlement ${settlementId}: Grouped into ${betsByUserAndMarket.size} users, ` +
         `total market groups: ${Array.from(betsByUserAndMarket.values()).reduce((sum, map) => sum + map.size, 0)}`
       );
-      
+  
       for (const [userId, userMarkets] of betsByUserAndMarket.entries()) {
         this.logger.log(
           `[USER PROCESSING START] Settlement ${settlementId}: Processing user ${userId} with ${userMarkets.size} market groups`
@@ -989,7 +989,7 @@ export class SettlementService {
           );
           
           // ✅ Process all refund pairs (either gola pair only, or all refund pairs if no gola)
-          for (const bet of userBets) {
+            for (const bet of userBets) {
             // Skip if already processed
             if (processedBetIds.has(bet.id)) {
               this.logger.log(
@@ -1117,16 +1117,34 @@ export class SettlementService {
                 `actualRuns=${actualRuns}, Condition: ${actualRuns} >= ${minLine} && ${actualRuns} < ${maxLine} = ${isGolaHit}, ` +
                 `isCancel=${isCancel}`
               );
-              
+  
               if (isCancel) {
                 // On cancel: mark both bets as cancelled
                 await tx.bet.update({
                   where: { id: bet.id },
-                  data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
+                  data: { 
+                    status: BetStatus.CANCELLED, 
+                    pnl: 0, 
+                    settledAt: new Date(), 
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(bet.metadata as object || {}),
+                      decisionRun: null,
+                    }
+                  }
                 });
                 await tx.bet.update({
                   where: { id: pairedBet.id },
-                  data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
+                  data: { 
+                    status: BetStatus.CANCELLED, 
+                    pnl: 0, 
+                    settledAt: new Date(), 
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(pairedBet.metadata as object || {}),
+                      decisionRun: null,
+                    }
+                  }
                 });
                 continue;
               }
@@ -1149,7 +1167,7 @@ export class SettlementService {
                 const previousBalanceDelta = balanceDelta;
                 const winAmountToAdd = bet1WinAmount + bet2WinAmount;
                 balanceDelta += winAmountToAdd;
-                
+  
                 this.logger.log(
                   `[GOLA HIT - BALANCE UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
                   `GOLA HIT! Adding winAmount to balanceDelta. ` +
@@ -1163,14 +1181,18 @@ export class SettlementService {
                   `Marking both bets as WON - Bet1: id=${bet.id}, pnl=${bet1WinAmount}, ` +
                   `Bet2: id=${pairedBet.id}, pnl=${bet2WinAmount}`
                 );
-                
-                await tx.bet.update({
-                  where: { id: bet.id },
+  
+              await tx.bet.update({
+                where: { id: bet.id },
                   data: {
                     status: BetStatus.WON,
                     pnl: bet1WinAmount,
                     settledAt: new Date(),
-                    updatedAt: new Date()
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(bet.metadata as object || {}),
+                      decisionRun: actualRuns,
+                    }
                   }
                 });
                 
@@ -1180,7 +1202,11 @@ export class SettlementService {
                     status: BetStatus.WON,
                     pnl: bet2WinAmount,
                     settledAt: new Date(),
-                    updatedAt: new Date()
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(pairedBet.metadata as object || {}),
+                      decisionRun: actualRuns,
+                    }
                   }
                 });
                 
@@ -1192,7 +1218,7 @@ export class SettlementService {
                   `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd}), ` +
                   `Current balanceDelta=${balanceDelta}`
                 );
-              } else {
+          } else {
                 // ✅ GOLA MISS: BOTH bets LOSE, NO credit to wallet
                 const previousBalanceDelta = balanceDelta;
                 
@@ -1215,7 +1241,11 @@ export class SettlementService {
                     status: BetStatus.LOST,
                     pnl: -bet1LossAmount,
                     settledAt: new Date(),
-                    updatedAt: new Date()
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(bet.metadata as object || {}),
+                      decisionRun: actualRuns,
+                    }
                   }
                 });
                 
@@ -1225,7 +1255,11 @@ export class SettlementService {
                     status: BetStatus.LOST,
                     pnl: -bet2LossAmount,
                     settledAt: new Date(),
-                    updatedAt: new Date()
+                    updatedAt: new Date(),
+                    metadata: {
+                      ...(pairedBet.metadata as object || {}),
+                      decisionRun: actualRuns,
+                    }
                   }
                 });
                 
@@ -1284,12 +1318,12 @@ export class SettlementService {
               `Processing individual bet ${bet.id}`
             );
             
-            const stake = bet.amount ?? 0;
-            const betType = bet.betType?.toUpperCase() ?? '';
-            const winAmount = bet.winAmount ?? stake;
-            const lossAmount = bet.lossAmount ?? stake;
-            const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-            
+              const stake = bet.amount ?? 0;
+              const betType = bet.betType?.toUpperCase() ?? '';
+              const winAmount = bet.winAmount ?? stake;
+              const lossAmount = bet.lossAmount ?? stake;
+              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+  
             this.logger.log(
               `[INDIVIDUAL BET CALC] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
               `Bet ${bet.id}: stake=${stake}, betType=${betType}, ` +
@@ -1309,10 +1343,19 @@ export class SettlementService {
                 `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${liabilityAmount}), ` +
                 `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
               );
-              
+  
               await tx.bet.update({
                 where: { id: bet.id },
-                data: { status: BetStatus.CANCELLED, pnl: 0, settledAt: new Date(), updatedAt: new Date() }
+                data: { 
+                  status: BetStatus.CANCELLED, 
+                  pnl: 0, 
+                  settledAt: new Date(), 
+                  updatedAt: new Date(),
+                  metadata: {
+                    ...(bet.metadata as object || {}),
+                    decisionRun: null,
+                  }
+                }
               });
               continue;
             }
@@ -1364,7 +1407,11 @@ export class SettlementService {
                 status: finalStatus,
                 pnl: finalPnl,
                 settledAt: new Date(),
-                updatedAt: new Date()
+                updatedAt: new Date(),
+                metadata: {
+                  ...(bet.metadata as object || {}),
+                  decisionRun: actualRuns,
+                }
               }
             });
             
@@ -1394,7 +1441,7 @@ export class SettlementService {
           `balance: ${wallet.balance} + ${balanceDelta} = ${finalBalance}, ` +
           `liability: ${wallet.liability} + ${liabilityDelta} = ${finalLiability}`
         );
-        
+  
         if (balanceDelta !== 0 || liabilityDelta !== 0) {
           await tx.wallet.update({ 
             where: { userId }, 
@@ -1446,6 +1493,30 @@ export class SettlementService {
         }
       }
       
+      // ✅ Create/update settlement record with decisionRun
+      await tx.settlement.upsert({
+        where: { settlementId },
+        update: {
+          isRollback: false,
+          settledBy: adminId,
+          winnerId: isCancel ? null : (decisionRun?.toString() || null),
+        },
+        create: {
+          settlementId,
+          eventId,
+          marketType: MarketType.FANCY,
+          marketId: marketId || null,
+          winnerId: isCancel ? null : (decisionRun?.toString() || null),
+          settledBy: adminId,
+        },
+      });
+      
+      this.logger.log(
+        `[SETTLEMENT RECORD CREATED] Settlement ${settlementId} - ` +
+        `Settlement record created/updated with winnerId=${isCancel ? null : (decisionRun?.toString() || null)}, ` +
+        `settledBy=${adminId}`
+      );
+      
       this.logger.log(
         `[SETTLEMENT TRANSACTION COMPLETE] Settlement ${settlementId} - ` +
         `Transaction completed. ` +
@@ -1460,7 +1531,7 @@ export class SettlementService {
   
     return { success: true, message: 'Fancy bets settled successfully' };
   }
-
+  
   
   /**
    * ✅ MATCH ODDS EXPOSURE CALCULATION (MARKET-SPECIFIC)
@@ -4506,6 +4577,7 @@ export class SettlementService {
         settledAt: true,
         createdAt: true,
         updatedAt: true,
+        metadata: true,
         user: {
           select: {
             id: true,
@@ -4533,14 +4605,90 @@ export class SettlementService {
       skip: offset,
     });
 
+    // ✅ Enrich response with decisionRun for FANCY settlements
+    // For FANCY: settlement.winnerId stores the decision run (as string)
+    const fancySettlementIds = [
+      ...new Set(
+        bets
+          .map((b) => b.settlementId)
+          .filter(
+            (sid): sid is string =>
+              typeof sid === 'string' && sid.startsWith('CRICKET:FANCY:'),
+          ),
+      ),
+    ];
+
+    const fancySettlements =
+      fancySettlementIds.length > 0
+        ? await this.prisma.settlement.findMany({
+            where: {
+              settlementId: { in: fancySettlementIds },
+              marketType: MarketType.FANCY,
+            },
+            select: {
+              settlementId: true,
+              winnerId: true,
+            },
+          })
+        : [];
+
+    const fancyDecisionRunBySettlementId = new Map<string, number | null>();
+    for (const s of fancySettlements) {
+      const n = s.winnerId !== null ? Number(s.winnerId) : NaN;
+      fancyDecisionRunBySettlementId.set(
+        s.settlementId,
+        Number.isFinite(n) ? n : null,
+      );
+    }
+
+    // ✅ Fetch user wallet balance
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId },
+      select: {
+        balance: true,
+        liability: true,
+      },
+    });
+
+    const enrichedBets = bets.map((b) => {
+      // ✅ Priority 1: Read decisionRun from bet.metadata (stored when bet was settled)
+      // ✅ Priority 2: Fallback to settlement.winnerId (for older bets without metadata)
+      let decisionRun: number | null = null;
+      
+      if (b.settlementId && b.settlementId.startsWith('CRICKET:FANCY:')) {
+        // First try to get from bet metadata
+        if (b.metadata && typeof b.metadata === 'object' && 'decisionRun' in b.metadata) {
+          const metadataDecisionRun = b.metadata.decisionRun;
+          if (metadataDecisionRun !== null && metadataDecisionRun !== undefined) {
+            const n = Number(metadataDecisionRun);
+            decisionRun = Number.isFinite(n) ? n : null;
+          }
+        }
+        
+        // Fallback to settlement record if not in metadata
+        if (decisionRun === null) {
+          decisionRun = fancyDecisionRunBySettlementId.get(b.settlementId) ?? null;
+        }
+      }
+
+      return {
+        ...b,
+        decisionRun,
+      };
+    });
+
     return {
       success: true,
-      data: bets,
-      count: bets.length,
+      data: enrichedBets,
+      count: enrichedBets.length,
       total: totalCount,
       limit,
       offset,
-      hasMore: offset + bets.length < totalCount,
+      hasMore: offset + enrichedBets.length < totalCount,
+      user: {
+        balance: wallet?.balance ?? 0,
+        liability: wallet?.liability ?? 0,
+      },
     };
   }
 
@@ -6888,8 +7036,8 @@ export class SettlementService {
         } else {
           where.createdAt.lte = endDate;
           this.logger.log(`[GET ALL SETTLEMENTS] Filtering by endDate: ${endDate.toISOString()}`);
-        }
       }
+    }
     }
 
     // Debug: Check total settlements before filtering
@@ -7731,9 +7879,9 @@ export class SettlementService {
       }
     } else {
       // Sort runners by selectionId for match-odds
-      for (const match of matchMap.values()) {
-        if (match.runners) {
-          match.runners.sort((a, b) => a.selectionId - b.selectionId);
+    for (const match of matchMap.values()) {
+      if (match.runners) {
+        match.runners.sort((a, b) => a.selectionId - b.selectionId);
         }
       }
     }
