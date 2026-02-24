@@ -824,40 +824,7 @@ export class BetsService {
             betData.isRangeConsumed = true;
           }
 
-          // ✅ Log to verify flag is in betData before DB insert
-          this.logger.log(
-            `[RANGE CONSUMED FLAG] betData before insert: isRangeConsumed=${betData.isRangeConsumed}, ` +
-            `selectionId=${normalizedSelectionId}, marketId=${marketId}, userId=${userId}`
-          );
-          
-          // ✅ Log full betData object to verify all fields
-          this.logger.debug(
-            `[RANGE CONSUMED FLAG] Full betData object: ${JSON.stringify(betData, null, 2)}`
-          );
-
           const createdBet = await tx.bet.create({ data: betData });
-
-          // ✅ Log to verify flag was persisted in DB
-          this.logger.log(
-            `[RANGE CONSUMED FLAG] Bet created successfully: betId=${createdBet.id}, ` +
-            `isRangeConsumed=${createdBet.isRangeConsumed}, selectionId=${normalizedSelectionId}, marketId=${marketId}`
-          );
-          
-          // ✅ Log full createdBet object to verify what Prisma returned
-          this.logger.debug(
-            `[RANGE CONSUMED FLAG] Full createdBet object: ${JSON.stringify(createdBet, null, 2)}`
-          );
-
-          // ✅ Direct database query to verify the value was actually saved
-          const dbVerification = await tx.$queryRaw<Array<{ is_range_consumed: boolean }>>`
-            SELECT is_range_consumed FROM bets WHERE id = ${createdBet.id}
-          `;
-          if (dbVerification && dbVerification.length > 0) {
-            this.logger.log(
-              `[RANGE CONSUMED FLAG] Direct DB query verification: betId=${createdBet.id}, ` +
-              `is_range_consumed=${dbVerification[0].is_range_consumed}`
-            );
-          }
 
           // 🔐 STEP 7: Create transaction log for audit trail
           // Use Math.abs() because transaction amount must be positive
@@ -880,14 +847,6 @@ export class BetsService {
                 b.userId === userId &&
                 b.status === BetStatus.PENDING
             );
-            if (exposureDelta < 0) {
-              console.log("REFUND TRIGGERED ✅");
-            } else {
-              console.log("NO REFUND ❌");
-            }
-            
-            console.log("Affected Bets:", affectedBets.length);
-            console.log("Affected Bet IDs:", affectedBets.map(b => b.id));
             
             for (const bet of affectedBets) {
               await tx.bet.update({
@@ -898,10 +857,6 @@ export class BetsService {
                   refundedByBetId: createdBet.id,
                 },
               });
-
-              this.logger.log(
-                `[REFUND BET UPDATE] Updated bet ${bet.id} as refunded`
-              );
             }
           }
 

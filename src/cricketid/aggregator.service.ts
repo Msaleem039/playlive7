@@ -372,9 +372,9 @@ export class AggregatorService {
   ) {
     const competitions = await this.getCompetitions(normalizedSportId);
 
-    const allMatches: any[] = [];
+        const allMatches: any[] = [];
 
-    for (const competition of competitions) {
+        for (const competition of competitions) {
       // ✅ MULTI-SPORT: Handle competition.id extraction with fallback
       // Some sports may return comp.id directly, others use comp.competition.id
       const compId = competition?.competition?.id || competition?.id || null;
@@ -390,21 +390,21 @@ export class AggregatorService {
       // Competitions are still cached (10 minutes), but match lists are not
       const useCache = !liveOnly; // Don't cache match lists for Soccer/Tennis
       const matches = await this.getMatchesByCompetition(compId, sportIdNum, liveOnly, useCache);
-      allMatches.push(...matches);
-    }
+          allMatches.push(...matches);
+        }
 
-    // Extract eventIds and get visibility map
-    const eventIds = allMatches
-      .map((m) => m?.event?.id)
-      .filter((id): id is string => !!id);
+        // Extract eventIds and get visibility map
+        const eventIds = allMatches
+          .map((m) => m?.event?.id)
+          .filter((id): id is string => !!id);
 
-    const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
+        const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
 
-    // Filter matches by visibility (only show enabled matches)
-    const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
-      allMatches,
-      visibilityMap,
-    );
+        // Filter matches by visibility (only show enabled matches)
+        const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
+          allMatches,
+          visibilityMap,
+        );
 
     // ✅ SOCCER/TENNIS: Only return live matches (upcoming is empty)
     if (liveOnly) {
@@ -417,14 +417,14 @@ export class AggregatorService {
     }
 
     // Cricket and others: Classify by date
-    const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
-    const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
+        const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
+        const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
 
-    return {
-      total: visibleMatches.length,
-      live,
-      upcoming,
-    };
+        return {
+          total: visibleMatches.length,
+          live,
+          upcoming,
+        };
   }
 
   /**
