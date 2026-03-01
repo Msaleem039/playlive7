@@ -505,9 +505,10 @@ export class AuthService {
       }
     }
 
-    // If type=statement, fetch bet history for each client with pagination
+    // If type=statement, fetch bet history for each client (high limit to build statement from all settled bets)
     const betHistoryMap = new Map<string, any>();
     if (type === 'statement' && statementFilters) {
+      const betFetchLimit = Math.min(statementFilters.limit ? statementFilters.limit * 50 : 10000, 10000);
       const betHistoryPromises = users
         .filter(user => user.role === UserRole.CLIENT)
         .map(async (user) => {
@@ -515,15 +516,15 @@ export class AuthService {
             const betHistory = await this.settlementService.getUserBetHistory({
               userId: user.id,
               status: statementFilters.betStatus,
-              limit: statementFilters.betLimit || 20,
-              offset: statementFilters.betOffset || 0,
-              startDate: statementFilters.betStartDate,
-              endDate: statementFilters.betEndDate,
+              limit: betFetchLimit,
+              offset: 0,
+              startDate: statementFilters.fromDate ?? statementFilters.betStartDate,
+              endDate: statementFilters.toDate ?? statementFilters.betEndDate,
             });
             return { userId: user.id, betHistory };
           } catch (error) {
             console.error(`Failed to get bet history for user ${user.id}:`, error);
-            return { userId: user.id, betHistory: { success: true, data: [], count: 0, total: 0, limit: statementFilters.betLimit || 20, offset: statementFilters.betOffset || 0, hasMore: false } };
+            return { userId: user.id, betHistory: { success: true, data: [], count: 0, total: 0, limit: betFetchLimit, offset: 0, hasMore: false } };
           }
         });
 
@@ -531,6 +532,121 @@ export class AuthService {
       for (const result of betHistoryResults) {
         betHistoryMap.set(result.userId, result.betHistory);
       }
+    }
+
+    // When type=statement, return new statement shape per subordinate
+    if (type === 'statement') {
+      const limit = statementFilters?.limit ?? 1000;
+      const offset = statementFilters?.offset ?? 0;
+
+      return users.map((user) => {
+        const balance = user.wallet?.balance ?? 0;
+        const betHistory = betHistoryMap.get(user.id);
+        const bets: any[] = (betHistory?.data ?? []) as any[];
+
+        // Group bets by marketId + selectionId
+        const groupKey = (b: any) => `${b.marketId ?? ''}|${b.selectionId ?? ''}`;
+        const groups = new Map<string, any[]>();
+        for (const b of bets) {
+          const key = groupKey(b);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key)!.push(b);
+        }
+
+        const statementEntries: any[] = [];
+        for (const [, groupBets] of groups) {
+          const first = groupBets[0];
+          const totalStake = groupBets.reduce((s, b) => s + (Number(b.amount) || 0), 0);
+          const wins = groupBets.filter((b) => (Number(b.pnl) || 0) > 0);
+          const losses = groupBets.filter((b) => (Number(b.pnl) || 0) < 0);
+          const totalCredit = wins.reduce((s, b) => s + (Number(b.pnl) || 0), 0);
+          const totalDebit = losses.reduce((s, b) => s + Math.abs(Number(b.pnl) || 0), 0);
+          const netPnl = totalCredit - totalDebit;
+          const latestSettledAt = groupBets.reduce((max, b) => {
+            const t = b.settledAt ? new Date(b.settledAt).getTime() : 0;
+            return t > max ? t : max;
+          }, 0);
+          const description =
+            first?.marketName ||
+            first?.match?.eventName ||
+            (first?.match ? `${first.match.homeTeam || ''} - ${first.match.awayTeam || ''}`.trim() : '') ||
+            'Market';
+          let result = 'SETTLED';
+          if (groupBets.every((b) => b.status === 'WON')) result = 'WON';
+          else if (groupBets.every((b) => b.status === 'LOST')) result = 'LOST';
+          else if (groupBets.every((b) => b.status === 'CANCELLED')) result = 'CANCELLED';
+          else if (netPnl > 0) result = 'WON';
+          else if (netPnl < 0) result = 'LOST';
+
+          statementEntries.push({
+            marketId: first?.marketId ?? null,
+            selectionId: first?.selectionId ?? null,
+            description,
+            totalStake,
+            totalCredit,
+            totalDebit,
+            netPnl,
+            runningBalance: 0, // filled below
+            result,
+            latestSettledAt: latestSettledAt ? new Date(latestSettledAt).toISOString() : null,
+            bets: groupBets.map((b: any) => ({
+              id: b.id,
+              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
+              betType: b.betType,
+              odds: b.odds,
+              stake: Number(b.amount) || 0,
+              pnl: Number(b.pnl) ?? 0,
+              status: b.status,
+            })),
+          });
+        }
+
+        // Sort by latestSettledAt desc (newest first)
+        statementEntries.sort((a, b) => {
+          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
+          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
+          return tb - ta;
+        });
+
+        const totalNetPnl = statementEntries.reduce((s, e) => s + (e.netPnl || 0), 0);
+        const openingBalance = balance - totalNetPnl;
+
+        // Compute running balance: sort by oldest first, then cumulative
+        const byOldest = [...statementEntries].sort((a, b) => {
+          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
+          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
+          return ta - tb;
+        });
+        let run = openingBalance;
+        for (const e of byOldest) {
+          e.runningBalance = run + (e.netPnl || 0);
+          run = e.runningBalance;
+        }
+        // Re-sort by newest first for response
+        statementEntries.sort((a, b) => {
+          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
+          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
+          return tb - ta;
+        });
+
+        const totalRecords = statementEntries.length;
+        const page = Math.floor(offset / limit) + 1;
+        const paginatedStatement = statementEntries.slice(offset, offset + limit);
+
+        return {
+          success: true,
+          user: {
+            id: user.id,
+            openingBalance,
+          },
+          statement: paginatedStatement,
+          pagination: {
+            page,
+            limit,
+            totalRecords,
+          },
+        };
+      });
     }
 
     // Return basic subordinate information with optional transactions and bet history
@@ -586,14 +702,6 @@ export class AuthService {
         });
 
         baseResponse.transactions = transactions;
-      }
-
-      // Add bet history if type=statement
-      if (type === 'statement') {
-        const betHistory = betHistoryMap.get(user.id);
-        if (betHistory) {
-          baseResponse.betHistory = betHistory;
-        }
       }
 
       return baseResponse;
