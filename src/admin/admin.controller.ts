@@ -64,18 +64,20 @@ export class AdminController {
 
       // Get visibility settings from database
       const visibilityRecords = await this.matchVisibilityService.getAllMatchesWithVisibility();
+      // Use string keys so lookup works when vendor API returns event.id as number
       const visibilityMap = new Map(
-        visibilityRecords.map((v) => [v.eventId, v.isEnabled]),
+        visibilityRecords.map((v) => [String(v.eventId), v.isEnabled]),
       );
 
       // Merge match data with visibility
       const matchesWithVisibility = allMatches.map((match: any) => {
-        const eventId = match?.event?.id;
+        const rawId = match?.event?.id;
+        const eventId = rawId != null ? String(rawId) : '';
         const eventName = match?.event?.name || 'Unknown Match';
         const eventDate = match?.event?.openDate || null;
 
-        // Get visibility status (default to true if not in DB)
-        const isEnabled = visibilityMap.get(eventId) ?? true;
+        // Lookup by string so number/string from API both match DB
+        const isEnabled = eventId ? (visibilityMap.get(eventId) ?? true) : true;
 
         return {
           eventId,

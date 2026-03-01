@@ -14,12 +14,12 @@ export class MatchVisibilityService {
    */
   async syncMatch(eventId: string): Promise<void> {
     try {
-      // TypeScript workaround: Prisma client types may not be immediately recognized
+      const id = String(eventId);
       const prisma = this.prisma as any;
       await prisma.matchVisibility.upsert({
-        where: { eventId },
-        update: {}, // No update needed if exists
-        create: { eventId, isEnabled: true },
+        where: { eventId: id },
+        update: {}, // No update needed if exists (keeps existing isEnabled)
+        create: { eventId: id, isEnabled: true },
       });
       this.logger.debug(`Synced MatchVisibility for eventId: ${eventId}`);
     } catch (error) {
@@ -41,11 +41,12 @@ export class MatchVisibilityService {
       const prisma = this.prisma as any;
       
       // Use transaction to batch all upserts efficiently
+      const ids = eventIds.map((id) => String(id));
       await prisma.$transaction(
-        eventIds.map((eventId) =>
+        ids.map((eventId) =>
           prisma.matchVisibility.upsert({
             where: { eventId },
-            update: {}, // No update needed if exists
+            update: {}, // No update if exists (keeps admin-set isEnabled)
             create: { eventId, isEnabled: true },
           })
         ),
@@ -67,10 +68,10 @@ export class MatchVisibilityService {
    */
   async isMatchEnabled(eventId: string): Promise<boolean> {
     try {
-      // TypeScript workaround: Prisma client types may not be immediately recognized
+      const id = String(eventId);
       const prisma = this.prisma as any;
       const visibility = await prisma.matchVisibility.findUnique({
-        where: { eventId },
+        where: { eventId: id },
       });
 
       // If not found, default to enabled (for backward compatibility)
@@ -96,21 +97,23 @@ export class MatchVisibilityService {
     try {
       // TypeScript workaround: Prisma client types may not be immediately recognized
       const prisma = this.prisma as any;
+      const ids = eventIds.map((id) => String(id));
       const visibilities = await prisma.matchVisibility.findMany({
         where: {
-          eventId: { in: eventIds },
+          eventId: { in: ids },
         },
       });
 
-      // Create a map of eventId -> isEnabled
+      // Create a map of eventId (string) -> isEnabled
       for (const v of visibilities) {
-        visibilityMap.set(v.eventId, v.isEnabled);
+        visibilityMap.set(String(v.eventId), v.isEnabled);
       }
 
       // For eventIds not found in DB, default to enabled
       for (const eventId of eventIds) {
-        if (!visibilityMap.has(eventId)) {
-          visibilityMap.set(eventId, true);
+        const key = String(eventId);
+        if (!visibilityMap.has(key)) {
+          visibilityMap.set(key, true);
         }
       }
     } catch (error) {
@@ -156,14 +159,14 @@ export class MatchVisibilityService {
    */
   async updateVisibility(eventId: string, isEnabled: boolean): Promise<void> {
     try {
-      // TypeScript workaround: Prisma client types may not be immediately recognized
+      const id = String(eventId);
       const prisma = this.prisma as any;
       await prisma.matchVisibility.upsert({
-        where: { eventId },
+        where: { eventId: id },
         update: { isEnabled },
-        create: { eventId, isEnabled },
+        create: { eventId: id, isEnabled },
       });
-      this.logger.log(`Updated visibility for eventId ${eventId}: isEnabled=${isEnabled}`);
+      this.logger.log(`Updated visibility for eventId ${id}: isEnabled=${isEnabled}`);
     } catch (error) {
       this.logger.error(`Error updating visibility for eventId ${eventId}:`, error);
       throw error;
@@ -182,17 +185,17 @@ export class MatchVisibilityService {
    * Note: If visibilityMap was built during an error, it defaults all to true,
    * so all matches would be included. This is acceptable for graceful degradation.
    */
-  filterMatchesByVisibility<T extends { event?: { id?: string } }>(
+  filterMatchesByVisibility<T extends { event?: { id?: string | number } }>(
     matches: T[],
     visibilityMap: Map<string, boolean>,
   ): T[] {
     return matches.filter((match) => {
-      const eventId = match?.event?.id;
-      if (!eventId) {
+      const raw = match?.event?.id;
+      if (raw == null || raw === '') {
         return false; // Exclude matches without eventId
       }
-      // Only include matches explicitly set to true
-      // undefined or false values are excluded
+      const eventId = String(raw);
+      // Only include matches explicitly set to true (string key for number/string API ids)
       return visibilityMap.get(eventId) === true;
     });
   }
