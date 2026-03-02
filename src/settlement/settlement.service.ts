@@ -2079,13 +2079,45 @@ export class SettlementService {
 
         // Offset bets: no wallet impact. Only release liability (and add to balance) for NON-offset bets.
         let releasedLiability = 0;
-        for (const bet of userBets) {
-          if (offsetBetIds.has(bet.id)) continue;
-          const stake = Number(bet.betValue ?? bet.amount ?? 0);
-          const odds = Number(bet.betRate ?? bet.odds ?? 0);
-          const bt = String(bet.betType ?? '').toUpperCase();
-          if (bt === 'BACK') releasedLiability += stake;
-          else if (bt === 'LAY') releasedLiability += stake * (odds - 1);
+        const nonOffsetBets = userBets.filter((b) => !offsetBetIds.has(b.id));
+        const laySelections = new Set(
+          nonOffsetBets
+            .filter((b) => String(b.betType ?? '').toUpperCase() === 'LAY')
+            .map((b) => Number(b.selectionId))
+            .filter((id) => !isNaN(id)),
+        );
+        const hasLayOnDifferentSelections = laySelections.size > 1;
+
+        if (!hasLayOnDifferentSelections) {
+          for (const bet of nonOffsetBets) {
+            const stake = Number(bet.betValue ?? bet.amount ?? 0);
+            const odds = Number(bet.betRate ?? bet.odds ?? 0);
+            const bt = String(bet.betType ?? '').toUpperCase();
+            if (bt === 'BACK') releasedLiability += stake;
+            else if (bt === 'LAY') releasedLiability += stake * (odds - 1);
+          }
+        } else {
+          let worstCaseNet = Infinity;
+          for (const simulatedWinnerSelId of laySelections) {
+            let simNet = 0;
+            for (const bet of nonOffsetBets) {
+              const stake = Number(bet.betValue ?? bet.amount ?? 0);
+              const odds = Number(bet.betRate ?? bet.odds ?? 0);
+              const bt = String(bet.betType ?? '').toUpperCase();
+              const betSelId = Number(bet.selectionId);
+              if (bt === 'BACK') {
+                simNet += stake;
+              } else if (bt === 'LAY') {
+                if (betSelId === simulatedWinnerSelId) {
+                  simNet -= stake * (odds - 1);
+                } else {
+                  simNet += stake;
+                }
+              }
+            }
+            worstCaseNet = Math.min(worstCaseNet, simNet);
+          }
+          releasedLiability = Math.abs(worstCaseNet === Infinity ? 0 : worstCaseNet);
         }
         const newBalance = currentBalance + totalPnL + releasedLiability;
         const newLiability = Math.max(0, currentLiability - releasedLiability);
@@ -2123,6 +2155,145 @@ export class SettlementService {
 
     return affectedUserIds;
   }
+  /**
+   * Exchange-style settlement for MATCH_ODDS (and TIED_MATCH) market.
+   * - Exposure is calculated in-memory from pending bets (do not trust DB liability).
+   * - newBalance = user.balance + totalPnL
+   * - newLiability = user.liability - marketExposure (never below 0).
+   */
+   /**
+   * Lock-model settlement for MATCH_ODDS: at placement, balance was already
+   * debited and liability increased. At settlement we only release liability
+   * and add payouts (no deduction of losses — avoids double deduction).
+   */
+  // private async settleMarket({
+  //   eventId,
+  //   marketId,
+  //   winnerSelectionId,
+  //   adminId,
+  //   marketType,
+  //   settlementId,
+  //   bets,
+  //   isCancel = false,
+  // }: {
+  //   eventId: string;
+  //   marketId: string;
+  //   winnerSelectionId: string;
+  //   adminId: string;
+  //   marketType: MarketType;
+  //   settlementId: string;
+  //   bets: any[];
+  //   isCancel?: boolean;
+  // }): Promise<Set<string>> {
+  //   const winnerSelectionIdNum = Number(winnerSelectionId);
+  //   const affectedUserIds = new Set<string>();
+
+  //   await this.prisma.$transaction(async (tx) => {
+  //     const betsByUser = new Map<string, any[]>();
+  //     for (const bet of bets) {
+  //       if (!betsByUser.has(bet.userId)) {
+  //         betsByUser.set(bet.userId, []);
+  //       }
+  //       betsByUser.get(bet.userId)!.push(bet);
+  //     }
+
+  //     for (const [userId, userBets] of betsByUser.entries()) {
+  //       const wallet = await tx.wallet.findUnique({ where: { userId } });
+  //       if (!wallet) continue;
+
+  //       let liabilityRelease = 0;
+  //       let balanceAdjustment = 0;
+  //       const betUpdates: Array<{ id: string; status: BetStatus; pnl: number }> = [];
+
+  //       for (const bet of userBets) {
+  //         const stake = Number(bet.betValue ?? bet.amount ?? 0);
+  //         const odds = Number(bet.betRate ?? bet.odds ?? 0);
+  //         const betType = String(bet.betType ?? '').toUpperCase();
+  //         const betSelectionId = Number(bet.selectionId);
+
+  //         const lockedAmount =
+  //           betType === 'BACK' ? stake : stake * (odds - 1);
+  //         liabilityRelease += lockedAmount;
+
+  //         if (isCancel) {
+  //           balanceAdjustment += lockedAmount;
+  //           betUpdates.push({ id: bet.id, status: BetStatus.CANCELLED, pnl: 0 });
+  //           continue;
+  //         }
+
+  //         const isWinner = betSelectionId === winnerSelectionIdNum;
+  //         let pnl = 0;
+
+  //         if (betType === 'BACK') {
+  //           pnl = isWinner ? stake * (odds - 1) : -stake;
+  //           if (isWinner) {
+  //             balanceAdjustment += stake * odds;
+  //           }
+  //         }
+  //         if (betType === 'LAY') {
+  //           const liability = stake * (odds - 1);
+  //           pnl = isWinner ? -liability : stake;
+  //           if (isWinner) {
+  //             balanceAdjustment += stake;
+  //           }
+  //         }
+
+  //         betUpdates.push({
+  //           id: bet.id,
+  //           status: pnl >= 0 ? BetStatus.WON : BetStatus.LOST,
+  //           pnl,
+  //         });
+  //       }
+
+  //       const newBalance = (wallet.balance ?? 0) + balanceAdjustment;
+  //       const newLiability = Math.max(
+  //         0,
+  //         (wallet.liability ?? 0) - liabilityRelease,
+  //       );
+
+  //       await tx.wallet.update({
+  //         where: { userId },
+  //         data: {
+  //           balance: newBalance,
+  //           liability: newLiability,
+  //         },
+  //       });
+
+  //       const now = new Date();
+  //       await Promise.all(
+  //         betUpdates.map((update) =>
+  //           tx.bet.update({
+  //             where: { id: update.id },
+  //             data: {
+  //               status: update.status,
+  //               pnl: update.pnl,
+  //               settledAt: now,
+  //               updatedAt: now,
+  //             },
+  //           }),
+  //         ),
+  //       );
+
+  //       if (balanceAdjustment > 0) {
+  //         await tx.transaction.create({
+  //           data: {
+  //             walletId: wallet.id,
+  //             amount: balanceAdjustment,
+  //             type: TransactionType.BET_WON,
+  //             description: `Settlement payout ${balanceAdjustment} - ${settlementId}`,
+  //           },
+  //         });
+  //       }
+
+  //       this.logger.debug(
+  //         `[SETTLE MARKET] user=${userId} balanceAdjustment=${balanceAdjustment} liabilityRelease=${liabilityRelease} newBalance=${newBalance} newLiability=${newLiability}`,
+  //       );
+  //       affectedUserIds.add(userId);
+  //     }
+  //   });
+
+  //   return affectedUserIds;
+  // }
   private getLockedAmount(betType: string, stake: number, odds: number): number {
     if (betType === 'BACK') return stake;
     if (betType === 'LAY') return stake * (odds - 1);
