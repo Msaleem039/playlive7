@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Logger, Param, Post, Query, HttpException, HttpStatus } from '@nestjs/common';
+import { Body, Controller, Get, Logger, Param, Post, Query, HttpException, HttpStatus, BadRequestException } from '@nestjs/common';
 import { CricketIdService } from './cricketid.service';
 
 @Controller('cricketid')
@@ -121,6 +121,51 @@ export class CricketIdController {
       }
       throw error;
     }
+  }
+
+  /**
+   * Get top matches for Soccer or Tennis only.
+   * GET /cricketid/top-matches?sportId=1&limit=5
+   * - sportId: 1 (Soccer) or 2 (Tennis) - required
+   * - limit: max number of matches to return (default: 5, min: 1)
+   *
+   * Cricket (4) is not handled here; passing 4 will result in BadRequestException
+   * from the underlying service validation.
+   */
+  @Get('top-matches')
+  async getTopMatchesBySport(
+    @Query('sportId') sportId?: string | number,
+    @Query('limit') limit?: string | number,
+  ) {
+    if (sportId === undefined || sportId === null) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'sportId query parameter is required and must be 1 (Soccer) or 2 (Tennis)',
+        error: 'Bad Request',
+      });
+    }
+
+    const normalizedSportId = Number(sportId);
+    const normalizedLimit = limit !== undefined && limit !== null ? Number(limit) : 5;
+
+    return this.cricketIdService.getTopMatchesBySport(normalizedSportId, normalizedLimit);
+  }
+
+  /**
+   * Get markets for a specific match/event (reuses existing market caching).
+   * GET /cricketid/match-markets?eventId={eventId}
+   */
+  @Get('match-markets')
+  async getMatchMarkets(@Query('eventId') eventId: string) {
+    if (!eventId) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'eventId query parameter is required',
+        error: 'Bad Request',
+      });
+    }
+
+    return this.cricketIdService.getMatchMarkets(eventId);
   }
 
 }

@@ -18,10 +18,8 @@ export class AggregatorService {
     VENDOR_MATCH_DETAIL: 10,  // 10 seconds (match details change less frequently)
   };
 
-  // ✅ MULTI-SPORT: Cache TTLs for matches endpoint (in milliseconds)
+  // Cache TTLs for matches endpoint (in milliseconds) - Cricket only
   private readonly MATCHES_CACHE_TTL = {
-    SOCCER: 10 * 60 * 1000,    // 10 minutes for Soccer (sportId=1)
-    TENNIS: 10 * 60 * 1000,    // 10 minutes for Tennis (sportId=2)
     CRICKET: 30 * 1000,        // 30 seconds for Cricket (sportId=4) - more frequent updates
     DEFAULT: 30 * 1000,         // 30 seconds default
   };
@@ -191,10 +189,9 @@ export class AggregatorService {
   }
 
   /**
-   * Get all competitions for a specific sport
-   * Endpoint: /cricketid/series?sportId={sportId}
-   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
-   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: '4')
+   * Get all competitions for Cricket
+   * Endpoint: /cricketid/series?sportId=4
+   * @param sportId - Sport ID (kept for backward compatibility, always handled as 4)
    */
   async getCompetitions(sportId: string | number = '4') {
     try {
@@ -208,26 +205,16 @@ export class AggregatorService {
   }
 
   /**
-   * Get matches for each competition
-   * Endpoint: /cricketid/matches?competitionId={competitionId}&sportId={sportId}
-   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
+   * Get matches for each competition (Cricket only)
+   * Endpoint: /cricketid/matches?competitionId={competitionId}&sportId=4
    * ✅ PERFORMANCE: Caches individual competition matches to prevent repeated API calls for invalid/expired competitions
    * @param competitionId - Competition ID
-   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
-   * @param liveOnly - If true, only return live matches (for Soccer/Tennis)
-   * @param useCache - If false, skip caching (for Soccer/Tennis match lists)
+   * @param sportId - Sport ID (kept for backward compatibility, default: 4)
    */
   async getMatchesByCompetition(
-    competitionId: string, 
-    sportId: number = 4, 
-    liveOnly: boolean = false,
-    useCache: boolean = true
+    competitionId: string,
+    sportId: number = 4,
   ) {
-    // ✅ SOCCER/TENNIS: Skip caching for match lists (only cache competitions)
-    if (!useCache) {
-      return this.fetchMatchesDirectly(competitionId, sportId, liveOnly);
-    }
-
     // ✅ PERFORMANCE: Cache individual competition matches to prevent repeated API calls
     // Cache key includes sportId to differentiate between sports
     const cacheKey = `comp-matches:${sportId}:${competitionId}`;
@@ -236,53 +223,25 @@ export class AggregatorService {
       cacheKey,
       10 * 60 * 1000, // 10 minutes cache - prevents repeated API calls for invalid/expired competitions
       async () => {
-        return this.fetchMatchesDirectly(competitionId, sportId, liveOnly);
+        return this.fetchMatchesDirectly(competitionId, sportId);
       },
     );
   }
 
   /**
-   * Fetch matches directly from vendor API (no caching)
+   * Fetch matches directly from vendor API (no caching) - Cricket only
    * @param competitionId - Competition ID
    * @param sportId - Sport ID
-   * @param liveOnly - If true, filter for live matches only
    */
   private async fetchMatchesDirectly(
-    competitionId: string, 
-    sportId: number, 
-    liveOnly: boolean = false
+    competitionId: string,
+    sportId: number,
   ): Promise<any[]> {
     try {
-      // ✅ SOCCER/TENNIS: Try to use vendor API parameters for live matches
       const params: Record<string, any> = { competitionId, sportId };
-      
-      // Try vendor-supported parameters for live matches
-      if (liveOnly) {
-        // Try inPlay parameter first
-        params.inPlay = true;
-        // Also try status parameter as fallback
-        // params.status = 'LIVE';
-      }
 
       const response = await this.fetch<any[]>(`/cricketid/matches`, params);
       let matches = Array.isArray(response) ? response : [];
-
-      // ✅ SOCCER/TENNIS: Filter for live matches if vendor doesn't support inPlay/status
-      if (liveOnly && matches.length > 0) {
-        const now = new Date();
-        matches = matches.filter((match) => {
-          const openDate = match?.event?.openDate;
-          if (!openDate) return false;
-          
-          const matchDate = new Date(openDate);
-          // Match is live if openDate <= now (match has started)
-          return matchDate <= now;
-        });
-
-        this.logger.debug(
-          `Filtered ${matches.length} live matches for competitionId ${competitionId} (sportId=${sportId})`
-        );
-      }
 
       // Sync matches with visibility table (create if not exists)
       // Use batch sync to prevent connection pool exhaustion
@@ -318,57 +277,34 @@ export class AggregatorService {
   }
 
   /**
-   * Fetch all matches for a specific sport and classify Live / Upcoming
+   * Fetch all Cricket matches and classify Live / Upcoming
    * Filters matches by admin-controlled visibility settings
-   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
-   * ✅ SOCCER/TENNIS: Only fetches live matches, no caching for match lists
-   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: '4')
+   * @param sportId - Sport ID (kept for backward compatibility, always treated as 4)
    * @param page - Page number (for cache key differentiation)
    * @param per_page - Items per page (for cache key differentiation)
    */
-  async getAllCricketMatches(sportId: string | number = '4', page = 1, per_page = 20) {
-    const normalizedSportId = String(sportId);
-    const sportIdNum = Number(normalizedSportId) || 4;
-    
-    // ✅ SOCCER/TENNIS: No caching for match lists (live matches change frequently)
-    // Only cache competitions (10 minutes), not the match list itself
-    const isSoccerOrTennis = sportIdNum === 1 || sportIdNum === 2;
-    const liveOnly = isSoccerOrTennis; // Only fetch live matches for Soccer/Tennis
-    
-    // ✅ MULTI-SPORT: Use different cache TTL based on sport
-    // Soccer (1) and Tennis (2): NO CACHE for match lists (0 TTL)
-    // Cricket (4) and others: 30 seconds (more frequent updates)
-    let cacheTtl = this.MATCHES_CACHE_TTL.DEFAULT;
-    if (sportIdNum === 1 || sportIdNum === 2) {
-      cacheTtl = 0; // ✅ NO CACHE for Soccer/Tennis match lists
-    } else if (sportIdNum === 4) {
-      cacheTtl = this.MATCHES_CACHE_TTL.CRICKET; // 30 seconds
-    }
-    
-    // ✅ SOCCER/TENNIS: Skip cache entirely for match lists
-    if (cacheTtl === 0) {
-      return this.fetchMatchesForSport(normalizedSportId, sportIdNum, liveOnly);
-    }
-    
+  async getAllCricketMatches(_sportId: string | number = '4', page = 1, per_page = 20) {
+    const normalizedSportId = '4';
+    const sportIdNum = 4;
+    const cacheTtl = this.MATCHES_CACHE_TTL.CRICKET; // 30 seconds for Cricket
+
     return this.fetchWithCache(
       `sport:${normalizedSportId}:${page}:${per_page}`,
-      cacheTtl, // Dynamic TTL based on sport
+      cacheTtl,
       async () => {
-        return this.fetchMatchesForSport(normalizedSportId, sportIdNum, liveOnly);
+        return this.fetchMatchesForSport(normalizedSportId, sportIdNum);
       },
     );
   }
 
   /**
-   * Fetch matches for a sport (with or without caching)
-   * @param normalizedSportId - Sport ID as string
-   * @param sportIdNum - Sport ID as number
-   * @param liveOnly - If true, only fetch live matches
+   * Fetch matches for Cricket
+   * @param normalizedSportId - Sport ID as string (always '4' for Cricket)
+   * @param sportIdNum - Sport ID as number (always 4 for Cricket)
    */
   private async fetchMatchesForSport(
     normalizedSportId: string,
     sportIdNum: number,
-    liveOnly: boolean
   ) {
     const competitions = await this.getCompetitions(normalizedSportId);
 
@@ -386,10 +322,7 @@ export class AggregatorService {
         continue;
       }
 
-      // ✅ SOCCER/TENNIS: Fetch matches without caching (liveOnly=true, useCache=false)
-      // Competitions are still cached (10 minutes), but match lists are not
-      const useCache = !liveOnly; // Don't cache match lists for Soccer/Tennis
-      const matches = await this.getMatchesByCompetition(compId, sportIdNum, liveOnly, useCache);
+      const matches = await this.getMatchesByCompetition(compId, sportIdNum);
           allMatches.push(...matches);
         }
 
@@ -406,17 +339,6 @@ export class AggregatorService {
           visibilityMap,
         );
 
-    // ✅ SOCCER/TENNIS: Only return live matches (upcoming is empty)
-    if (liveOnly) {
-      // All matches are already filtered to live only
-      return {
-        total: visibleMatches.length,
-        live: visibleMatches,
-        upcoming: [], // ✅ No upcoming matches for Soccer/Tennis
-      };
-    }
-
-    // Cricket and others: Classify by date
         const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
         const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
 

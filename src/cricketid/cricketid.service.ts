@@ -1,5 +1,5 @@
 import { HttpService } from '@nestjs/axios';
-import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus, BadRequestException } from '@nestjs/common';
 import { firstValueFrom } from 'rxjs';
 import { AxiosError } from 'axios';
 import * as https from 'https';
@@ -24,6 +24,8 @@ export class CricketIdService {
     VENDOR_FANCY: 5,          // 5 seconds (fancy data changes frequently, but 3s was too short)
     VENDOR_BOOKMAKER: 5,      // 5 seconds (bookmaker data changes frequently, but 3s was too short)
     VENDOR_MATCH_DETAIL: 10,  // 10 seconds (match details change less frequently)
+    SERIES_LIST: 5000,          // 30 seconds for series list (competitions)
+    MATCH_LIST: 5000,           // 20 seconds for match list per competition
   };
 
   constructor(
@@ -270,6 +272,171 @@ export class CricketIdService {
   }
 
   /**
+   * Validate that the sportId is supported for VendorService (Soccer/Tennis only).
+   * Allowed sportIds:
+   *  - 1: Soccer
+   *  - 2: Tennis
+   * Any other value will throw BadRequestException.
+   */
+  private validateSport(sportId: number) {
+    if (sportId !== 1 && sportId !== 2) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'Invalid sportId. Only Soccer (1) and Tennis (2) are supported by this endpoint.',
+        error: 'Bad Request',
+        details: {
+          sportId,
+          allowedSportIds: [1, 2],
+        },
+      });
+    }
+  }
+
+  /**
+   * Get series list from Redis cache or vendor API (Soccer/Tennis only).
+   * Cache key: vendor:series:{sportId}
+   * TTL: 30 seconds
+   */
+  private async getCachedSeries(sportId: number) {
+    this.validateSport(sportId);
+
+    const cacheKey = `vendor:series:${sportId}`;
+    const cached = await this.redisService.get<any[]>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for series list (sportId=${sportId})`);
+      return cached;
+    }
+
+    this.logger.debug(`Redis cache MISS for series list (sportId=${sportId}) - fetching from vendor API`);
+    const seriesList = await this.getSeriesList(sportId);
+
+    try {
+      await this.redisService.set(cacheKey, seriesList, this.REDIS_TTL.SERIES_LIST);
+      this.logger.debug(
+        `Redis cache SET for series list (sportId=${sportId}) (TTL: ${this.REDIS_TTL.SERIES_LIST}s)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to set Redis cache for series list sportId=${sportId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    return seriesList;
+  }
+
+  /**
+   * Get match list for a competition from Redis cache or vendor API (Soccer/Tennis only).
+   * Cache key: vendor:matches:{sportId}:{competitionId}
+   * TTL: 15 seconds
+   */
+  private async getCachedMatches(sportId: number, competitionId: string) {
+    this.validateSport(sportId);
+
+    const cacheKey = `vendor:matches:${sportId}:${competitionId}`;
+    const cached = await this.redisService.get<any[]>(cacheKey);
+    if (cached) {
+      this.logger.debug(
+        `Redis cache HIT for match list (sportId=${sportId}, competitionId=${competitionId})`,
+      );
+      return cached;
+    }
+
+    this.logger.debug(
+      `Redis cache MISS for match list (sportId=${sportId}, competitionId=${competitionId}) - fetching from vendor API`,
+    );
+    const matchList = await this.getMatchDetails(competitionId, sportId);
+
+    try {
+      await this.redisService.set(cacheKey, matchList, this.REDIS_TTL.MATCH_LIST);
+      this.logger.debug(
+        `Redis cache SET for match list (sportId=${sportId}, competitionId=${competitionId}) (TTL: ${this.REDIS_TTL.MATCH_LIST}s)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to set Redis cache for match list sportId=${sportId}, competitionId=${competitionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    return matchList;
+  }
+
+  /**
+   * Get top N matches for a given sport (Soccer/Tennis only).
+   * - Supported sports: 1 (Soccer), 2 (Tennis)
+   * - Cricket (4) must not be handled here.
+   * - Uses Redis caching for series and match lists.
+   * - Stops iterating once `limit` matches are collected (early break).
+   */
+  async getTopMatchesBySport(sportId: number, limit = 5) {
+    this.validateSport(sportId);
+
+    const max = Math.max(1, limit || 5);
+    const rawSeries = await this.getCachedSeries(sportId);
+    const seriesList: any[] = Array.isArray(rawSeries) ? rawSeries : [];
+
+    const allMatches: any[] = [];
+
+    for (const series of seriesList) {
+      // Handle both flat and nested competition structures
+      const compId =
+        (series?.competition && series.competition.id) ||
+        series?.id ||
+        series?.competitionId ||
+        null;
+
+      if (!compId) {
+        this.logger.debug(
+          `Skipping series with missing competitionId for sportId=${sportId}`,
+        );
+        continue;
+      }
+
+      let matches: any[] = [];
+      try {
+        const result = await this.getCachedMatches(sportId, String(compId));
+        matches = Array.isArray(result) ? result : [];
+      } catch (error: any) {
+        // Skip invalid/expired competitions (400) and continue to next
+        const status = error?.getStatus?.() ?? error?.statusCode ?? error?.response?.status;
+        if (status === 400) {
+          this.logger.debug(
+            `Skipping invalid/expired competitionId ${compId} for sportId=${sportId}`,
+          );
+        } else {
+          throw error;
+        }
+      }
+
+      if (matches.length > 0) {
+        allMatches.push(...matches);
+      }
+
+      if (allMatches.length >= max) {
+        this.logger.debug(
+          `Collected ${allMatches.length} matches for sportId=${sportId}, stopping early at limit=${max}`,
+        );
+        break;
+      }
+    }
+
+    const result = allMatches.slice(0, max);
+    const now = new Date();
+    return result.map((match) => {
+      const openDate = match?.event?.openDate;
+      const hasStarted = openDate ? new Date(openDate) <= now : false;
+      return {
+        ...match,
+        live: hasStarted,
+        upcoming: openDate ? !hasStarted : false,
+      };
+    });
+  }
+
+  /**
    * Get market list (odds/markets) for a specific event/match
    * Endpoint: /v3/marketList?eventId={eventId}
    * Returns markets with runners, odds, selectionId, etc.
@@ -301,6 +468,14 @@ export class CricketIdService {
     }
     
     return response;
+  }
+
+  /**
+   * Get markets for a specific match/event.
+   * Reuses existing getMarketList() with Redis caching.
+   */
+  async getMatchMarkets(eventId: string) {
+    return this.getMarketList(eventId);
   }
 
   /**
