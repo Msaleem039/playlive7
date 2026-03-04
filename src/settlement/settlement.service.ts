@@ -53,7 +53,54 @@ export class SettlementService {
     this.cacheTimestamps.set(eventId, Date.now());
   }
 
- 
+  /**
+   * Calculate total exposure from bets using SAME logic as BetsService / PositionsController.
+   * Source of truth for liability; do not trust stored wallet.liability blindly.
+   */
+  private calculateExposureFromBets(bets: any[]): number {
+    const matchOddsBetsByMarket = new Map<string, any[]>();
+    const bookmakerBetsByMarket = new Map<string, any[]>();
+    const fancyBetsBySelection = new Map<string, any[]>();
+
+    for (const bet of bets) {
+      const betGtype = (bet.gtype || '').toLowerCase();
+
+      if ((betGtype === 'matchodds' || betGtype === 'match') && bet.marketId) {
+        if (!matchOddsBetsByMarket.has(bet.marketId)) {
+          matchOddsBetsByMarket.set(bet.marketId, []);
+        }
+        matchOddsBetsByMarket.get(bet.marketId)!.push(bet);
+      } else if (
+        bet.marketId &&
+        (betGtype === 'bookmaker' ||
+          (betGtype.startsWith('match') && betGtype !== 'match' && betGtype !== 'matchodds'))
+      ) {
+        if (!bookmakerBetsByMarket.has(bet.marketId)) {
+          bookmakerBetsByMarket.set(bet.marketId, []);
+        }
+        bookmakerBetsByMarket.get(bet.marketId)!.push(bet);
+      } else if (betGtype === 'fancy' && bet.eventId && bet.selectionId != null) {
+        const key = `${bet.eventId}_${bet.selectionId}`;
+        if (!fancyBetsBySelection.has(key)) {
+          fancyBetsBySelection.set(key, []);
+        }
+        fancyBetsBySelection.get(key)!.push(bet);
+      }
+    }
+
+    let total = 0;
+    for (const [, marketBets] of matchOddsBetsByMarket) {
+      total += this.matchOddsExposureService.calculateMatchOddsExposureInMemory(marketBets);
+    }
+    for (const [, marketBets] of bookmakerBetsByMarket) {
+      total += this.bookmakerExposureService.calculateBookmakerExposureInMemory(marketBets);
+    }
+    for (const [, selectionBets] of fancyBetsBySelection) {
+      total += this.fancyExposureService.calculateFancyExposureInMemory(selectionBets);
+    }
+    return total;
+  }
+
   // 🔐 STRICT: Use fixed decimal precision (2 decimal places) to avoid floating point drift
 
 
@@ -2035,6 +2082,12 @@ export class SettlementService {
           }
         }
 
+        // Exposure BEFORE settlement (for offset: releasedLiability via calculateExposureFromBets)
+        const allPendingBefore = await tx.bet.findMany({
+          where: { userId, status: 'PENDING' },
+        });
+        const exposureBefore = this.calculateExposureFromBets(allPendingBefore);
+
         const now = new Date();
         await Promise.all(
           betUpdates.map((update) =>
@@ -2052,6 +2105,12 @@ export class SettlementService {
 
         const currentBalance = wallet.balance ?? 0;
         const currentLiability = wallet.liability ?? 0;
+
+        // Exposure after settlement (source of truth for liability)
+        const allPendingAfter = await tx.bet.findMany({
+          where: { userId, status: 'PENDING' },
+        });
+        const exposureAfter = this.calculateExposureFromBets(allPendingAfter);
 
         let releasedLiability = 0;
         const nonOffsetBets = userBets;
@@ -2118,9 +2177,17 @@ export class SettlementService {
         );
 
         if (isOffsetCase) {
-          // Offset trade → only real PnL affects balance; no liability release
-          newBalance = currentBalance + totalPnL;
-          newLiability = currentLiability;
+          // Offset: releasedLiability from exposure (calculateExposureFromBets), not pending-bet sum
+          const releasedLiabilityOffset = exposureBefore - exposureAfter;
+          if (totalPnL > 0) {
+            // Winning case
+            newBalance = currentBalance + totalPnL + releasedLiabilityOffset;
+          } else {
+            // Losing case
+            newBalance = currentBalance;
+          }
+          // Liability from exposure (source of truth)
+          newLiability = exposureAfter;
         } else {
           // Normal case
           newBalance = currentBalance + totalPnL + releasedLiability;
