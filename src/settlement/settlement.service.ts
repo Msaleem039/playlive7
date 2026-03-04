@@ -1977,26 +1977,8 @@ export class SettlementService {
         });
         if (!wallet) continue;
 
-        // Offset: BACK+LAY same marketId, selectionId, betValue → pnl 0, skip from totalPnL
-        const offsetBetIds = new Set<string>();
-        const pairMap = new Map<string, { back?: any; lay?: any }>();
-        for (const bet of userBets) {
-          const key = `${bet.marketId}_${bet.selectionId}_${bet.betValue ?? bet.amount ?? 0}`;
-          if (!pairMap.has(key)) pairMap.set(key, {});
-          const pair = pairMap.get(key)!;
-          const bt = String(bet.betType ?? '').toUpperCase();
-          if (bt === 'BACK') pair.back = bet;
-          else if (bt === 'LAY') pair.lay = bet;
-        }
-        for (const [, pair] of pairMap.entries()) {
-          if (pair.back && pair.lay) {
-            offsetBetIds.add(pair.back.id);
-            offsetBetIds.add(pair.lay.id);
-          }
-        }
-
         this.logger.debug(
-          `[SETTLE MARKET] user=${userId} bets=${userBets.length} offsetCount=${offsetBetIds.size} settlementId=${settlementId} isCancel=${isCancel}`,
+          `[SETTLE MARKET] user=${userId} bets=${userBets.length} settlementId=${settlementId} isCancel=${isCancel}`,
         );
 
         let totalPnL = 0;
@@ -2017,12 +1999,6 @@ export class SettlementService {
           if (isCancel) {
             totalPnL += stake;
             this.logger.debug(`[SETTLE MARKET] bet=${bet.id} CANCEL refund+=${stake} totalPnL=${totalPnL}`);
-            betUpdates.push({ id: bet.id, status: BetStatus.CANCELLED, pnl: 0 });
-            continue;
-          }
-
-          if (offsetBetIds.has(bet.id)) {
-            this.logger.debug(`[SETTLE MARKET] bet=${bet.id} OFFSET skipped`);
             betUpdates.push({ id: bet.id, status: BetStatus.CANCELLED, pnl: 0 });
             continue;
           }
@@ -2077,9 +2053,8 @@ export class SettlementService {
         const currentBalance = wallet.balance ?? 0;
         const currentLiability = wallet.liability ?? 0;
 
-        // Offset bets: no wallet impact. Only release liability (and add to balance) for NON-offset bets.
         let releasedLiability = 0;
-        const nonOffsetBets = userBets.filter((b) => !offsetBetIds.has(b.id));
+        const nonOffsetBets = userBets;
         const laySelections = new Set(
           nonOffsetBets
             .filter((b) => String(b.betType ?? '').toUpperCase() === 'LAY')
@@ -2119,12 +2094,44 @@ export class SettlementService {
           }
           releasedLiability = Math.abs(worstCaseNet === Infinity ? 0 : worstCaseNet);
         }
-        const newBalance = currentBalance + totalPnL + releasedLiability;
-        const newLiability = Math.max(0, currentLiability - releasedLiability);
+        let newBalance: number;
+        let newLiability: number;
+
+        // Offset = same selectionId has both BACK and LAY bets
+        const selectionMap = new Map<number, { back: number; lay: number }>();
+        for (const bet of userBets) {
+          const selId = Number(bet.selectionId);
+          const bt = String(bet.betType ?? '').toUpperCase();
+
+          if (!selectionMap.has(selId)) {
+            selectionMap.set(selId, { back: 0, lay: 0 });
+          }
+
+          const entry = selectionMap.get(selId)!;
+
+          if (bt === 'BACK') entry.back++;
+          if (bt === 'LAY') entry.lay++;
+        }
+
+        const isOffsetCase = Array.from(selectionMap.values()).some(
+          (v) => v.back > 0 && v.lay > 0,
+        );
+
+        if (isOffsetCase) {
+          // Offset trade → only real PnL affects balance; no liability release
+          newBalance = currentBalance + totalPnL;
+          newLiability = currentLiability;
+        } else {
+          // Normal case
+          newBalance = currentBalance + totalPnL + releasedLiability;
+          newLiability = Math.max(0, currentLiability - releasedLiability);
+        }
 
         this.logger.debug(
-          `[SETTLE MARKET] user=${userId} currentBalance=${currentBalance} currentLiability=${currentLiability} ` +
-          `releasedLiability=${releasedLiability} (excl. offset) totalPnL=${totalPnL} newBalance=${newBalance} newLiability=${newLiability}`,
+          `[SETTLE MARKET] user=${userId} isOffsetCase=${isOffsetCase} selectionMap=${JSON.stringify(Object.fromEntries(selectionMap))} ` +
+            `currentBalance=${currentBalance} currentLiability=${currentLiability} ` +
+            `releasedLiability=${releasedLiability} totalPnL=${totalPnL} ` +
+            `newBalance=${newBalance} newLiability=${newLiability}`,
         );
 
         await tx.wallet.update({
@@ -2147,7 +2154,8 @@ export class SettlementService {
         }
 
         this.logger.debug(
-          `[SETTLED] user=${userId} totalPnL=${totalPnL} releasedLiability=${releasedLiability} newBalance=${newBalance} newLiability=${newLiability}`,
+          `[SETTLED] user=${userId} isOffsetCase=${isOffsetCase} totalPnL=${totalPnL} releasedLiability=${releasedLiability} ` +
+          `newBalance=${newBalance} newLiability=${newLiability}`,
         );
         affectedUserIds.add(userId);
       }
