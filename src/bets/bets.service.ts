@@ -556,11 +556,11 @@ export class BetsService {
       const txStart = Date.now();
       const transactionResult = await this.prisma.$transaction(
         async (tx) => {
-          // ✅ COMBINED: Check user status AND wallet in parallel within transaction
+          // ✅ COMBINED: Check user status, betting_enabled, AND wallet in parallel within transaction
           const [user, wallet] = await Promise.all([
             tx.user.findUnique({
               where: { id: userId },
-              select: { id: true, isActive: true },
+              select: { id: true, isActive: true, bettingEnabled: true },
             }),
             tx.wallet.findUnique({
               where: { userId },
@@ -589,6 +589,15 @@ export class BetsService {
               },
               403,
             );
+          }
+
+          // Disable betting for all clients under a stopped agent (enforced on backend)
+          if (user.bettingEnabled === false) {
+            throw new BadRequestException({
+              success: false,
+              error: 'Betting is disabled by your agent.',
+              code: 'BETTING_DISABLED_BY_AGENT',
+            });
           }
 
           // Validate wallet exists

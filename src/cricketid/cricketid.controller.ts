@@ -19,35 +19,40 @@ export class CricketIdController {
   }
 
   /**
-   * Get all competitions/series for a specific sport
-   * GET /cricketid/series?sportId=4
-   * Returns list of competitions with competition.id, competition.name, etc.
-   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
-   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
+   * Get all leagues/competitions for a sport (vendor: v3/seriesList).
+   * GET /cricketid/series?sportId=2
+   * Returns array of { competition: { id, name }, competitionRegion, marketCount }.
+   * ✅ MULTI-SPORT: Soccer (1), Tennis (2), Cricket (4). Example Tennis: sportId=2
    */
   @Get('series')
   getSeriesList(@Query('sportId') sportId?: number) {
-    // Default to 4 (Cricket) for backward compatibility
-    const normalizedSportId = sportId ? Number(sportId) : 4;
+    const normalizedSportId = sportId !== undefined && sportId !== null ? Number(sportId) : 4;
     return this.cricketIdService.getSeriesList(normalizedSportId);
   }
 
   /**
-   * Get match details by competition ID
-   * GET /cricketid/matches?sportId=4&competitionId={competitionId}
-   * Example: GET /cricketid/matches?sportId=4&competitionId=9992899
-   * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
-   * @param competitionId - Competition ID from the series list (e.g., "9992899")
-   * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
+   * Get all matches for a competition (vendor: v3/matchList).
+   * GET /cricketid/matches?sportId=2&competitionId=12674623
+   * Or: GET /cricketid/matches?sportId=2&competition=12674623
+   * Returns array of matches with eventId for use with /markets and /bookmaker-fancy.
+   * ✅ MULTI-SPORT: Soccer (1), Tennis (2), Cricket (4)
    */
   @Get('matches')
   getMatchDetails(
-    @Query('competitionId') competitionId: string | number,
+    @Query('competitionId') competitionId?: string | number,
+    @Query('competition') competition?: string | number,
     @Query('sportId') sportId?: number,
   ) {
-    // Default to 4 (Cricket) for backward compatibility
-    const normalizedSportId = sportId ? Number(sportId) : 4;
-    return this.cricketIdService.getMatchDetails(competitionId, normalizedSportId);
+    const compId = competitionId ?? competition;
+    if (compId === undefined || compId === null || String(compId).trim() === '') {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'competitionId or competition query parameter is required',
+        error: 'Bad Request',
+      });
+    }
+    const normalizedSportId = sportId !== undefined && sportId !== null ? Number(sportId) : 4;
+    return this.cricketIdService.getMatchDetails(compId, normalizedSportId);
   }
 
   /**
@@ -127,7 +132,7 @@ export class CricketIdController {
    * Get top matches for Soccer or Tennis only.
    * GET /cricketid/top-matches?sportId=1&limit=5
    * - sportId: 1 (Soccer) or 2 (Tennis) - required
-   * - limit: max number of matches to return (default: 5, min: 1)
+   * - limit: max number of matches to return (default: 10, min: 1)
    *
    * Cricket (4) is not handled here; passing 4 will result in BadRequestException
    * from the underlying service validation.
@@ -146,7 +151,7 @@ export class CricketIdController {
     }
 
     const normalizedSportId = Number(sportId);
-    const normalizedLimit = limit !== undefined && limit !== null ? Number(limit) : 5;
+    const normalizedLimit = limit !== undefined && limit !== null ? Number(limit) : 10;
 
     return this.cricketIdService.getTopMatchesBySport(normalizedSportId, normalizedLimit);
   }

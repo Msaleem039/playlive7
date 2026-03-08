@@ -897,16 +897,20 @@ export class AuthService {
       }
     }
 
-    // Update user status
+    // Update user status and betting_enabled for target (agent/client)
     const updatedUser = await this.prisma.user.update({
       where: { id: targetUserId },
-      data: { isActive: isActive } as any,
+      data: {
+        isActive,
+        bettingEnabled: isActive, // When agent is stopped, they also cannot bet
+      } as any,
       select: {
         id: true,
         name: true,
         username: true,
         role: true,
         isActive: true,
+        bettingEnabled: true,
         parentId: true,
         commissionPercentage: true,
         createdAt: true,
@@ -914,10 +918,109 @@ export class AuthService {
       } as any,
     });
 
+    // When an agent is stopped, disable betting for entire downline (all subordinate users).
+    // When reactivated, enable betting for entire downline.
+    const downlineIds = await this.getDownlineUserIds(targetUserId);
+    if (downlineIds.length > 0) {
+      await this.prisma.user.updateMany({
+        where: { id: { in: downlineIds } },
+        data: { bettingEnabled: isActive },
+      });
+    }
+
     return {
       message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
       user: updatedUser,
     };
+  }
+
+  /**
+   * Set betting enabled/disabled for a user and optionally their entire downline.
+   * Same hierarchy rules as toggleUserStatus: parent or Super Admin only.
+   */
+  async setBettingEnabled(
+    currentUser: User,
+    targetUserId: string,
+    bettingEnabled: boolean,
+    includeDownline: boolean = true,
+  ) {
+    const targetUser = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+    });
+
+    if (!targetUser) {
+      throw new BadRequestException('User not found');
+    }
+
+    if (currentUser.role !== UserRole.SUPER_ADMIN) {
+      if (targetUser.parentId !== currentUser.id) {
+        throw new ForbiddenException('You can only change betting for your direct subordinates');
+      }
+      if (currentUser.role === UserRole.ADMIN && targetUser.role !== UserRole.AGENT && targetUser.role !== UserRole.CLIENT) {
+        throw new ForbiddenException('Admin can only change betting for Agents and Clients');
+      }
+      if (currentUser.role === UserRole.AGENT && targetUser.role !== UserRole.CLIENT) {
+        throw new ForbiddenException('Agent can only change betting for Clients');
+      }
+    }
+
+    // When disabling betting for an Agent (or Admin), always include full downline so that
+    // all clients under that agent cannot place bets. Otherwise clients would still be able to bet.
+    const forceDownline = bettingEnabled === false && (targetUser.role === UserRole.AGENT || targetUser.role === UserRole.ADMIN);
+    const applyToDownline = includeDownline || forceDownline;
+
+    await this.prisma.user.update({
+      where: { id: targetUserId },
+      data: { bettingEnabled },
+    });
+
+    if (applyToDownline) {
+      const downlineIds = await this.getDownlineUserIds(targetUserId);
+      if (downlineIds.length > 0) {
+        await this.prisma.user.updateMany({
+          where: { id: { in: downlineIds } },
+          data: { bettingEnabled },
+        });
+      }
+    }
+
+    const updated = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: {
+        id: true,
+        name: true,
+        username: true,
+        role: true,
+        isActive: true,
+        bettingEnabled: true,
+        parentId: true,
+      },
+    });
+
+    const downlineApplied = applyToDownline ? ' and entire downline' : ' (this user only)';
+    return {
+      message: `Betting ${bettingEnabled ? 'enabled' : 'disabled'} for user${downlineApplied}`,
+      user: updated,
+    };
+  }
+
+  /**
+   * Get all user IDs in the downline (subordinates) of the given user, recursively.
+   * Used to disable/enable betting for all clients under a stopped/reactivated agent.
+   */
+  private async getDownlineUserIds(userId: string): Promise<string[]> {
+    const result: string[] = [];
+    let currentLevel: string[] = [userId];
+    while (currentLevel.length > 0) {
+      const children = await this.prisma.user.findMany({
+        where: { parentId: { in: currentLevel } },
+        select: { id: true },
+      });
+      const ids = children.map((c) => c.id);
+      result.push(...ids);
+      currentLevel = ids;
+    }
+    return result;
   }
 
   /**

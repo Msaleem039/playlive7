@@ -239,6 +239,33 @@ export class AuthController {
   }
 
   /**
+   * Set betting enabled/disabled for a user (and optionally their entire downline).
+   * Same hierarchy as toggle-user-status: parent or Super Admin only.
+   * Use this to disable betting without deactivating the account.
+   *
+   * @example PATCH /auth/users/:targetUserId/betting-enabled
+   * Body: { "bettingEnabled": false }
+   * Body: { "bettingEnabled": false, "includeDownline": true }  (default)
+   * Body: { "bettingEnabled": true, "includeDownline": false } (this user only)
+   */
+  @Patch('users/:targetUserId/betting-enabled')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async setBettingEnabled(
+    @Param('targetUserId') targetUserId: string,
+    @Body() body: { bettingEnabled: boolean; includeDownline?: boolean },
+    @CurrentUser() currentUser: User,
+  ) {
+    const includeDownline = body.includeDownline !== false;
+    return this.authService.setBettingEnabled(
+      currentUser,
+      targetUserId,
+      body.bettingEnabled,
+      includeDownline,
+    );
+  }
+
+  /**
    * Update client details (Agent only)
    * Allows agents to update their client's name, password, commission, and maxWinLimit
    * Username cannot be changed

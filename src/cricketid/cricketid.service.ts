@@ -18,14 +18,24 @@ export class CricketIdService {
   private readonly retryDelay = 1000; // Initial delay in ms
   private readonly timeout = 30000; // 30 seconds timeout
 
-  // ✅ PERFORMANCE: Redis TTLs (in seconds)
+  /**
+   * Redis TTLs (in seconds) – betting-platform data refresh model.
+   * Short TTLs keep live data responsive; longer TTLs reduce vendor API load for stable data.
+   */
   private readonly REDIS_TTL = {
-    VENDOR_ODDS: 5,           // 5 seconds (odds change frequently, but 3s was too short)
-    VENDOR_FANCY: 5,          // 5 seconds (fancy data changes frequently, but 3s was too short)
-    VENDOR_BOOKMAKER: 5,      // 5 seconds (bookmaker data changes frequently, but 3s was too short)
-    VENDOR_MATCH_DETAIL: 10,  // 10 seconds (match details change less frequently)
-    SERIES_LIST: 5000,          // 30 seconds for series list (competitions)
-    MATCH_LIST: 5000,           // 20 seconds for match list per competition
+    // Odds / Fancy / Bookmaker → very frequent updates (prices move in real time)
+    VENDOR_ODDS: 4,       // 4s: Betfair odds change constantly; short TTL for accurate live betting.
+    VENDOR_FANCY: 4,      // 4s: Fancy markets update frequently; balance freshness vs API load.
+    VENDOR_BOOKMAKER: 4,  // 4s: Bookmaker lines move often; keep cache brief for responsiveness.
+
+    // Market / Match details → medium update frequency (markets open/close, status changes)
+    VENDOR_MATCH_DETAIL: 12, // 12s: Market list and match metadata; less volatile than odds.
+
+    // Match list per competition → occasional updates (new matches, start times, cancellations)
+    MATCH_LIST: 180, // 3 min: List of matches in a competition changes occasionally.
+
+    // Series list / competitions → rarely change (tournament structure is static for the season)
+    SERIES_LIST: 600, // 10 min: Competitions/series list changes rarely; longer TTL cuts API calls.
   };
 
   constructor(
@@ -90,32 +100,37 @@ export class CricketIdService {
   private async fetch<T>(path: string, params: Record<string, any> = {}): Promise<T> {
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     const url = `${this.baseUrl}${normalizedPath}`;
-
+    // When path already has query string (e.g. matchList?sportId=X?competition=Y), do not pass
+    // params so Axios uses the URL as-is. Otherwise Axios can re-serialize and turn ? into &.
+    const requestConfig: any = {
+      timeout: this.timeout,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'PlayLive-API/1.0',
+      },
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: this.timeout,
+      }),
+      httpsAgent: new https.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: this.timeout,
+      }),
+    };
+    if (!normalizedPath.includes('?')) {
+      requestConfig.params = params;
+    }
     let lastError: any;
-    
-    // Retry loop
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
         const { data } = await firstValueFrom(
-          this.http.get<T>(url, {
-            params,
-            timeout: this.timeout,
-            // Add connection keep-alive and retry settings
-            httpAgent: new http.Agent({
-              keepAlive: true,
-              keepAliveMsecs: 1000,
-              maxSockets: 50,
-              maxFreeSockets: 10,
-              timeout: this.timeout,
-            }),
-            httpsAgent: new https.Agent({
-              keepAlive: true,
-              keepAliveMsecs: 1000,
-              maxSockets: 50,
-              maxFreeSockets: 10,
-              timeout: this.timeout,
-            }),
-          }),
+          this.http.get<T>(url, requestConfig),
         );
         return data;
       } catch (error) {
@@ -247,27 +262,85 @@ export class CricketIdService {
   }
 
   /**
-   * Get all competitions/series for a specific sport
+   * Normalize vendor response to an array (handles raw array, wrapper objects, and one level of nesting).
+   */
+  private normalizeToArray<T = any>(raw: unknown, dataKeys: string[] = ['data', 'matches', 'series']): T[] {
+    if (Array.isArray(raw)) {
+      return raw as T[];
+    }
+    if (raw && typeof raw === 'object') {
+      const obj = raw as Record<string, unknown>;
+      for (const key of dataKeys) {
+        const val = obj[key];
+        if (Array.isArray(val)) {
+          return val as T[];
+        }
+        // One level of nesting: e.g. { data: { series: [...] } }
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          const inner = val as Record<string, unknown>;
+          for (const innerKey of dataKeys) {
+            if (Array.isArray(inner[innerKey])) {
+              return inner[innerKey] as T[];
+            }
+          }
+        }
+      }
+    }
+    return [];
+  }
+
+  /**
+   * Get all competitions/series (leagues) for a specific sport
    * Endpoint: /v3/seriesList?sportId={sportId}
-   * Returns list of competitions with competition.id, competition.name, etc.
+   * Returns array of { competition: { id, name }, competitionRegion, marketCount } etc.
    * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
    * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
   async getSeriesList(sportId: number = this.DEFAULT_SPORT_ID) {
-    return this.fetch('/v3/seriesList', { sportId });
+    // Build URL manually so vendor gets exact format (same pattern as matchList)
+    const url = `/v3/seriesList?sportId=${sportId}`;
+    const raw = await this.fetch(url);
+    // Vendor may return a raw array of { competition, competitionRegion, marketCount }; return as-is
+    return this.normalizeToArray(raw, ['data', 'series', 'competitions', 'list', 'result', 'items']);
   }
 
   /**
-   * Get match details by competition ID
-   * Endpoint: /v3/matchList?sportId={sportId}&competitionId={competitionId}
+   * Get match list for a competition (by competition ID from series list)
+   * Vendor: /v3/matchList?sportId={sportId}&competition={competitionId}
+   * Returns array of matches; each item includes eventId for use with /markets and /bookmaker-fancy.
    * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
-   * @param competitionId - Competition ID from the series list (e.g., "9992899")
+   * @param competitionId - Competition ID from the series list (e.g. "12597512")
    * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
   async getMatchDetails(competitionId: string | number, sportId: number = this.DEFAULT_SPORT_ID) {
-    return this.fetch('/v3/matchList', { 
-      sportId,
-      competitionId 
+    const comp = String(competitionId);
+    let raw: unknown;
+    try {
+      // Vendor API expects non-standard format: ?sportId=X?competition=Y (not &)
+      const url = `/v3/matchList?sportId=${sportId}?competition=${comp}`;
+      raw = await this.fetch(url);
+    } catch (error: any) {
+      const status = error?.response?.status ?? error?.statusCode ?? error?.getStatus?.();
+      if (status === 400) {
+        this.logger.debug(
+          `Vendor returned 400 for matchList (sportId=${sportId}, competitionId=${comp}); returning empty list`,
+        );
+        return [];
+      }
+      throw error;
+    }
+    const matches = this.normalizeToArray<any>(raw, ['data', 'matches', 'events', 'eventList']);
+    const now = new Date();
+    return matches.map((match) => {
+      const eventId = match?.event?.id ?? match?.eventId;
+      const openDate = match?.event?.openDate;
+      const hasStarted = openDate ? new Date(openDate) <= now : false;
+      return {
+        ...match,
+        ...(eventId != null && String(eventId).trim() !== '' ? { eventId: String(eventId) } : {}),
+        live: hasStarted,
+        upcoming: openDate ? !hasStarted : false,
+      };
     });
   }
 

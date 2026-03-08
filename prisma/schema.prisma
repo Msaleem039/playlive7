@@ -15,6 +15,7 @@ model User {
   password                                                        String
   role                                                            UserRole             @default(CLIENT)
   isActive                                                        Boolean              @default(true) @map("is_active")
+  bettingEnabled                                                  Boolean              @default(true) @map("betting_enabled")
   parentId                                                        String?              @map("parent_id")
   commissionPercentage                                           Float                @default(100) @map("commission_percentage")
   createdAt                                                      DateTime             @default(now()) @db.Timestamp(6) @map("created_at")
