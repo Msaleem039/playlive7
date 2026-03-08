@@ -326,8 +326,18 @@ export class AggregatorService {
           allMatches.push(...matches);
         }
 
+        // Deduplicate by eventId (same match can appear in multiple competitions, e.g. Specials + league)
+        const seenEventIds = new Set<string>();
+        const uniqueMatches = allMatches.filter((m) => {
+          const eventId = m?.event?.id ?? m?.eventId;
+          const id = eventId != null ? String(eventId) : null;
+          if (!id || seenEventIds.has(id)) return false;
+          seenEventIds.add(id);
+          return true;
+        });
+
         // Extract eventIds and get visibility map
-        const eventIds = allMatches
+        const eventIds = uniqueMatches
           .map((m) => m?.event?.id)
           .filter((id): id is string => !!id);
 
@@ -335,7 +345,7 @@ export class AggregatorService {
 
         // Filter matches by visibility (only show enabled matches)
         const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
-          allMatches,
+          uniqueMatches,
           visibilityMap,
         );
 

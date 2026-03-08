@@ -331,7 +331,16 @@ export class CricketIdService {
     }
     const matches = this.normalizeToArray<any>(raw, ['data', 'matches', 'events', 'eventList']);
     const now = new Date();
-    return matches.map((match) => {
+    // Deduplicate by eventId (vendor can return same match more than once in one response)
+    const seenEventIds = new Set<string>();
+    const uniqueMatches = matches.filter((match) => {
+      const eventId = match?.event?.id ?? match?.eventId;
+      const id = eventId != null ? String(eventId).trim() : '';
+      if (!id || seenEventIds.has(id)) return false;
+      seenEventIds.add(id);
+      return true;
+    });
+    return uniqueMatches.map((match) => {
       const eventId = match?.event?.id ?? match?.eventId;
       const openDate = match?.event?.openDate;
       const hasStarted = openDate ? new Date(openDate) <= now : false;
