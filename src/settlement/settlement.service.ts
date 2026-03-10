@@ -1266,58 +1266,17 @@ export class SettlementService {
                   `Current balanceDelta=${balanceDelta}`
                 );
           } else {
-                // ✅ GOLA MISS: BOTH bets LOSE, NO credit to wallet
-                const previousBalanceDelta = balanceDelta;
-                
                 this.logger.log(
-                  `[GOLA MISS - BALANCE UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `GOLA MISS! No balance credit. ` +
-                  `Bet1 lossAmount=${bet1LossAmount}, Bet2 lossAmount=${bet2LossAmount}, ` +
-                  `balanceDelta remains ${balanceDelta} (no change)`
+                  `[GOLA MISS - FALLBACK TO INDIVIDUAL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+                  `actualRuns=${actualRuns} outside gola zone [${minLine}, ${maxLine}). ` +
+                  `Refund pair will be processed as individual bets.`
                 );
-                
-                this.logger.log(
-                  `[GOLA MISS - UPDATING BETS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `Marking both bets as LOST - Bet1: id=${bet.id}, pnl=-${bet1LossAmount}, ` +
-                  `Bet2: id=${pairedBet.id}, pnl=-${bet2LossAmount}`
-                );
-                
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    pnl: -bet1LossAmount,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(bet.metadata as object || {}),
-                      decisionRun: actualRuns,
-                    }
-                  }
-                });
-                
-                await tx.bet.update({
-                  where: { id: pairedBet.id },
-                  data: {
-                    status: BetStatus.LOST,
-                    pnl: -bet2LossAmount,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(pairedBet.metadata as object || {}),
-                      decisionRun: actualRuns,
-                    }
-                  }
-                });
-                
-                this.logger.log(
-                  `[GOLA MISS - SUCCESS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `BOTH bets LOST (gola miss), ` +
-                  `Bet1 lossAmount=${bet1LossAmount}, Bet2 lossAmount=${bet2LossAmount}, ` +
-                  `NO balance credit (balanceDelta: ${previousBalanceDelta} -> ${balanceDelta}, unchanged), ` +
-                  `actualRuns=${actualRuns} is outside gola zone [${minLine}, ${maxLine}), ` +
-                  `Current balanceDelta=${balanceDelta}`
-                );
+
+                // ❗ IMPORTANT: remove processed flags
+                processedBetIds.delete(bet.id);
+                processedBetIds.delete(pairedBet.id);
+
+                continue;
               }
               
               // ✅ IMPORTANT: Do NOT adjust liability for refund pairs
