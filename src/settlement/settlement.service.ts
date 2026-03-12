@@ -170,8 +170,208 @@ export class SettlementService {
   
   //   return result;
   // }
-  
-  
+
+  /**
+   * Settle fancy bets manually (Admin). Entry point for POST /admin/settlement/fancy.
+   * Handles single and multiple fancy bets using FancyExposureService.getPerBetPnLForOutcome (single source of truth).
+   */
+  async settleFancyManual(
+    eventId: string,
+    selectionId: string,
+    decisionRun: number | null,
+    isCancel: boolean,
+    marketId: string | null,
+    adminId: string,
+    betIds?: string[],
+  ) {
+    if (decisionRun === null && !isCancel) {
+      throw new BadRequestException('Either decisionRun or isCancel must be provided');
+    }
+    const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
+    const actualRuns = decisionRun ?? 0;
+
+    let bets = await this.prisma.bet.findMany({
+      where: {
+        settlementId,
+        status: BetStatus.PENDING,
+        eventId,
+        selectionId: Number(selectionId),
+        ...(betIds && betIds.length > 0 ? { id: { in: betIds } } : {}),
+      },
+    });
+
+    if (bets.length === 0) {
+      bets = await this.prisma.bet.findMany({
+        where: {
+          eventId,
+          selectionId: Number(selectionId),
+          status: BetStatus.PENDING,
+          ...(betIds && betIds.length > 0 ? { id: { in: betIds } } : {}),
+          OR: [
+            { gtype: { contains: 'fancy', mode: 'insensitive' } },
+            { marketType: { contains: 'fancy', mode: 'insensitive' } },
+          ],
+        },
+      });
+      if (bets.length > 0) {
+        await this.prisma.bet.updateMany({
+          where: { id: { in: bets.map((b) => b.id) } },
+          data: { settlementId },
+        });
+      }
+    }
+
+    if (bets.length === 0) {
+      return { success: true, message: 'No pending bets to settle' };
+    }
+
+    const betsByUser = new Map<string, typeof bets>();
+    for (const bet of bets) {
+      if (!betsByUser.has(bet.userId)) betsByUser.set(bet.userId, []);
+      betsByUser.get(bet.userId)!.push(bet);
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const [userId, userBets] of betsByUser.entries()) {
+        const wallet = await tx.wallet.findUnique({ where: { userId } });
+        if (!wallet) continue;
+
+        let balanceDelta = 0;
+        let liabilityDelta = 0;
+
+        if (isCancel) {
+          for (const bet of userBets) {
+            const type = (bet.betType || '').toUpperCase();
+            const stake = bet.betValue ?? bet.amount ?? 0;
+            const lossAmount = bet.lossAmount ?? stake;
+            const liabilityAmount = type === 'LAY' || type === 'NO' ? lossAmount : stake;
+            liabilityDelta -= liabilityAmount;
+            balanceDelta += liabilityAmount;
+            await tx.bet.update({
+              where: { id: bet.id },
+              data: {
+                status: BetStatus.CANCELLED,
+                pnl: 0,
+                settledAt: new Date(),
+                updatedAt: new Date(),
+                metadata: { ...((bet.metadata as object) || {}), decisionRun: null },
+              },
+            });
+          }
+        } else {
+          // Partially hedged / gola: bets with isRefunded or refundedByBetId had liability already released at placement (REFUND tx).
+          // Do not release liability again; on win only credit profit (pnl), not stake+pnl.
+          const refundPairBetIds = new Set<string>();
+          for (const b of userBets) {
+            if (b.isRefunded === true) refundPairBetIds.add(b.id);
+            const pairedId = b.refundedByBetId;
+            if (pairedId && userBets.some((x) => x.id === pairedId)) refundPairBetIds.add(pairedId);
+          }
+
+          // One exposure read per user group (fancy_exposures) for correct credit in hedge cases
+          const marketIdForExposure = marketId ?? userBets[0]?.marketId ?? undefined;
+          const exposure = marketIdForExposure
+            ? await tx.fancyExposure.findFirst({
+                where: {
+                  userId,
+                  eventId,
+                  selectionId: Number(selectionId),
+                  marketId: marketIdForExposure,
+                },
+              })
+            : null;
+
+          const perBet = this.fancyExposureService.getPerBetPnLForOutcome(userBets, actualRuns);
+          const totalPnl = perBet.reduce((sum, { pnl }) => sum + pnl, 0);
+          const useExposureCredit =
+            exposure != null &&
+            exposure.remainingExposure > 0 &&
+            totalPnl > 0;
+          let appliedExposureCredit = false;
+
+          for (const { bet, betWins, pnl } of perBet) {
+            const type = (bet.betType || '').toUpperCase();
+            const stake = bet.betValue ?? bet.amount ?? 0;
+            const lossAmount = bet.lossAmount ?? stake;
+            const alreadyRefunded = refundPairBetIds.has(bet.id);
+            // BUG 2 FIX: Always release full liability on settlement, regardless of refund/hedge flags.
+            const liabilityAmount = type === 'LAY' || type === 'NO' ? lossAmount : stake;
+            liabilityDelta -= liabilityAmount;
+
+            if (betWins) {
+              if (useExposureCredit && !appliedExposureCredit) {
+                // Gola / range fancy: remaining_exposure is the effective stake, totalPnl is the net profit.
+                const effectiveStake = exposure!.remainingExposure;
+                const profit = totalPnl;
+                balanceDelta += effectiveStake + profit;
+                appliedExposureCredit = true;
+              } else if (!useExposureCredit) {
+                // BUG 1 FIX: Always treat pnl as profit; credit = stake + profit for normal bets,
+                // and profit only for already-refunded (hedged) bets.
+                const profit = pnl;
+                const credit = alreadyRefunded ? profit : stake + profit;
+                balanceDelta += credit;
+              }
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.WON,
+                  pnl,
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                  metadata: { ...((bet.metadata as object) || {}), decisionRun: actualRuns },
+                },
+              });
+            } else {
+              await tx.bet.update({
+                where: { id: bet.id },
+                data: {
+                  status: BetStatus.LOST,
+                  pnl,
+                  settledAt: new Date(),
+                  updatedAt: new Date(),
+                  metadata: { ...((bet.metadata as object) || {}), decisionRun: actualRuns },
+                },
+              });
+            }
+          }
+        }
+
+        if (balanceDelta !== 0 || liabilityDelta !== 0) {
+          await tx.wallet.update({
+            where: { userId },
+            data: {
+              balance: wallet.balance + balanceDelta,
+              liability: Math.max(0, wallet.liability + liabilityDelta),
+            },
+          });
+          if (balanceDelta > 0) {
+            await tx.transaction.create({
+              data: {
+                walletId: wallet.id,
+                amount: balanceDelta,
+                type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+                description: isCancel
+                  ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
+                  : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+              },
+            });
+          }
+        }
+      }
+
+      // Clean up exposure records for this selection so they do not go stale after settlement
+      await tx.fancyExposure.deleteMany({
+        where: {
+          eventId,
+          selectionId: Number(selectionId),
+        },
+      });
+    }, { maxWait: 15000, timeout: 30000 });
+
+    return { success: true, message: 'Fancy bets settled successfully' };
+  }
+
   // async settleFancyManual(
   //   eventId: string,
   //   selectionId: string,
@@ -375,34 +575,34 @@ export class SettlementService {
   
   //   return { success: true, message: 'Fancy bets settled successfully' };
   // }
-  private evaluateFancySingle(
-    bets: Array<{
-      id: string;
-      betType: string | null;
-      betRate: number | null;
-      odds: number | null;
-    }>,
-    actualRuns: number,
-  ): Map<string, boolean> {
-    const result = new Map<string, boolean>();
+  // private evaluateFancySingle(
+  //   bets: Array<{
+  //     id: string;
+  //     betType: string | null;
+  //     betRate: number | null;
+  //     odds: number | null;
+  //   }>,
+  //   actualRuns: number,
+  // ): Map<string, boolean> {
+  //   const result = new Map<string, boolean>();
 
-    for (const bet of bets) {
-        const line = bet.betRate ?? bet.odds ?? 0;
-        const betType = bet.betType?.toUpperCase();
+  //   for (const bet of bets) {
+  //       const line = bet.betRate ?? bet.odds ?? 0;
+  //       const betType = bet.betType?.toUpperCase();
 
-        const isYes = betType === 'YES' || betType === 'BACK';
-        const isNo = betType === 'NO' || betType === 'LAY';
+  //       const isYes = betType === 'YES' || betType === 'BACK';
+  //       const isNo = betType === 'NO' || betType === 'LAY';
 
-        let isWin = false;
+  //       let isWin = false;
 
-      if (isNo && actualRuns < line) isWin = true;
-      if (isYes && actualRuns >= line) isWin = true;
+  //     if (isNo && actualRuns < line) isWin = true;
+  //     if (isYes && actualRuns >= line) isWin = true;
 
-        result.set(bet.id, isWin);
-    }
+  //       result.set(bet.id, isWin);
+  //   }
 
-    return result;
-  }
+  //   return result;
+  // }
 
   // async settleFancyManual(
   //   eventId: string,
@@ -715,829 +915,866 @@ export class SettlementService {
   
   //   return { success: true, message: 'Fancy bets settled successfully' };
   // }
-  async settleFancyManual(
-    eventId: string,
-    selectionId: string,
-    decisionRun: number | null,
-    isCancel: boolean,
-    marketId: string | null,
-    adminId: string,
-    betIds?: string[],
+  // async settleFancyManual(
+  //   eventId: string,
+  //   selectionId: string,
+  //   decisionRun: number | null,
+  //   isCancel: boolean,
+  //   marketId: string | null,
+  //   adminId: string,
+  //   betIds?: string[],
+  // ) {
+  //   const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
+  //   this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement for event=${eventId}, selection=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds?.join(',') || 'all'}`);
+  //   this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement: settlementId=${settlementId}, eventId=${eventId}, selectionId=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds ? betIds.join(',') : 'all'}`);
+  
+  //   // 1️⃣ Fetch pending bets (new + legacy)
+  //   let bets = await this.prisma.bet.findMany({
+  //     where: {
+  //       settlementId,
+  //       status: BetStatus.PENDING,
+  //       eventId,
+  //       selectionId: Number(selectionId),
+  //       ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //     },
+  //   });
+  
+  //   this.logger.log(`[FANCY SETTLEMENT FETCH] Settlement ${settlementId}: Found ${bets.length} bets with settlementId=${settlementId}`);
+  
+  //   if (bets.length === 0) {
+  //     bets = await this.prisma.bet.findMany({
+  //       where: {
+  //         eventId,
+  //         selectionId: Number(selectionId),
+  //         status: BetStatus.PENDING,
+  //         ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
+  //         OR: [
+  //           { gtype: { contains: 'fancy', mode: 'insensitive' } },
+  //           { marketType: { contains: 'fancy', mode: 'insensitive' } },
+  //         ],
+  //       },
+  //     });
+  
+  //     this.logger.log(`[FANCY SETTLEMENT FETCH LEGACY] Settlement ${settlementId}: Found ${bets.length} legacy bets without settlementId`);
+  
+  //     if (bets.length > 0) {
+  //       await this.prisma.bet.updateMany({
+  //         where: { id: { in: bets.map(b => b.id) } },
+  //         data: { settlementId },
+  //       });
+  //       this.logger.log(`[FANCY SETTLEMENT UPDATE] Settlement ${settlementId}: Updated ${bets.length} bets with settlementId`);
+  //     }
+  //   }
+  
+  //   // Log all bets details
+  //   this.logger.log(`[FANCY SETTLEMENT BETS FOUND] Settlement ${settlementId}: Found ${bets.length} pending bets to settle`);
+  //   for (const bet of bets) {
+  //     this.logger.log(
+  //       `[FANCY SETTLEMENT BET DETAIL] Bet ${bet.id}: userId=${bet.userId}, ` +
+  //       `betType=${bet.betType}, betRate=${bet.betRate}, odds=${bet.odds}, ` +
+  //       `amount=${bet.amount}, betValue=${bet.betValue}, ` +
+  //       `winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
+  //       `marketId=${bet.marketId}, selectionId=${bet.selectionId}, ` +
+  //       `isRefunded=${bet.isRefunded}, refundedByBetId=${bet.refundedByBetId}, ` +
+  //       `status=${bet.status}`
+  //     );
+  //   }
+  
+  //   if (bets.length === 0) return { success: true, message: 'No pending bets to settle' };
+  //   if (decisionRun === null && !isCancel) throw new BadRequestException('Either decisionRun or isCancel must be provided');
+  
+  //   const actualRuns = decisionRun ?? 0;
+  //   this.logger.log(`[FANCY SETTLEMENT PARAMS] Settlement ${settlementId}: actualRuns=${actualRuns}, isCancel=${isCancel}`);
+  
+  //   const affectedUserIds = new Set<string>();
+  
+  //   await this.prisma.$transaction(async (tx) => {
+  //     // ✅ STEP 1: Build a map of refund pairs
+  //     // Key: bet.id that has isRefunded=true and refundedByBetId
+  //     // Value: the paired bet fetched using refundedByBetId
+  //     const refundPairMap = new Map<string, typeof bets[0]>();
+  //     const processedBetIds = new Set<string>();
+      
+  //     // Identify bets that are part of refund pairs
+  //     const refundedBets = bets.filter(b => b.isRefunded === true && b.refundedByBetId !== null);
+      
+  //     this.logger.log(
+  //       `[REFUND PAIR DETECTION] Settlement ${settlementId}: Found ${refundedBets.length} bets with isRefunded=true and refundedByBetId out of ${bets.length} total bets`
+  //     );
+      
+  //     // Log all refunded bets
+  //     for (const refundedBet of refundedBets) {
+  //       this.logger.log(
+  //         `[REFUND PAIR DETECTION DETAIL] Bet ${refundedBet.id}: ` +
+  //         `userId=${refundedBet.userId}, refundedByBetId=${refundedBet.refundedByBetId}, ` +
+  //         `betType=${refundedBet.betType}, betRate=${refundedBet.betRate}, odds=${refundedBet.odds}, ` +
+  //         `amount=${refundedBet.amount}, winAmount=${refundedBet.winAmount}, lossAmount=${refundedBet.lossAmount}`
+  //       );
+  //     }
+      
+  //     // Build refund pair map by fetching paired bets
+  //     this.logger.log(`[REFUND PAIR BUILDING] Settlement ${settlementId}: Building refund pair map for ${refundedBets.length} refunded bets`);
+      
+  //     for (const refundedBet of refundedBets) {
+  //       if (!refundedBet.refundedByBetId) {
+  //         this.logger.warn(`[REFUND PAIR SKIP] Bet ${refundedBet.id} has isRefunded=true but refundedByBetId is null`);
+  //         continue;
+  //       }
+        
+  //       this.logger.log(
+  //         `[REFUND PAIR SEARCH] Settlement ${settlementId}: Searching for paired bet ${refundedBet.refundedByBetId} for refunded bet ${refundedBet.id}`
+  //       );
+        
+  //       // Fetch the paired bet using refundedByBetId
+  //       const pairedBet = bets.find(b => b.id === refundedBet.refundedByBetId);
+        
+  //       if (pairedBet) {
+  //         refundPairMap.set(refundedBet.id, pairedBet);
+  //         refundPairMap.set(pairedBet.id, refundedBet);
+  //         this.logger.log(
+  //           `[REFUND PAIR FOUND IN BATCH] Settlement ${settlementId}: Bet ${refundedBet.id} paired with bet ${pairedBet.id} (found in current batch)`
+  //         );
+  //       } else {
+  //         // Paired bet might not be in the current settlement batch, fetch from DB
+  //         // Only include if it matches the same settlement criteria
+  //         this.logger.log(
+  //           `[REFUND PAIR DB FETCH] Settlement ${settlementId}: Paired bet ${refundedBet.refundedByBetId} not in batch, fetching from DB`
+  //         );
+          
+  //         const pairedBetFromDb = await tx.bet.findUnique({
+  //           where: { id: refundedBet.refundedByBetId },
+  //         });
+          
+  //         if (
+  //           pairedBetFromDb &&
+  //           pairedBetFromDb.status === BetStatus.PENDING &&
+  //           pairedBetFromDb.eventId === eventId &&
+  //           pairedBetFromDb.selectionId === Number(selectionId)
+  //         ) {
+  //           refundPairMap.set(refundedBet.id, pairedBetFromDb as any);
+  //           refundPairMap.set(pairedBetFromDb.id, refundedBet);
+  //           // Add to bets array so it gets processed (avoid duplicates)
+  //           if (!bets.find(b => b.id === pairedBetFromDb.id)) {
+  //             bets.push(pairedBetFromDb as any);
+  //             this.logger.log(
+  //               `[REFUND PAIR ADDED] Settlement ${settlementId}: Added paired bet ${pairedBetFromDb.id} to bets array. Total bets now: ${bets.length}`
+  //             );
+  //           } else {
+  //             this.logger.log(
+  //               `[REFUND PAIR DUPLICATE] Settlement ${settlementId}: Paired bet ${pairedBetFromDb.id} already in bets array`
+  //             );
+  //           }
+  //           this.logger.log(
+  //             `[REFUND PAIR FOUND DB] Settlement ${settlementId}: Bet ${refundedBet.id} paired with bet ${pairedBetFromDb.id} (fetched from DB, added to settlement)`
+  //           );
+  //         } else if (pairedBetFromDb) {
+  //           this.logger.warn(
+  //             `[REFUND PAIR SKIPPED] Settlement ${settlementId}: Bet ${refundedBet.id} has paired bet ${refundedBet.refundedByBetId} ` +
+  //             `but it doesn't match settlement criteria (status=${pairedBetFromDb.status}, ` +
+  //             `eventId=${pairedBetFromDb.eventId} (expected ${eventId}), selectionId=${pairedBetFromDb.selectionId} (expected ${selectionId}))`
+  //           );
+  //         } else {
+  //           this.logger.warn(
+  //             `[REFUND PAIR NOT FOUND] Settlement ${settlementId}: Paired bet ${refundedBet.refundedByBetId} not found in database`
+  //           );
+  //         }
+  //       }
+  //     }
+      
+  //     this.logger.log(
+  //       `[REFUND PAIR MAP COMPLETE] Settlement ${settlementId}: Refund pair map built with ${refundPairMap.size / 2} pairs. ` +
+  //       `Total bets after adding paired bets: ${bets.length}`
+  //     );
+
+  //     // 2️⃣ Group bets by userId AND marketId + selectionId
+  //     this.logger.log(`[BET GROUPING] Settlement ${settlementId}: Grouping ${bets.length} bets by userId and marketId`);
+      
+  //     const betsByUserAndMarket = new Map<string, Map<string, typeof bets>>();
+  //     for (const bet of bets) {
+  //       const userMap = betsByUserAndMarket.get(bet.userId) || new Map();
+  //       const marketKey = `${bet.marketId}_${bet.selectionId}`;
+  //       const marketBets = userMap.get(marketKey) || [];
+  //       marketBets.push(bet);
+  //       userMap.set(marketKey, marketBets);
+  //       betsByUserAndMarket.set(bet.userId, userMap);
+  //     }
+      
+  //     this.logger.log(
+  //       `[BET GROUPING COMPLETE] Settlement ${settlementId}: Grouped into ${betsByUserAndMarket.size} users, ` +
+  //       `total market groups: ${Array.from(betsByUserAndMarket.values()).reduce((sum, map) => sum + map.size, 0)}`
+  //     );
+  
+  //     for (const [userId, userMarkets] of betsByUserAndMarket.entries()) {
+  //       this.logger.log(
+  //         `[USER PROCESSING START] Settlement ${settlementId}: Processing user ${userId} with ${userMarkets.size} market groups`
+  //       );
+        
+  //       const wallet = await tx.wallet.findUnique({ where: { userId } });
+  //       if (!wallet) {
+  //         this.logger.warn(`[USER WALLET MISSING] Settlement ${settlementId}: Wallet not found for user ${userId}, skipping`);
+  //         continue;
+  //       }
+        
+  //       this.logger.log(
+  //         `[USER WALLET INIT] Settlement ${settlementId}: User ${userId} - ` +
+  //         `Initial balance=${wallet.balance}, liability=${wallet.liability}`
+  //       );
+  
+  //       let balanceDelta = 0;
+  //       let liabilityDelta = 0;
+        
+  //       this.logger.log(
+  //         `[USER DELTA INIT] Settlement ${settlementId}: User ${userId} - ` +
+  //         `Initial balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+  //       );
+  
+  //       for (const [marketKey, userBets] of userMarkets.entries()) {
+  //         this.logger.log(
+  //           `[MARKET PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Processing ${userBets.length} bets. ` +
+  //           `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+  //         );
+          
+  //         // Log all bets in this market
+  //         for (const bet of userBets) {
+  //           this.logger.log(
+  //             `[MARKET BET DETAIL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Bet ${bet.id}: betType=${bet.betType}, betRate=${bet.betRate}, odds=${bet.odds}, ` +
+  //             `amount=${bet.amount}, winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
+  //             `isRefunded=${bet.isRefunded}, refundedByBetId=${bet.refundedByBetId}, ` +
+  //             `processed=${processedBetIds.has(bet.id)}`
+  //           );
+  //         }
+
+  //         // Step: Identify refund bets
+  //         const refundBets = userBets.filter(b => b.isRefunded && b.refundedByBetId !== null);
+
+  //         this.logger.log(
+  //           `[GOLA DEBUG] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Refund bets found=${refundBets.length}, all user bets=${userBets.length}`
+  //         );
+          
+  //         // Log refund bets details
+  //         for (const refundBet of refundBets) {
+  //           this.logger.log(
+  //             `[GOLA REFUND BET DETAIL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Refund bet ${refundBet.id}: betType=${refundBet.betType}, ` +
+  //             `betRate=${refundBet.betRate}, odds=${refundBet.odds}, ` +
+  //             `refundedByBetId=${refundBet.refundedByBetId}, ` +
+  //             `hasPairInMap=${refundPairMap.has(refundBet.id)}`
+  //           );
+  //         }
+
+  //         this.logger.log(
+  //           `[GOLA RANGE FANCY] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Found ${refundBets.length} refund bets (isRefunded=true, refundedByBetId != null)`
+  //         );
+
+  //         // ✅ CRITICAL: Gola pair should ONLY be created when refundBets.length === 2
+  //         // AND both bets form a valid bidirectional pair
+  //         let golaPair: [typeof userBets[0], typeof userBets[0]] | null = null;
+
+  //         if (refundBets.length === 2) {
+  //           // Verify that the two refund bets form a valid bidirectional pair
+  //           const bet1 = refundBets[0];
+  //           const bet2 = refundBets[1];
+            
+  //           // Check if bet1 and bet2 are paired with each other (bidirectional)
+  //           const bet1Paired = refundPairMap.get(bet1.id);
+  //           const bet2Paired = refundPairMap.get(bet2.id);
+            
+  //           const isValidPair = 
+  //             (bet1Paired?.id === bet2.id && bet2Paired?.id === bet1.id) ||
+  //             (bet1.refundedByBetId === bet2.id && bet2.refundedByBetId === bet1.id);
+            
+  //           if (isValidPair) {
+  //             golaPair = [bet1, bet2];
+              
+  //             this.logger.log(
+  //               `[GOLA PAIR SELECTED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Valid gola pair created (refundBets.length === 2). ` +
+  //               `Bet1: id=${golaPair[0].id}, type=${golaPair[0].betType}, line=${golaPair[0].betRate ?? golaPair[0].odds}, ` +
+  //               `Bet2: id=${golaPair[1].id}, type=${golaPair[1].betType}, line=${golaPair[1].betRate ?? golaPair[1].odds}, ` +
+  //               `actualRuns=${actualRuns}, ` +
+  //               `bidirectional pair verified: bet1.refundedByBetId=${bet1.refundedByBetId}, bet2.refundedByBetId=${bet2.refundedByBetId}`
+  //             );
+  //           } else {
+  //             this.logger.warn(
+  //               `[GOLA PAIR INVALID] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `refundBets.length === 2 but bets do NOT form a valid bidirectional pair. ` +
+  //               `Bet1: id=${bet1.id}, refundedByBetId=${bet1.refundedByBetId}, ` +
+  //               `Bet2: id=${bet2.id}, refundedByBetId=${bet2.refundedByBetId}, ` +
+  //               `bet1Paired=${bet1Paired?.id || 'null'}, bet2Paired=${bet2Paired?.id || 'null'}. ` +
+  //               `Skipping gola logic, will process as individual refund pairs.`
+  //             );
+  //           }
+  //         } else if (refundBets.length > 2) {
+  //           this.logger.log(
+  //             `[GOLA PAIR SKIPPED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `refundBets.length=${refundBets.length} (expected exactly 2). ` +
+  //             `Gola logic requires exactly 2 refund bets. ` +
+  //             `Skipping gola pair creation, will process refund bets as individual pairs. ` +
+  //             `Refund bet IDs: ${refundBets.map(b => b.id).join(', ')}`
+  //           );
+  //         } else if (refundBets.length === 1) {
+  //           this.logger.log(
+  //             `[GOLA PAIR INSUFFICIENT] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Only ${refundBets.length} refund bet found, need exactly 2 for gola pair. ` +
+  //             `Skipping gola logic, will process as individual refund pair.`
+  //           );
+  //         }
+
+  //         // ✅ Process refund pairs first
+  //         // CRITICAL: If golaPair exists, ONLY process that specific pair
+  //         // If golaPair is null, process ALL refund pairs individually
+  //         this.logger.log(
+  //           `[REFUND PAIR PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Starting refund pair processing. ` +
+  //           `Total userBets=${userBets.length}, refundBets=${refundBets.length}, ` +
+  //           `golaPair=${golaPair ? `[${golaPair[0].id}, ${golaPair[1].id}]` : 'null (will process all refund pairs)'}, ` +
+  //           `processedBetIds=${Array.from(processedBetIds).join(',') || 'none'}`
+  //         );
+          
+  //         // ✅ Process all refund pairs (either gola pair only, or all refund pairs if no gola)
+  //           for (const bet of userBets) {
+  //           // Skip if already processed
+  //           if (processedBetIds.has(bet.id)) {
+  //             this.logger.log(
+  //               `[REFUND PAIR SKIP PROCESSED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Bet ${bet.id} already processed, skipping`
+  //             );
+  //             continue;
+  //           }
+            
+  //           // Check if this bet is part of a refund pair
+  //           const isRefundedBet = bet.isRefunded === true && bet.refundedByBetId !== null;
+            
+  //           this.logger.log(
+  //             `[REFUND PAIR CHECK] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Bet ${bet.id}: isRefundedBet=${isRefundedBet}, ` +
+  //             `refundedByBetId=${bet.refundedByBetId}, ` +
+  //             `hasPairInMap=${refundPairMap.has(bet.id)}`
+  //           );
+            
+  //           // ✅ CRITICAL: If golaPair exists, ONLY process that specific pair
+  //           if (golaPair) {
+  //             const isInGolaPair = bet.id === golaPair[0].id || bet.id === golaPair[1].id;
+  //             if (!isInGolaPair) {
+  //               this.logger.log(
+  //                 `[REFUND PAIR SKIP NOT GOLA] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `Bet ${bet.id} is refunded but not in gola pair [${golaPair[0].id}, ${golaPair[1].id}], skipping. ` +
+  //                 `Gola mode: only processing the gola pair.`
+  //               );
+  //               continue; // Skip all other refund bets when in gola mode
+  //             }
+  //           }
+            
+  //           if (isRefundedBet && refundPairMap.has(bet.id)) {
+  //             const pairedBet = refundPairMap.get(bet.id);
+  //             if (!pairedBet) {
+  //               this.logger.warn(
+  //                 `[REFUND PAIR MISSING] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `Bet ${bet.id} has isRefunded=true but paired bet not found in map`
+  //               );
+  //               continue;
+  //             }
+              
+  //             // ✅ CRITICAL: Verify paired bet is not already processed (prevents bet reuse)
+  //             if (processedBetIds.has(pairedBet.id)) {
+  //               this.logger.warn(
+  //                 `[REFUND PAIR DUPLICATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `Bet ${bet.id} is paired with ${pairedBet.id}, but ${pairedBet.id} is already processed. ` +
+  //                 `This indicates bet reuse. Skipping bet ${bet.id}.`
+  //               );
+  //               continue;
+  //             }
+              
+  //             // ✅ CRITICAL: If golaPair exists, verify this pair matches the gola pair exactly
+  //             if (golaPair) {
+  //               const isExactGolaPair = (bet.id === golaPair[0].id && pairedBet.id === golaPair[1].id) ||
+  //                                      (bet.id === golaPair[1].id && pairedBet.id === golaPair[0].id);
+  //               if (!isExactGolaPair) {
+  //                 this.logger.log(
+  //                   `[REFUND PAIR SKIP NOT GOLA] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                   `Refund pair [${bet.id}, ${pairedBet.id}] does not match gola pair [${golaPair[0].id}, ${golaPair[1].id}], skipping. ` +
+  //                   `Gola mode: only processing the gola pair.`
+  //                 );
+  //                 continue;
+  //               }
+  //             }
+              
+  //             // ✅ Mark both bets as processed BEFORE processing to prevent reuse
+  //             processedBetIds.add(bet.id);
+  //             processedBetIds.add(pairedBet.id);
+              
+  //             this.logger.log(
+  //               `[REFUND PAIR PROCESSING] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Processing refund pair. ` +
+  //               `Marked bets as processed: ${bet.id}, ${pairedBet.id}. ` +
+  //               `Total processed: ${processedBetIds.size}, ` +
+  //               `isGolaPair=${golaPair ? 'YES' : 'NO'}`
+  //             );
+              
+  //             this.logger.log(
+  //               `[GOLA REFUND PAIR] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+  //               `Processing refund pair - Bet1: id=${bet.id}, type=${bet.betType}, line=${bet.betRate ?? bet.odds}, ` +
+  //               `amount=${bet.amount}, winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
+  //               `Bet2: id=${pairedBet.id}, type=${pairedBet.betType}, line=${pairedBet.betRate ?? pairedBet.odds}, ` +
+  //               `amount=${pairedBet.amount}, winAmount=${pairedBet.winAmount}, lossAmount=${pairedBet.lossAmount}`
+  //             );
+              
+  //             // ✅ REFUND PAIR SETTLEMENT: Both bets win/lose together based on GOLA ZONE
+  //             // Gola zone = [minLine, maxLine) where minLine is BACK line, maxLine is NO line
+  //             // - If actualRuns is IN gola zone: BOTH WIN, credit both winAmounts
+  //             // - If actualRuns is OUTSIDE gola zone: BOTH LOSE, NO credit
+  //             const bet1Line = Number(bet.betRate ?? bet.odds ?? 0);
+  //             const bet2Line = Number(pairedBet.betRate ?? pairedBet.odds ?? 0);
+  //             const bet1Type = bet.betType?.toUpperCase() ?? '';
+  //             const bet2Type = pairedBet.betType?.toUpperCase() ?? '';
+              
+  //             // Determine which bet is BACK and which is NO
+  //             const isbet1Back = (bet1Type === 'BACK' || bet1Type === 'YES');
+  //             const isbet2Back = (bet2Type === 'BACK' || bet2Type === 'YES');
+              
+  //             // Calculate gola range: minLine (BACK line) to maxLine (NO line)
+  //             // Gola zone is where BOTH bets win
+  //             let minLine: number, maxLine: number;
+  //             if (isbet1Back && !isbet2Back) {
+  //               // bet1 is BACK, bet2 is NO
+  //               minLine = bet1Line;
+  //               maxLine = bet2Line;
+  //             } else if (!isbet1Back && isbet2Back) {
+  //               // bet1 is NO, bet2 is BACK
+  //               minLine = bet2Line;
+  //               maxLine = bet1Line;
+  //             } else {
+  //               // Both same type - use min/max
+  //               minLine = Math.min(bet1Line, bet2Line);
+  //               maxLine = Math.max(bet1Line, bet2Line);
+  //             }
+              
+  //             // ✅ GOLA ZONE CHECK: actualRuns >= minLine AND actualRuns < maxLine
+  //             // Score must be >= BACK line AND < NO line (strictly less than, NOT equal)
+  //             const isGolaHit = actualRuns >= minLine && actualRuns < maxLine;
+              
+  //             this.logger.log(
+  //               `[GOLA ZONE EVALUATION] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+  //               `Bet1: ${bet1Type} @ ${bet1Line}, Bet2: ${bet2Type} @ ${bet2Line}, ` +
+  //               `Gola Zone: [${minLine}, ${maxLine}) [minLine inclusive, maxLine exclusive], ` +
+  //               `actualRuns=${actualRuns}, Condition: ${actualRuns} >= ${minLine} && ${actualRuns} < ${maxLine} = ${isGolaHit}, ` +
+  //               `isCancel=${isCancel}`
+  //             );
+  
+  //             if (isCancel) {
+  //               // On cancel: mark both bets as cancelled
+  //               await tx.bet.update({
+  //                 where: { id: bet.id },
+  //                 data: { 
+  //                   status: BetStatus.CANCELLED, 
+  //                   pnl: 0, 
+  //                   settledAt: new Date(), 
+  //                   updatedAt: new Date(),
+  //                   metadata: {
+  //                     ...(bet.metadata as object || {}),
+  //                     decisionRun: null,
+  //                   }
+  //                 }
+  //               });
+  //               await tx.bet.update({
+  //                 where: { id: pairedBet.id },
+  //                 data: { 
+  //                   status: BetStatus.CANCELLED, 
+  //                   pnl: 0, 
+  //                   settledAt: new Date(), 
+  //                   updatedAt: new Date(),
+  //                   metadata: {
+  //                     ...(pairedBet.metadata as object || {}),
+  //                     decisionRun: null,
+  //                   }
+  //                 }
+  //               });
+  //               continue;
+  //             }
+              
+  //             const bet1WinAmount = bet.winAmount ?? bet.amount ?? 0;
+  //             const bet1LossAmount = bet.lossAmount ?? bet.amount ?? 0;
+  //             const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
+  //             const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
+              
+  //             this.logger.log(
+  //               `[GOLA AMOUNTS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+  //               `Bet1: winAmount=${bet1WinAmount}, lossAmount=${bet1LossAmount}, ` +
+  //               `Bet2: winAmount=${bet2WinAmount}, lossAmount=${bet2LossAmount}, ` +
+  //               `Total winAmount=${bet1WinAmount + bet2WinAmount}, ` +
+  //               `isGolaHit=${isGolaHit}, balanceDelta before=${balanceDelta}`
+  //             );
+              
+  //             if (isGolaHit) {
+  //               // ✅ GOLA HIT: BOTH bets WIN, credit both winAmounts
+  //               const previousBalanceDelta = balanceDelta;
+  //               const winAmountToAdd = bet1WinAmount + bet2WinAmount;
+  //               balanceDelta += winAmountToAdd;
+  
+  //               this.logger.log(
+  //                 `[GOLA HIT - BALANCE UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `GOLA HIT! Adding winAmount to balanceDelta. ` +
+  //                 `Bet1 winAmount=${bet1WinAmount}, Bet2 winAmount=${bet2WinAmount}, ` +
+  //                 `Total winAmount=${winAmountToAdd}, ` +
+  //                 `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd})`
+  //               );
+                
+  //               this.logger.log(
+  //                 `[GOLA HIT - UPDATING BETS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `Marking both bets as WON - Bet1: id=${bet.id}, pnl=${bet1WinAmount}, ` +
+  //                 `Bet2: id=${pairedBet.id}, pnl=${bet2WinAmount}`
+  //               );
+  
+  //             await tx.bet.update({
+  //               where: { id: bet.id },
+  //                 data: {
+  //                   status: BetStatus.WON,
+  //                   pnl: bet1WinAmount,
+  //                   settledAt: new Date(),
+  //                   updatedAt: new Date(),
+  //                   metadata: {
+  //                     ...(bet.metadata as object || {}),
+  //                     decisionRun: actualRuns,
+  //                   }
+  //                 }
+  //               });
+                
+  //               await tx.bet.update({
+  //                 where: { id: pairedBet.id },
+  //                 data: {
+  //                   status: BetStatus.WON,
+  //                   pnl: bet2WinAmount,
+  //                   settledAt: new Date(),
+  //                   updatedAt: new Date(),
+  //                   metadata: {
+  //                     ...(pairedBet.metadata as object || {}),
+  //                     decisionRun: actualRuns,
+  //                   }
+  //                 }
+  //               });
+                
+  //               this.logger.log(
+  //                 `[GOLA HIT - SUCCESS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `BOTH bets WON (gola hit), ` +
+  //                 `Bet1 winAmount=${bet1WinAmount}, Bet2 winAmount=${bet2WinAmount}, ` +
+  //                 `Total winAmount=${winAmountToAdd}, ` +
+  //                 `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd}), ` +
+  //                 `Current balanceDelta=${balanceDelta}`
+  //               );
+  //         } else {
+  //               this.logger.log(
+  //                 `[GOLA MISS - FALLBACK TO INDIVIDUAL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //                 `actualRuns=${actualRuns} outside gola zone [${minLine}, ${maxLine}). ` +
+  //                 `Refund pair will be processed as individual bets.`
+  //               );
+
+  //               // ❗ IMPORTANT: remove processed flags
+  //               processedBetIds.delete(bet.id);
+  //               processedBetIds.delete(pairedBet.id);
+
+  //               continue;
+  //             }
+              
+  //             // ✅ IMPORTANT: Do NOT adjust liability for refund pairs
+  //             // Liability was already released at placement time
+  //             this.logger.log(
+  //               `[GOLA REFUND PAIR COMPLETE] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
+  //               `Refund pair settlement completed - Bet1: ${bet.id}, Bet2: ${pairedBet.id}, ` +
+  //               `isGolaHit=${isGolaHit}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta} (no liability change for refund pairs)`
+  //             );
+  //             continue;
+  //           }
+  //         }
+
+  //         this.logger.log(
+  //           `[GOLA RANGE FANCY COMPLETE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Gola/range fancy processing completed. ` +
+  //           `Total refund bets found=${refundBets.length}, ` +
+  //           `Gola pair selected=${golaPair ? `[${golaPair[0].id}, ${golaPair[1].id}]` : 'NO'}, ` +
+  //           `Processed refund pairs=${processedBetIds.size / 2}, ` +
+  //           `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}, ` +
+  //           `Remaining unprocessed bets=${userBets.filter(b => !processedBetIds.has(b.id)).length}`
+  //         );
+
+  //         // ✅ Handle individual bets (not part of refund pairs)
+  //         const unprocessedBets = userBets.filter(b => !processedBetIds.has(b.id));
+  //         this.logger.log(
+  //           `[INDIVIDUAL BET PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Starting individual bet processing. ` +
+  //           `Unprocessed bets=${unprocessedBets.length} out of ${userBets.length} total, ` +
+  //           `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+  //         );
+          
+  //         for (const bet of unprocessedBets) {
+  //           // Skip if already processed as part of a refund pair
+  //           if (processedBetIds.has(bet.id)) {
+  //             this.logger.log(
+  //               `[INDIVIDUAL BET SKIP PROCESSED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Bet ${bet.id} already processed, skipping`
+  //             );
+  //             continue;
+  //           }
+            
+  //           this.logger.log(
+  //             `[INDIVIDUAL FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
+  //             `Processing individual bet ${bet.id}`
+  //           );
+            
+  //             const stake = bet.amount ?? 0;
+  //             const betType = bet.betType?.toUpperCase() ?? '';
+  //             const winAmount = bet.winAmount ?? stake;
+  //             const lossAmount = bet.lossAmount ?? stake;
+  //             const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
+  
+  //           this.logger.log(
+  //             `[INDIVIDUAL BET CALC] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Bet ${bet.id}: stake=${stake}, betType=${betType}, ` +
+  //             `winAmount=${winAmount}, lossAmount=${lossAmount}, liabilityAmount=${liabilityAmount}, ` +
+  //             `betRate=${bet.betRate}, odds=${bet.odds}`
+  //           );
+            
+  //           if (isCancel) {
+  //             const previousBalanceDelta = balanceDelta;
+  //             const previousLiabilityDelta = liabilityDelta;
+  //             balanceDelta += liabilityAmount;
+  //             liabilityDelta -= liabilityAmount;
+              
+  //             this.logger.log(
+  //               `[INDIVIDUAL BET CANCEL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Bet ${bet.id} CANCELLED. ` +
+  //               `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${liabilityAmount}), ` +
+  //               `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
+  //             );
+  
+  //             await tx.bet.update({
+  //               where: { id: bet.id },
+  //               data: { 
+  //                 status: BetStatus.CANCELLED, 
+  //                 pnl: 0, 
+  //                 settledAt: new Date(), 
+  //                 updatedAt: new Date(),
+  //                 metadata: {
+  //                   ...(bet.metadata as object || {}),
+  //                   decisionRun: null,
+  //                 }
+  //               }
+  //             });
+  //             continue;
+  //           }
+            
+  //           const line = Number(bet.betRate ?? bet.odds ?? 0);
+  //           const isWin = (betType === 'BACK' || betType === 'YES')
+  //             ? actualRuns >= line
+  //             : actualRuns < line;
+            
+  //           const previousBalanceDelta = balanceDelta;
+  //           const previousLiabilityDelta = liabilityDelta;
+  //           liabilityDelta -= liabilityAmount;
+            
+  //           // ✅ On win: add winAmount + stake for individual bets
+  //           // ✅ On loss: only release liability, do not increment balance
+  //           if (isWin) {
+  //             const winAmountToAdd = winAmount + stake;
+  //             balanceDelta += winAmountToAdd;
+  //             this.logger.log(
+  //               `[INDIVIDUAL BET WIN] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Bet ${bet.id} WON! ` +
+  //               `winAmount=${winAmount}, stake=${stake}, total=${winAmountToAdd}, ` +
+  //               `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd}), ` +
+  //               `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
+  //             );
+  //           } else {
+  //             this.logger.log(
+  //               `[INDIVIDUAL BET LOSS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //               `Bet ${bet.id} LOST. ` +
+  //               `lossAmount=${lossAmount}, ` +
+  //               `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (no change), ` +
+  //               `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
+  //             );
+  //           }
+  //           // On loss: balanceDelta remains unchanged (only liability released)
+            
+  //           const finalStatus = isWin ? BetStatus.WON : BetStatus.LOST;
+  //           const finalPnl = isWin ? winAmount : -lossAmount;
+            
+  //           this.logger.log(
+  //             `[INDIVIDUAL BET UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Updating bet ${bet.id} status to ${finalStatus}, pnl=${finalPnl}, ` +
+  //             `isWin=${isWin}, line=${line}, actualRuns=${actualRuns}, betType=${betType}`
+  //           );
+            
+  //           await tx.bet.update({
+  //             where: { id: bet.id },
+  //             data: {
+  //               status: finalStatus,
+  //               pnl: finalPnl,
+  //               settledAt: new Date(),
+  //               updatedAt: new Date(),
+  //               metadata: {
+  //                 ...(bet.metadata as object || {}),
+  //                 decisionRun: actualRuns,
+  //               }
+  //             }
+  //           });
+            
+  //           this.logger.log(
+  //             `[INDIVIDUAL BET UPDATED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //             `Bet ${bet.id} status successfully updated to ${finalStatus}. ` +
+  //             `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+  //           );
+  //         }
+          
+  //         this.logger.log(
+  //           `[MARKET PROCESSING COMPLETE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
+  //           `Market processing completed. ` +
+  //           `Total bets processed=${userBets.length}, ` +
+  //           `Processed refund pairs=${refundBets.filter(b => processedBetIds.has(b.id)).length / 2}, ` +
+  //           `Processed individual bets=${unprocessedBets.filter(b => processedBetIds.has(b.id) || !refundBets.includes(b)).length}, ` +
+  //           `Final balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
+  //         );
+  //       }
+  
+  //       const finalBalance = wallet.balance + balanceDelta;
+  //       const finalLiability = wallet.liability + liabilityDelta;
+        
+  //       this.logger.log(
+  //         `[USER WALLET UPDATE] Settlement ${settlementId}: User ${userId} - ` +
+  //         `Wallet update calculation: ` +
+  //         `balance: ${wallet.balance} + ${balanceDelta} = ${finalBalance}, ` +
+  //         `liability: ${wallet.liability} + ${liabilityDelta} = ${finalLiability}`
+  //       );
+  
+  //       if (balanceDelta !== 0 || liabilityDelta !== 0) {
+  //         await tx.wallet.update({ 
+  //           where: { userId }, 
+  //           data: { 
+  //             balance: finalBalance, 
+  //             liability: finalLiability 
+  //           } 
+  //         });
+          
+  //         this.logger.log(
+  //           `[USER WALLET UPDATED] Settlement ${settlementId}: User ${userId} - ` +
+  //           `Wallet updated successfully. ` +
+  //           `New balance=${finalBalance}, new liability=${finalLiability}`
+  //         );
+          
+  //         if (balanceDelta > 0) {
+  //           const transaction = await tx.transaction.create({
+  //             data: {
+  //               walletId: wallet.id,
+  //               amount: balanceDelta,
+  //               type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
+  //               description: isCancel
+  //                 ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
+  //                 : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
+  //             },
+  //           });
+            
+  //           this.logger.log(
+  //             `[USER TRANSACTION CREATED] Settlement ${settlementId}: User ${userId} - ` +
+  //             `Transaction created: id=${transaction.id}, amount=${balanceDelta}, ` +
+  //             `type=${isCancel ? TransactionType.REFUND : TransactionType.BET_WON}`
+  //           );
+  //         }
+          
+  //         this.logger.log(
+  //           `[USER PROCESSING COMPLETE] Settlement ${settlementId}: User ${userId} - ` +
+  //           `User processing completed. ` +
+  //           `Total bets processed=${bets.filter(b => b.userId === userId).length}, ` +
+  //           `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}, ` +
+  //           `Final balance=${finalBalance}, final liability=${finalLiability}`
+  //         );
+          
+  //         affectedUserIds.add(userId);
+  //       } else {
+  //         this.logger.log(
+  //           `[USER NO UPDATE] Settlement ${settlementId}: User ${userId} - ` +
+  //           `No wallet update needed (balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta})`
+  //         );
+  //       }
+  //     }
+      
+  //     // ✅ Create/update settlement record with decisionRun
+  //     await tx.settlement.upsert({
+  //       where: { settlementId },
+  //       update: {
+  //         isRollback: false,
+  //         settledBy: adminId,
+  //         winnerId: isCancel ? null : (decisionRun?.toString() || null),
+  //       },
+  //       create: {
+  //         settlementId,
+  //         eventId,
+  //         marketType: MarketType.FANCY,
+  //         marketId: marketId || null,
+  //         winnerId: isCancel ? null : (decisionRun?.toString() || null),
+  //         settledBy: adminId,
+  //       },
+  //     });
+      
+  //     this.logger.log(
+  //       `[SETTLEMENT RECORD CREATED] Settlement ${settlementId} - ` +
+  //       `Settlement record created/updated with winnerId=${isCancel ? null : (decisionRun?.toString() || null)}, ` +
+  //       `settledBy=${adminId}`
+  //     );
+      
+  //     this.logger.log(
+  //       `[SETTLEMENT TRANSACTION COMPLETE] Settlement ${settlementId} - ` +
+  //       `Transaction completed. ` +
+  //       `Total bets processed=${bets.length}, ` +
+  //       `Affected users=${affectedUserIds.size} (${Array.from(affectedUserIds).join(', ')})`
+  //     );
+  //   });
+  
+  //   await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
+  
+  //   this.logger.log(`[FANCY SETTLEMENT COMPLETE] Settlement ${settlementId}: Total bets settled=${bets.length}, Affected users=${affectedUserIds.size}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
+  
+  //   return { success: true, message: 'Fancy bets settled successfully' };
+  // }
+  /**
+   * Settle a set of fancy bets for one market (e.g. after actualRuns is known).
+   * Uses FancyExposureService.getPerBetPnLForOutcome so win/loss and PnL match exposure (single source of truth).
+   */
+  async settleFancyMarket(
+    bets: any[],
+    actualRuns: number,
+    wallet: any,
   ) {
-    const settlementId = `CRICKET:FANCY:${eventId}:${selectionId}`;
-    this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement for event=${eventId}, selection=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds?.join(',') || 'all'}`);
-    this.logger.log(`[FANCY SETTLEMENT INIT] Starting settlement: settlementId=${settlementId}, eventId=${eventId}, selectionId=${selectionId}, decisionRun=${decisionRun}, isCancel=${isCancel}, marketId=${marketId}, betIds=${betIds ? betIds.join(',') : 'all'}`);
-  
-    // 1️⃣ Fetch pending bets (new + legacy)
-    let bets = await this.prisma.bet.findMany({
-      where: {
-        settlementId,
-        status: BetStatus.PENDING,
-        eventId,
-        selectionId: Number(selectionId),
-        ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
-      },
-    });
-  
-    this.logger.log(`[FANCY SETTLEMENT FETCH] Settlement ${settlementId}: Found ${bets.length} bets with settlementId=${settlementId}`);
-  
     if (bets.length === 0) {
-      bets = await this.prisma.bet.findMany({
-        where: {
-          eventId,
-          selectionId: Number(selectionId),
-          status: BetStatus.PENDING,
-          ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
-          OR: [
-            { gtype: { contains: 'fancy', mode: 'insensitive' } },
-            { marketType: { contains: 'fancy', mode: 'insensitive' } },
-          ],
-        },
-      });
-  
-      this.logger.log(`[FANCY SETTLEMENT FETCH LEGACY] Settlement ${settlementId}: Found ${bets.length} legacy bets without settlementId`);
-  
-      if (bets.length > 0) {
-        await this.prisma.bet.updateMany({
-          where: { id: { in: bets.map(b => b.id) } },
-          data: { settlementId },
-        });
-        this.logger.log(`[FANCY SETTLEMENT UPDATE] Settlement ${settlementId}: Updated ${bets.length} bets with settlementId`);
-      }
+      return { credited: 0, releasedLiability: wallet.liability ?? 0, results: [] };
     }
-  
-    // Log all bets details
-    this.logger.log(`[FANCY SETTLEMENT BETS FOUND] Settlement ${settlementId}: Found ${bets.length} pending bets to settle`);
-    for (const bet of bets) {
-      this.logger.log(
-        `[FANCY SETTLEMENT BET DETAIL] Bet ${bet.id}: userId=${bet.userId}, ` +
-        `betType=${bet.betType}, betRate=${bet.betRate}, odds=${bet.odds}, ` +
-        `amount=${bet.amount}, betValue=${bet.betValue}, ` +
-        `winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
-        `marketId=${bet.marketId}, selectionId=${bet.selectionId}, ` +
-        `isRefunded=${bet.isRefunded}, refundedByBetId=${bet.refundedByBetId}, ` +
-        `status=${bet.status}`
-      );
-    }
-  
-    if (bets.length === 0) return { success: true, message: 'No pending bets to settle' };
-    if (decisionRun === null && !isCancel) throw new BadRequestException('Either decisionRun or isCancel must be provided');
-  
-    const actualRuns = decisionRun ?? 0;
-    this.logger.log(`[FANCY SETTLEMENT PARAMS] Settlement ${settlementId}: actualRuns=${actualRuns}, isCancel=${isCancel}`);
-  
-    const affectedUserIds = new Set<string>();
-  
-    await this.prisma.$transaction(async (tx) => {
-      // ✅ STEP 1: Build a map of refund pairs
-      // Key: bet.id that has isRefunded=true and refundedByBetId
-      // Value: the paired bet fetched using refundedByBetId
-      const refundPairMap = new Map<string, typeof bets[0]>();
-      const processedBetIds = new Set<string>();
-      
-      // Identify bets that are part of refund pairs
-      const refundedBets = bets.filter(b => b.isRefunded === true && b.refundedByBetId !== null);
-      
-      this.logger.log(
-        `[REFUND PAIR DETECTION] Settlement ${settlementId}: Found ${refundedBets.length} bets with isRefunded=true and refundedByBetId out of ${bets.length} total bets`
-      );
-      
-      // Log all refunded bets
-      for (const refundedBet of refundedBets) {
-        this.logger.log(
-          `[REFUND PAIR DETECTION DETAIL] Bet ${refundedBet.id}: ` +
-          `userId=${refundedBet.userId}, refundedByBetId=${refundedBet.refundedByBetId}, ` +
-          `betType=${refundedBet.betType}, betRate=${refundedBet.betRate}, odds=${refundedBet.odds}, ` +
-          `amount=${refundedBet.amount}, winAmount=${refundedBet.winAmount}, lossAmount=${refundedBet.lossAmount}`
-        );
-      }
-      
-      // Build refund pair map by fetching paired bets
-      this.logger.log(`[REFUND PAIR BUILDING] Settlement ${settlementId}: Building refund pair map for ${refundedBets.length} refunded bets`);
-      
-      for (const refundedBet of refundedBets) {
-        if (!refundedBet.refundedByBetId) {
-          this.logger.warn(`[REFUND PAIR SKIP] Bet ${refundedBet.id} has isRefunded=true but refundedByBetId is null`);
-          continue;
-        }
-        
-        this.logger.log(
-          `[REFUND PAIR SEARCH] Settlement ${settlementId}: Searching for paired bet ${refundedBet.refundedByBetId} for refunded bet ${refundedBet.id}`
-        );
-        
-        // Fetch the paired bet using refundedByBetId
-        const pairedBet = bets.find(b => b.id === refundedBet.refundedByBetId);
-        
-        if (pairedBet) {
-          refundPairMap.set(refundedBet.id, pairedBet);
-          refundPairMap.set(pairedBet.id, refundedBet);
-          this.logger.log(
-            `[REFUND PAIR FOUND IN BATCH] Settlement ${settlementId}: Bet ${refundedBet.id} paired with bet ${pairedBet.id} (found in current batch)`
-          );
-        } else {
-          // Paired bet might not be in the current settlement batch, fetch from DB
-          // Only include if it matches the same settlement criteria
-          this.logger.log(
-            `[REFUND PAIR DB FETCH] Settlement ${settlementId}: Paired bet ${refundedBet.refundedByBetId} not in batch, fetching from DB`
-          );
-          
-          const pairedBetFromDb = await tx.bet.findUnique({
-            where: { id: refundedBet.refundedByBetId },
-          });
-          
-          if (
-            pairedBetFromDb &&
-            pairedBetFromDb.status === BetStatus.PENDING &&
-            pairedBetFromDb.eventId === eventId &&
-            pairedBetFromDb.selectionId === Number(selectionId)
-          ) {
-            refundPairMap.set(refundedBet.id, pairedBetFromDb as any);
-            refundPairMap.set(pairedBetFromDb.id, refundedBet);
-            // Add to bets array so it gets processed (avoid duplicates)
-            if (!bets.find(b => b.id === pairedBetFromDb.id)) {
-              bets.push(pairedBetFromDb as any);
-              this.logger.log(
-                `[REFUND PAIR ADDED] Settlement ${settlementId}: Added paired bet ${pairedBetFromDb.id} to bets array. Total bets now: ${bets.length}`
-              );
-            } else {
-              this.logger.log(
-                `[REFUND PAIR DUPLICATE] Settlement ${settlementId}: Paired bet ${pairedBetFromDb.id} already in bets array`
-              );
-            }
-            this.logger.log(
-              `[REFUND PAIR FOUND DB] Settlement ${settlementId}: Bet ${refundedBet.id} paired with bet ${pairedBetFromDb.id} (fetched from DB, added to settlement)`
-            );
-          } else if (pairedBetFromDb) {
-            this.logger.warn(
-              `[REFUND PAIR SKIPPED] Settlement ${settlementId}: Bet ${refundedBet.id} has paired bet ${refundedBet.refundedByBetId} ` +
-              `but it doesn't match settlement criteria (status=${pairedBetFromDb.status}, ` +
-              `eventId=${pairedBetFromDb.eventId} (expected ${eventId}), selectionId=${pairedBetFromDb.selectionId} (expected ${selectionId}))`
-            );
-          } else {
-            this.logger.warn(
-              `[REFUND PAIR NOT FOUND] Settlement ${settlementId}: Paired bet ${refundedBet.refundedByBetId} not found in database`
-            );
-          }
-        }
-      }
-      
-      this.logger.log(
-        `[REFUND PAIR MAP COMPLETE] Settlement ${settlementId}: Refund pair map built with ${refundPairMap.size / 2} pairs. ` +
-        `Total bets after adding paired bets: ${bets.length}`
-      );
 
-      // 2️⃣ Group bets by userId AND marketId + selectionId
-      this.logger.log(`[BET GROUPING] Settlement ${settlementId}: Grouping ${bets.length} bets by userId and marketId`);
-      
-      const betsByUserAndMarket = new Map<string, Map<string, typeof bets>>();
-      for (const bet of bets) {
-        const userMap = betsByUserAndMarket.get(bet.userId) || new Map();
-        const marketKey = `${bet.marketId}_${bet.selectionId}`;
-        const marketBets = userMap.get(marketKey) || [];
-        marketBets.push(bet);
-        userMap.set(marketKey, marketBets);
-        betsByUserAndMarket.set(bet.userId, userMap);
-      }
-      
-      this.logger.log(
-        `[BET GROUPING COMPLETE] Settlement ${settlementId}: Grouped into ${betsByUserAndMarket.size} users, ` +
-        `total market groups: ${Array.from(betsByUserAndMarket.values()).reduce((sum, map) => sum + map.size, 0)}`
-      );
-  
-      for (const [userId, userMarkets] of betsByUserAndMarket.entries()) {
-        this.logger.log(
-          `[USER PROCESSING START] Settlement ${settlementId}: Processing user ${userId} with ${userMarkets.size} market groups`
-        );
-        
-        const wallet = await tx.wallet.findUnique({ where: { userId } });
-        if (!wallet) {
-          this.logger.warn(`[USER WALLET MISSING] Settlement ${settlementId}: Wallet not found for user ${userId}, skipping`);
-          continue;
-        }
-        
-        this.logger.log(
-          `[USER WALLET INIT] Settlement ${settlementId}: User ${userId} - ` +
-          `Initial balance=${wallet.balance}, liability=${wallet.liability}`
-        );
-  
-        let balanceDelta = 0;
-        let liabilityDelta = 0;
-        
-        this.logger.log(
-          `[USER DELTA INIT] Settlement ${settlementId}: User ${userId} - ` +
-          `Initial balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
-        );
-  
-        for (const [marketKey, userBets] of userMarkets.entries()) {
-          this.logger.log(
-            `[MARKET PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Processing ${userBets.length} bets. ` +
-            `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
-          );
-          
-          // Log all bets in this market
-          for (const bet of userBets) {
-            this.logger.log(
-              `[MARKET BET DETAIL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Bet ${bet.id}: betType=${bet.betType}, betRate=${bet.betRate}, odds=${bet.odds}, ` +
-              `amount=${bet.amount}, winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
-              `isRefunded=${bet.isRefunded}, refundedByBetId=${bet.refundedByBetId}, ` +
-              `processed=${processedBetIds.has(bet.id)}`
-            );
-          }
+    const perBet = this.fancyExposureService.getPerBetPnLForOutcome(bets, actualRuns);
+    let totalCredit = 0;
+    const results: any[] = [];
 
-          // Step: Identify refund bets
-          const refundBets = userBets.filter(b => b.isRefunded && b.refundedByBetId !== null);
-
-          this.logger.log(
-            `[GOLA DEBUG] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Refund bets found=${refundBets.length}, all user bets=${userBets.length}`
-          );
-          
-          // Log refund bets details
-          for (const refundBet of refundBets) {
-            this.logger.log(
-              `[GOLA REFUND BET DETAIL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Refund bet ${refundBet.id}: betType=${refundBet.betType}, ` +
-              `betRate=${refundBet.betRate}, odds=${refundBet.odds}, ` +
-              `refundedByBetId=${refundBet.refundedByBetId}, ` +
-              `hasPairInMap=${refundPairMap.has(refundBet.id)}`
-            );
-          }
-
-          this.logger.log(
-            `[GOLA RANGE FANCY] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Found ${refundBets.length} refund bets (isRefunded=true, refundedByBetId != null)`
-          );
-
-          // ✅ CRITICAL: Gola pair should ONLY be created when refundBets.length === 2
-          // AND both bets form a valid bidirectional pair
-          let golaPair: [typeof userBets[0], typeof userBets[0]] | null = null;
-
-          if (refundBets.length === 2) {
-            // Verify that the two refund bets form a valid bidirectional pair
-            const bet1 = refundBets[0];
-            const bet2 = refundBets[1];
-            
-            // Check if bet1 and bet2 are paired with each other (bidirectional)
-            const bet1Paired = refundPairMap.get(bet1.id);
-            const bet2Paired = refundPairMap.get(bet2.id);
-            
-            const isValidPair = 
-              (bet1Paired?.id === bet2.id && bet2Paired?.id === bet1.id) ||
-              (bet1.refundedByBetId === bet2.id && bet2.refundedByBetId === bet1.id);
-            
-            if (isValidPair) {
-              golaPair = [bet1, bet2];
-              
-              this.logger.log(
-                `[GOLA PAIR SELECTED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Valid gola pair created (refundBets.length === 2). ` +
-                `Bet1: id=${golaPair[0].id}, type=${golaPair[0].betType}, line=${golaPair[0].betRate ?? golaPair[0].odds}, ` +
-                `Bet2: id=${golaPair[1].id}, type=${golaPair[1].betType}, line=${golaPair[1].betRate ?? golaPair[1].odds}, ` +
-                `actualRuns=${actualRuns}, ` +
-                `bidirectional pair verified: bet1.refundedByBetId=${bet1.refundedByBetId}, bet2.refundedByBetId=${bet2.refundedByBetId}`
-              );
-            } else {
-              this.logger.warn(
-                `[GOLA PAIR INVALID] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `refundBets.length === 2 but bets do NOT form a valid bidirectional pair. ` +
-                `Bet1: id=${bet1.id}, refundedByBetId=${bet1.refundedByBetId}, ` +
-                `Bet2: id=${bet2.id}, refundedByBetId=${bet2.refundedByBetId}, ` +
-                `bet1Paired=${bet1Paired?.id || 'null'}, bet2Paired=${bet2Paired?.id || 'null'}. ` +
-                `Skipping gola logic, will process as individual refund pairs.`
-              );
-            }
-          } else if (refundBets.length > 2) {
-            this.logger.log(
-              `[GOLA PAIR SKIPPED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `refundBets.length=${refundBets.length} (expected exactly 2). ` +
-              `Gola logic requires exactly 2 refund bets. ` +
-              `Skipping gola pair creation, will process refund bets as individual pairs. ` +
-              `Refund bet IDs: ${refundBets.map(b => b.id).join(', ')}`
-            );
-          } else if (refundBets.length === 1) {
-            this.logger.log(
-              `[GOLA PAIR INSUFFICIENT] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Only ${refundBets.length} refund bet found, need exactly 2 for gola pair. ` +
-              `Skipping gola logic, will process as individual refund pair.`
-            );
-          }
-
-          // ✅ Process refund pairs first
-          // CRITICAL: If golaPair exists, ONLY process that specific pair
-          // If golaPair is null, process ALL refund pairs individually
-          this.logger.log(
-            `[REFUND PAIR PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Starting refund pair processing. ` +
-            `Total userBets=${userBets.length}, refundBets=${refundBets.length}, ` +
-            `golaPair=${golaPair ? `[${golaPair[0].id}, ${golaPair[1].id}]` : 'null (will process all refund pairs)'}, ` +
-            `processedBetIds=${Array.from(processedBetIds).join(',') || 'none'}`
-          );
-          
-          // ✅ Process all refund pairs (either gola pair only, or all refund pairs if no gola)
-            for (const bet of userBets) {
-            // Skip if already processed
-            if (processedBetIds.has(bet.id)) {
-              this.logger.log(
-                `[REFUND PAIR SKIP PROCESSED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Bet ${bet.id} already processed, skipping`
-              );
-              continue;
-            }
-            
-            // Check if this bet is part of a refund pair
-            const isRefundedBet = bet.isRefunded === true && bet.refundedByBetId !== null;
-            
-            this.logger.log(
-              `[REFUND PAIR CHECK] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Bet ${bet.id}: isRefundedBet=${isRefundedBet}, ` +
-              `refundedByBetId=${bet.refundedByBetId}, ` +
-              `hasPairInMap=${refundPairMap.has(bet.id)}`
-            );
-            
-            // ✅ CRITICAL: If golaPair exists, ONLY process that specific pair
-            if (golaPair) {
-              const isInGolaPair = bet.id === golaPair[0].id || bet.id === golaPair[1].id;
-              if (!isInGolaPair) {
-                this.logger.log(
-                  `[REFUND PAIR SKIP NOT GOLA] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `Bet ${bet.id} is refunded but not in gola pair [${golaPair[0].id}, ${golaPair[1].id}], skipping. ` +
-                  `Gola mode: only processing the gola pair.`
-                );
-                continue; // Skip all other refund bets when in gola mode
-              }
-            }
-            
-            if (isRefundedBet && refundPairMap.has(bet.id)) {
-              const pairedBet = refundPairMap.get(bet.id);
-              if (!pairedBet) {
-                this.logger.warn(
-                  `[REFUND PAIR MISSING] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `Bet ${bet.id} has isRefunded=true but paired bet not found in map`
-                );
-                continue;
-              }
-              
-              // ✅ CRITICAL: Verify paired bet is not already processed (prevents bet reuse)
-              if (processedBetIds.has(pairedBet.id)) {
-                this.logger.warn(
-                  `[REFUND PAIR DUPLICATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `Bet ${bet.id} is paired with ${pairedBet.id}, but ${pairedBet.id} is already processed. ` +
-                  `This indicates bet reuse. Skipping bet ${bet.id}.`
-                );
-                continue;
-              }
-              
-              // ✅ CRITICAL: If golaPair exists, verify this pair matches the gola pair exactly
-              if (golaPair) {
-                const isExactGolaPair = (bet.id === golaPair[0].id && pairedBet.id === golaPair[1].id) ||
-                                       (bet.id === golaPair[1].id && pairedBet.id === golaPair[0].id);
-                if (!isExactGolaPair) {
-                  this.logger.log(
-                    `[REFUND PAIR SKIP NOT GOLA] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                    `Refund pair [${bet.id}, ${pairedBet.id}] does not match gola pair [${golaPair[0].id}, ${golaPair[1].id}], skipping. ` +
-                    `Gola mode: only processing the gola pair.`
-                  );
-                  continue;
-                }
-              }
-              
-              // ✅ Mark both bets as processed BEFORE processing to prevent reuse
-              processedBetIds.add(bet.id);
-              processedBetIds.add(pairedBet.id);
-              
-              this.logger.log(
-                `[REFUND PAIR PROCESSING] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Processing refund pair. ` +
-                `Marked bets as processed: ${bet.id}, ${pairedBet.id}. ` +
-                `Total processed: ${processedBetIds.size}, ` +
-                `isGolaPair=${golaPair ? 'YES' : 'NO'}`
-              );
-              
-              this.logger.log(
-                `[GOLA REFUND PAIR] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
-                `Processing refund pair - Bet1: id=${bet.id}, type=${bet.betType}, line=${bet.betRate ?? bet.odds}, ` +
-                `amount=${bet.amount}, winAmount=${bet.winAmount}, lossAmount=${bet.lossAmount}, ` +
-                `Bet2: id=${pairedBet.id}, type=${pairedBet.betType}, line=${pairedBet.betRate ?? pairedBet.odds}, ` +
-                `amount=${pairedBet.amount}, winAmount=${pairedBet.winAmount}, lossAmount=${pairedBet.lossAmount}`
-              );
-              
-              // ✅ REFUND PAIR SETTLEMENT: Both bets win/lose together based on GOLA ZONE
-              // Gola zone = [minLine, maxLine) where minLine is BACK line, maxLine is NO line
-              // - If actualRuns is IN gola zone: BOTH WIN, credit both winAmounts
-              // - If actualRuns is OUTSIDE gola zone: BOTH LOSE, NO credit
-              const bet1Line = Number(bet.betRate ?? bet.odds ?? 0);
-              const bet2Line = Number(pairedBet.betRate ?? pairedBet.odds ?? 0);
-              const bet1Type = bet.betType?.toUpperCase() ?? '';
-              const bet2Type = pairedBet.betType?.toUpperCase() ?? '';
-              
-              // Determine which bet is BACK and which is NO
-              const isbet1Back = (bet1Type === 'BACK' || bet1Type === 'YES');
-              const isbet2Back = (bet2Type === 'BACK' || bet2Type === 'YES');
-              
-              // Calculate gola range: minLine (BACK line) to maxLine (NO line)
-              // Gola zone is where BOTH bets win
-              let minLine: number, maxLine: number;
-              if (isbet1Back && !isbet2Back) {
-                // bet1 is BACK, bet2 is NO
-                minLine = bet1Line;
-                maxLine = bet2Line;
-              } else if (!isbet1Back && isbet2Back) {
-                // bet1 is NO, bet2 is BACK
-                minLine = bet2Line;
-                maxLine = bet1Line;
-              } else {
-                // Both same type - use min/max
-                minLine = Math.min(bet1Line, bet2Line);
-                maxLine = Math.max(bet1Line, bet2Line);
-              }
-              
-              // ✅ GOLA ZONE CHECK: actualRuns >= minLine AND actualRuns < maxLine
-              // Score must be >= BACK line AND < NO line (strictly less than, NOT equal)
-              const isGolaHit = actualRuns >= minLine && actualRuns < maxLine;
-              
-              this.logger.log(
-                `[GOLA ZONE EVALUATION] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
-                `Bet1: ${bet1Type} @ ${bet1Line}, Bet2: ${bet2Type} @ ${bet2Line}, ` +
-                `Gola Zone: [${minLine}, ${maxLine}) [minLine inclusive, maxLine exclusive], ` +
-                `actualRuns=${actualRuns}, Condition: ${actualRuns} >= ${minLine} && ${actualRuns} < ${maxLine} = ${isGolaHit}, ` +
-                `isCancel=${isCancel}`
-              );
-  
-              if (isCancel) {
-                // On cancel: mark both bets as cancelled
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: { 
-                    status: BetStatus.CANCELLED, 
-                    pnl: 0, 
-                    settledAt: new Date(), 
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(bet.metadata as object || {}),
-                      decisionRun: null,
-                    }
-                  }
-                });
-                await tx.bet.update({
-                  where: { id: pairedBet.id },
-                  data: { 
-                    status: BetStatus.CANCELLED, 
-                    pnl: 0, 
-                    settledAt: new Date(), 
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(pairedBet.metadata as object || {}),
-                      decisionRun: null,
-                    }
-                  }
-                });
-                continue;
-              }
-              
-              const bet1WinAmount = bet.winAmount ?? bet.amount ?? 0;
-              const bet1LossAmount = bet.lossAmount ?? bet.amount ?? 0;
-              const bet2WinAmount = pairedBet.winAmount ?? pairedBet.amount ?? 0;
-              const bet2LossAmount = pairedBet.lossAmount ?? pairedBet.amount ?? 0;
-              
-              this.logger.log(
-                `[GOLA AMOUNTS] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
-                `Bet1: winAmount=${bet1WinAmount}, lossAmount=${bet1LossAmount}, ` +
-                `Bet2: winAmount=${bet2WinAmount}, lossAmount=${bet2LossAmount}, ` +
-                `Total winAmount=${bet1WinAmount + bet2WinAmount}, ` +
-                `isGolaHit=${isGolaHit}, balanceDelta before=${balanceDelta}`
-              );
-              
-              if (isGolaHit) {
-                // ✅ GOLA HIT: BOTH bets WIN, credit both winAmounts
-                const previousBalanceDelta = balanceDelta;
-                const winAmountToAdd = bet1WinAmount + bet2WinAmount;
-                balanceDelta += winAmountToAdd;
-  
-                this.logger.log(
-                  `[GOLA HIT - BALANCE UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `GOLA HIT! Adding winAmount to balanceDelta. ` +
-                  `Bet1 winAmount=${bet1WinAmount}, Bet2 winAmount=${bet2WinAmount}, ` +
-                  `Total winAmount=${winAmountToAdd}, ` +
-                  `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd})`
-                );
-                
-                this.logger.log(
-                  `[GOLA HIT - UPDATING BETS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `Marking both bets as WON - Bet1: id=${bet.id}, pnl=${bet1WinAmount}, ` +
-                  `Bet2: id=${pairedBet.id}, pnl=${bet2WinAmount}`
-                );
-  
-              await tx.bet.update({
-                where: { id: bet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    pnl: bet1WinAmount,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(bet.metadata as object || {}),
-                      decisionRun: actualRuns,
-                    }
-                  }
-                });
-                
-                await tx.bet.update({
-                  where: { id: pairedBet.id },
-                  data: {
-                    status: BetStatus.WON,
-                    pnl: bet2WinAmount,
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                    metadata: {
-                      ...(pairedBet.metadata as object || {}),
-                      decisionRun: actualRuns,
-                    }
-                  }
-                });
-                
-                this.logger.log(
-                  `[GOLA HIT - SUCCESS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `BOTH bets WON (gola hit), ` +
-                  `Bet1 winAmount=${bet1WinAmount}, Bet2 winAmount=${bet2WinAmount}, ` +
-                  `Total winAmount=${winAmountToAdd}, ` +
-                  `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd}), ` +
-                  `Current balanceDelta=${balanceDelta}`
-                );
-          } else {
-                this.logger.log(
-                  `[GOLA MISS - FALLBACK TO INDIVIDUAL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                  `actualRuns=${actualRuns} outside gola zone [${minLine}, ${maxLine}). ` +
-                  `Refund pair will be processed as individual bets.`
-                );
-
-                // ❗ IMPORTANT: remove processed flags
-                processedBetIds.delete(bet.id);
-                processedBetIds.delete(pairedBet.id);
-
-                continue;
-              }
-              
-              // ✅ IMPORTANT: Do NOT adjust liability for refund pairs
-              // Liability was already released at placement time
-              this.logger.log(
-                `[GOLA REFUND PAIR COMPLETE] User ${userId}, Market ${marketKey}, Settlement ${settlementId}: ` +
-                `Refund pair settlement completed - Bet1: ${bet.id}, Bet2: ${pairedBet.id}, ` +
-                `isGolaHit=${isGolaHit}, balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta} (no liability change for refund pairs)`
-              );
-              continue;
-            }
-          }
-
-          this.logger.log(
-            `[GOLA RANGE FANCY COMPLETE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Gola/range fancy processing completed. ` +
-            `Total refund bets found=${refundBets.length}, ` +
-            `Gola pair selected=${golaPair ? `[${golaPair[0].id}, ${golaPair[1].id}]` : 'NO'}, ` +
-            `Processed refund pairs=${processedBetIds.size / 2}, ` +
-            `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}, ` +
-            `Remaining unprocessed bets=${userBets.filter(b => !processedBetIds.has(b.id)).length}`
-          );
-
-          // ✅ Handle individual bets (not part of refund pairs)
-          const unprocessedBets = userBets.filter(b => !processedBetIds.has(b.id));
-          this.logger.log(
-            `[INDIVIDUAL BET PROCESSING START] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Starting individual bet processing. ` +
-            `Unprocessed bets=${unprocessedBets.length} out of ${userBets.length} total, ` +
-            `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
-          );
-          
-          for (const bet of unprocessedBets) {
-            // Skip if already processed as part of a refund pair
-            if (processedBetIds.has(bet.id)) {
-              this.logger.log(
-                `[INDIVIDUAL BET SKIP PROCESSED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Bet ${bet.id} already processed, skipping`
-              );
-              continue;
-            }
-            
-            this.logger.log(
-              `[INDIVIDUAL FANCY SETTLEMENT] User ${userId}, Settlement ${settlementId}: ` +
-              `Processing individual bet ${bet.id}`
-            );
-            
-              const stake = bet.amount ?? 0;
-              const betType = bet.betType?.toUpperCase() ?? '';
-              const winAmount = bet.winAmount ?? stake;
-              const lossAmount = bet.lossAmount ?? stake;
-              const liabilityAmount = (betType === 'LAY' || betType === 'NO') ? lossAmount : stake;
-  
-            this.logger.log(
-              `[INDIVIDUAL BET CALC] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Bet ${bet.id}: stake=${stake}, betType=${betType}, ` +
-              `winAmount=${winAmount}, lossAmount=${lossAmount}, liabilityAmount=${liabilityAmount}, ` +
-              `betRate=${bet.betRate}, odds=${bet.odds}`
-            );
-            
-            if (isCancel) {
-              const previousBalanceDelta = balanceDelta;
-              const previousLiabilityDelta = liabilityDelta;
-              balanceDelta += liabilityAmount;
-              liabilityDelta -= liabilityAmount;
-              
-              this.logger.log(
-                `[INDIVIDUAL BET CANCEL] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Bet ${bet.id} CANCELLED. ` +
-                `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${liabilityAmount}), ` +
-                `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
-              );
-  
-              await tx.bet.update({
-                where: { id: bet.id },
-                data: { 
-                  status: BetStatus.CANCELLED, 
-                  pnl: 0, 
-                  settledAt: new Date(), 
-                  updatedAt: new Date(),
-                  metadata: {
-                    ...(bet.metadata as object || {}),
-                    decisionRun: null,
-                  }
-                }
-              });
-              continue;
-            }
-            
-            const line = Number(bet.betRate ?? bet.odds ?? 0);
-            const isWin = (betType === 'BACK' || betType === 'YES')
-              ? actualRuns >= line
-              : actualRuns < line;
-            
-            const previousBalanceDelta = balanceDelta;
-            const previousLiabilityDelta = liabilityDelta;
-            liabilityDelta -= liabilityAmount;
-            
-            // ✅ On win: add winAmount + stake for individual bets
-            // ✅ On loss: only release liability, do not increment balance
-            if (isWin) {
-              const winAmountToAdd = winAmount + stake;
-              balanceDelta += winAmountToAdd;
-              this.logger.log(
-                `[INDIVIDUAL BET WIN] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Bet ${bet.id} WON! ` +
-                `winAmount=${winAmount}, stake=${stake}, total=${winAmountToAdd}, ` +
-                `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (added ${winAmountToAdd}), ` +
-                `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
-              );
-            } else {
-              this.logger.log(
-                `[INDIVIDUAL BET LOSS] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-                `Bet ${bet.id} LOST. ` +
-                `lossAmount=${lossAmount}, ` +
-                `balanceDelta: ${previousBalanceDelta} -> ${balanceDelta} (no change), ` +
-                `liabilityDelta: ${previousLiabilityDelta} -> ${liabilityDelta} (subtracted ${liabilityAmount})`
-              );
-            }
-            // On loss: balanceDelta remains unchanged (only liability released)
-            
-            const finalStatus = isWin ? BetStatus.WON : BetStatus.LOST;
-            const finalPnl = isWin ? winAmount : -lossAmount;
-            
-            this.logger.log(
-              `[INDIVIDUAL BET UPDATE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Updating bet ${bet.id} status to ${finalStatus}, pnl=${finalPnl}, ` +
-              `isWin=${isWin}, line=${line}, actualRuns=${actualRuns}, betType=${betType}`
-            );
-            
-            await tx.bet.update({
-              where: { id: bet.id },
-              data: {
-                status: finalStatus,
-                pnl: finalPnl,
-                settledAt: new Date(),
-                updatedAt: new Date(),
-                metadata: {
-                  ...(bet.metadata as object || {}),
-                  decisionRun: actualRuns,
-                }
-              }
-            });
-            
-            this.logger.log(
-              `[INDIVIDUAL BET UPDATED] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-              `Bet ${bet.id} status successfully updated to ${finalStatus}. ` +
-              `Current balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
-            );
-          }
-          
-          this.logger.log(
-            `[MARKET PROCESSING COMPLETE] Settlement ${settlementId}: User ${userId}, Market ${marketKey} - ` +
-            `Market processing completed. ` +
-            `Total bets processed=${userBets.length}, ` +
-            `Processed refund pairs=${refundBets.filter(b => processedBetIds.has(b.id)).length / 2}, ` +
-            `Processed individual bets=${unprocessedBets.filter(b => processedBetIds.has(b.id) || !refundBets.includes(b)).length}, ` +
-            `Final balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}`
-          );
-        }
-  
-        const finalBalance = wallet.balance + balanceDelta;
-        const finalLiability = wallet.liability + liabilityDelta;
-        
-        this.logger.log(
-          `[USER WALLET UPDATE] Settlement ${settlementId}: User ${userId} - ` +
-          `Wallet update calculation: ` +
-          `balance: ${wallet.balance} + ${balanceDelta} = ${finalBalance}, ` +
-          `liability: ${wallet.liability} + ${liabilityDelta} = ${finalLiability}`
-        );
-  
-        if (balanceDelta !== 0 || liabilityDelta !== 0) {
-          await tx.wallet.update({ 
-            where: { userId }, 
-            data: { 
-              balance: finalBalance, 
-              liability: finalLiability 
-            } 
-          });
-          
-          this.logger.log(
-            `[USER WALLET UPDATED] Settlement ${settlementId}: User ${userId} - ` +
-            `Wallet updated successfully. ` +
-            `New balance=${finalBalance}, new liability=${finalLiability}`
-          );
-          
-          if (balanceDelta > 0) {
-            const transaction = await tx.transaction.create({
-              data: {
-                walletId: wallet.id,
-                amount: balanceDelta,
-                type: isCancel ? TransactionType.REFUND : TransactionType.BET_WON,
-                description: isCancel
-                  ? `Fancy Settlement CANCEL: Refunded ${balanceDelta} - ${settlementId}`
-                  : `Fancy Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
-              },
-            });
-            
-            this.logger.log(
-              `[USER TRANSACTION CREATED] Settlement ${settlementId}: User ${userId} - ` +
-              `Transaction created: id=${transaction.id}, amount=${balanceDelta}, ` +
-              `type=${isCancel ? TransactionType.REFUND : TransactionType.BET_WON}`
-            );
-          }
-          
-          this.logger.log(
-            `[USER PROCESSING COMPLETE] Settlement ${settlementId}: User ${userId} - ` +
-            `User processing completed. ` +
-            `Total bets processed=${bets.filter(b => b.userId === userId).length}, ` +
-            `balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta}, ` +
-            `Final balance=${finalBalance}, final liability=${finalLiability}`
-          );
-          
-          affectedUserIds.add(userId);
-        } else {
-          this.logger.log(
-            `[USER NO UPDATE] Settlement ${settlementId}: User ${userId} - ` +
-            `No wallet update needed (balanceDelta=${balanceDelta}, liabilityDelta=${liabilityDelta})`
-          );
-        }
-      }
-      
-      // ✅ Create/update settlement record with decisionRun
-      await tx.settlement.upsert({
-        where: { settlementId },
-        update: {
-          isRollback: false,
-          settledBy: adminId,
-          winnerId: isCancel ? null : (decisionRun?.toString() || null),
-        },
-        create: {
-          settlementId,
-          eventId,
-          marketType: MarketType.FANCY,
-          marketId: marketId || null,
-          winnerId: isCancel ? null : (decisionRun?.toString() || null),
-          settledBy: adminId,
-        },
+    for (const { bet, betWins, pnl } of perBet) {
+      const stake = bet.betValue ?? bet.amount ?? 0;
+      const payout = betWins ? stake + pnl : 0;
+      totalCredit += payout;
+      results.push({
+        betId: bet.id,
+        result: betWins ? 'WIN' : 'LOSS',
+        payout,
       });
-      
-      this.logger.log(
-        `[SETTLEMENT RECORD CREATED] Settlement ${settlementId} - ` +
-        `Settlement record created/updated with winnerId=${isCancel ? null : (decisionRun?.toString() || null)}, ` +
-        `settledBy=${adminId}`
-      );
-      
-      this.logger.log(
-        `[SETTLEMENT TRANSACTION COMPLETE] Settlement ${settlementId} - ` +
-        `Transaction completed. ` +
-        `Total bets processed=${bets.length}, ` +
-        `Affected users=${affectedUserIds.size} (${Array.from(affectedUserIds).join(', ')})`
-      );
-    });
-  
-    await this.recalculatePnLForUsersFancy(affectedUserIds, eventId);
-  
-    this.logger.log(`[FANCY SETTLEMENT COMPLETE] Settlement ${settlementId}: Total bets settled=${bets.length}, Affected users=${affectedUserIds.size}, actualRuns=${actualRuns}, isCancel=${isCancel}`);
-  
-    return { success: true, message: 'Fancy bets settled successfully' };
+    }
+
+    const releasedLiability = wallet.liability ?? 0;
+    wallet.liability = 0;
+    wallet.balance += totalCredit;
+
+    return {
+      credited: totalCredit,
+      releasedLiability,
+      results,
+    };
   }
-  
   
   /**
    * ✅ MATCH ODDS EXPOSURE CALCULATION (MARKET-SPECIFIC)

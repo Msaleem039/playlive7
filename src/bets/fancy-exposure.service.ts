@@ -119,7 +119,49 @@ export class FancyExposureService {
   }
 
   /**
-   * Calculate total P/L for a specific outcome (actualRuns value)
+   * Calculate total P/L for a specific outcome (actualRuns).
+   * Single source of truth for fancy win/loss and PnL – use in settlement for consistency with exposure.
+   *
+   * @param fancyBets - Array of Fancy bets
+   * @param actualRuns - The actual outcome value (runs/score)
+   * @returns Total P/L (positive = profit, negative = loss)
+   */
+  calculatePnLForOutcome(fancyBets: any[], actualRuns: number): number {
+    return this.calculateTotalPlForOutcome(fancyBets, actualRuns);
+  }
+
+  /**
+   * Per-bet P/L for a given outcome. Use in fancy settlement (individual or gola fallback) so win/loss
+   * and PnL match the same rules as exposure (YES: win if actualRuns >= line, NO: win if actualRuns < line).
+   *
+   * @param fancyBets - Array of Fancy bets
+   * @param actualRuns - The actual outcome value (runs/score)
+   * @returns Array of { bet, betWins, pnl } for each bet (pnl = +winAmount or -lossAmount)
+   */
+  getPerBetPnLForOutcome(
+    fancyBets: any[],
+    actualRuns: number,
+  ): Array<{ bet: any; betWins: boolean; pnl: number }> {
+    const results: Array<{ bet: any; betWins: boolean; pnl: number }> = [];
+    for (const bet of fancyBets) {
+      const betType = (bet.betType || '').toUpperCase();
+      const line = bet.betRate ?? bet.odds ?? 0;
+      const stake = bet.betValue ?? bet.amount ?? 0;
+      const lossAmount = bet.lossAmount ?? stake;
+      const winAmount = bet.winAmount ?? stake;
+      const isYes = betType === 'YES' || betType === 'BACK';
+      const isNo = betType === 'NO' || betType === 'LAY';
+      let betWins = false;
+      if (isYes) betWins = actualRuns >= line;
+      else if (isNo) betWins = actualRuns < line;
+      const pnl = betWins ? winAmount : -lossAmount;
+      results.push({ bet, betWins, pnl });
+    }
+    return results;
+  }
+
+  /**
+   * Calculate total P/L for a specific outcome (actualRuns value) – internal use
    * 
    * @param fancyBets - Array of Fancy bets
    * @param actualRuns - The actual outcome value (runs/score)

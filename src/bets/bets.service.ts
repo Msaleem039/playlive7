@@ -1,7 +1,7 @@
 import { BadRequestException, HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { PlaceBetDto } from './bets.dto';
 import { PrismaService } from '../prisma/prisma.service';
-import { BetStatus, MatchStatus, TransactionType, Prisma, Wallet, Bet } from '@prisma/client';
+import { BetStatus, MatchStatus, TransactionType, Prisma, Wallet, Bet, PrismaClient } from '@prisma/client';
 import { 
   calculatePositions, 
   calculateMatchOddsPosition, 
@@ -62,6 +62,53 @@ export class BetsService {
     }
     // BACK bet (match odds/bookmaker) or fallback
     return stake;
+  }
+
+  /**
+   * Observability only: upsert remaining fancy exposure for (userId, marketId, selectionId).
+   * Does not affect placement; wrapped in try/catch so failures never fail the main flow.
+   */
+  private async upsertFancyExposureSafe(
+    tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>,
+    params: {
+      userId: string;
+      eventId: string;
+      marketId: string;
+      selectionId: number;
+      remainingExposure: number;
+      lastBetId: string;
+    },
+  ): Promise<void> {
+    try {
+      await (tx as PrismaClient).fancyExposure.upsert({
+        where: {
+          userId_marketId_selectionId: {
+            userId: params.userId,
+            marketId: params.marketId,
+            selectionId: params.selectionId,
+          },
+        },
+        update: {
+          remainingExposure: params.remainingExposure,
+          lastBetId: params.lastBetId,
+          updatedAt: new Date(),
+          ...(params.eventId && { eventId: params.eventId }),
+        },
+        create: {
+          userId: params.userId,
+          eventId: params.eventId || null,
+          marketId: params.marketId,
+          selectionId: params.selectionId,
+          remainingExposure: params.remainingExposure,
+          lastBetId: params.lastBetId,
+        },
+      });
+    } catch (err) {
+      this.logger.warn(
+        `[fancy_exposures] upsert failed (observability only): ${(err as Error)?.message}`,
+        { userId: params.userId, marketId: params.marketId, selectionId: params.selectionId },
+      );
+    }
   }
 
   private calculateExposureByMarketType(bets: any[]): {
@@ -866,6 +913,44 @@ export class BetsService {
                   refundedByBetId: createdBet.id,
                 },
               });
+            }
+          }
+
+          // Observability only: store remaining fancy exposure (no impact on placement/settlement)
+          // Use persisted createdBet with normalized fields so exposure engine sees the latest bet correctly.
+          if (betGtype === 'fancy') {
+            try {
+              const fancyGroup = allPendingBets.filter(
+                (b) =>
+                  (b.gtype || '').toLowerCase() === 'fancy' &&
+                  b.marketId === marketId &&
+                  b.selectionId === normalizedSelectionId,
+              );
+              const normalizedCreatedBet = {
+                gtype: 'fancy',
+                eventId: createdBet.eventId ?? eventId ?? '',
+                selectionId: createdBet.selectionId ?? normalizedSelectionId,
+                betType: createdBet.betType ?? bet_type,
+                betRate: createdBet.betRate ?? normalizedBetRate,
+                odds: createdBet.odds ?? normalizedBetRate,
+                betValue: createdBet.betValue ?? normalizedBetValue,
+                amount: createdBet.amount ?? normalizedBetValue,
+                winAmount: createdBet.winAmount ?? normalizedWinAmount,
+                lossAmount: createdBet.lossAmount ?? normalizedLossAmount,
+              };
+              const newGroup = [...fancyGroup, normalizedCreatedBet];
+              const remainingExposure =
+                this.fancyExposureService.calculateFancyExposureInMemory(newGroup);
+              await this.upsertFancyExposureSafe(tx, {
+                userId,
+                eventId: eventId || '',
+                marketId,
+                selectionId: normalizedSelectionId,
+                remainingExposure,
+                lastBetId: createdBet.id,
+              });
+            } catch {
+              // Never fail placement; observability only
             }
           }
 
