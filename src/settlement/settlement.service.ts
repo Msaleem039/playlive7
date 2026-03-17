@@ -2205,24 +2205,25 @@ export class SettlementService {
       );
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      const betsByUser = new Map<string, any[]>();
-      for (const bet of bets) {
-        if (!betsByUser.has(bet.userId)) {
-          betsByUser.set(bet.userId, []);
+    await this.prisma.$transaction(
+      async (tx) => {
+        const betsByUser = new Map<string, any[]>();
+        for (const bet of bets) {
+          if (!betsByUser.has(bet.userId)) {
+            betsByUser.set(bet.userId, []);
+          }
+          betsByUser.get(bet.userId)!.push(bet);
         }
-        betsByUser.get(bet.userId)!.push(bet);
-      }
 
-      for (const [userId, userBets] of betsByUser.entries()) {
-        const wallet = await tx.wallet.findUnique({
-          where: { userId },
-        });
-        if (!wallet) continue;
+        for (const [userId, userBets] of betsByUser.entries()) {
+          const wallet = await tx.wallet.findUnique({
+            where: { userId },
+          });
+          if (!wallet) continue;
 
-        this.logger.debug(
-          `[SETTLE MARKET] user=${userId} bets=${userBets.length} settlementId=${settlementId} isCancel=${isCancel}`,
-        );
+          this.logger.debug(
+            `[SETTLE MARKET] user=${userId} bets=${userBets.length} settlementId=${settlementId} isCancel=${isCancel}`,
+          );
 
         let totalPnL = 0;
         const betUpdates: Array<{ id: string; status: BetStatus; pnl: number }> = [];
@@ -2422,7 +2423,12 @@ export class SettlementService {
         );
         affectedUserIds.add(userId);
       }
-    });
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
+      },
+    );
 
     return affectedUserIds;
   }

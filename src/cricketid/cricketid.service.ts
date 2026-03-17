@@ -759,6 +759,77 @@ export class CricketIdService {
   }
 
   /**
+   * Get live score by eventId from cache.tresting.com
+   * Endpoint: https://cache.tresting.com/v2/api/getScoreByEventIdNew?eventId={eventId}
+   *
+   * This is a lightweight, read-only call used for scoreboards and in-play views.
+   * It does NOT affect any betting logic, wallet state, or exposure.
+   */
+  async getScoreByEventId(eventId: string | number) {
+    const id = String(eventId);
+    const url = `https://cache.tresting.com/v2/api/getScoreByEventIdNew?eventId=${encodeURIComponent(
+      id,
+    )}`;
+
+    try {
+      const { data } = await firstValueFrom(
+        this.http.get(url, {
+          timeout: this.timeout,
+          headers: {
+            Accept: 'application/json',
+            'User-Agent': 'PlayLive-API/1.0',
+          },
+          httpAgent: new http.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: 50,
+            maxFreeSockets: 10,
+            timeout: this.timeout,
+          }),
+          httpsAgent: new https.Agent({
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: 50,
+            maxFreeSockets: 10,
+            timeout: this.timeout,
+          }),
+        }),
+      );
+      return data;
+    } catch (error: any) {
+      this.logger.error(
+        `Error fetching score from cache.tresting.com for eventId=${id}: ${
+          error?.message || String(error)
+        }`,
+      );
+
+      if (error instanceof AxiosError && error.response) {
+        const status = error.response.status || HttpStatus.BAD_GATEWAY;
+        throw new HttpException(
+          {
+            statusCode: status,
+            message:
+              error.response.data?.message ||
+              error.message ||
+              'Failed to fetch score from vendor cache API',
+            error: 'Vendor Cache API Error',
+          },
+          status,
+        );
+      }
+
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_GATEWAY,
+          message: error instanceof Error ? error.message : 'Failed to fetch score from vendor cache API',
+          error: 'Vendor Cache API Error',
+        },
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+  }
+
+  /**
    * Determine if a market is suspended based on various conditions
    * @param market - Market object with gstatus/status, min, max, odds properties
    * @returns boolean indicating if the market is suspended

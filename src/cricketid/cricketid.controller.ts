@@ -173,5 +173,25 @@ export class CricketIdController {
     return this.cricketIdService.getMatchMarkets(eventId);
   }
 
+  /**
+   * Get live score for a specific event from cache.tresting.com
+   * GET /cricketid/score?eventId={eventId}
+   *
+   * Thin wrapper around the vendor cache API:
+   * https://cache.tresting.com/v2/api/getScoreByEventIdNew?eventId={eventId}
+   */
+  @Get('score')
+  async getScoreByEventId(@Query('eventId') eventId: string | number) {
+    if (!eventId) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'eventId query parameter is required',
+        error: 'Bad Request',
+      });
+    }
+
+    return this.cricketIdService.getScoreByEventId(eventId);
+  }
+
 }
 
