@@ -1,5 +1,5 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
-import { PrismaClient, BetStatus, MarketType, TransactionType } from '@prisma/client';
+import { PrismaClient, BetStatus, MarketType, TransactionType, TransferLogType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AggregatorService } from '../cricketid/aggregator.service';
 import { PnlService } from './pnl.service';
@@ -2697,6 +2697,7 @@ export class SettlementService {
     marketType: MarketType,
     adminId: string,
     betIds?: string[],
+    isCancelOverride = false,
   ) {
     try {
       // 🔐 STRICT VALIDATION: Validate required parameters
@@ -2863,23 +2864,27 @@ export class SettlementService {
       }
 
       // 🔐 STRICT VALIDATION: Validate winnerSelectionId exists in valid runners/bets
-      if (validSelectionIds !== null && validSelectionIds.length > 0) {
-        const idsToCheck = validSelectionIds; // TypeScript guard
-        if (!idsToCheck.includes(winnerSelectionIdNum)) {
-          const validIds = idsToCheck.join(', ');
-          throw new BadRequestException(
-            `Invalid winnerSelectionId: ${winnerSelectionId} (${winnerSelectionIdNum}). ` +
-            `This selectionId does not exist in the market runners or found bets. ` +
-            `Valid selectionIds: ${validIds}. ` +
-            `Settlement aborted - winnerSelectionId must be a valid runner.`,
+      // Cancel-all bypasses this: vendor API runners often differ from stored bet selectionIds
+      // (cricket re-seeding, stale API). Voiding the market does not depend on winner.
+      if (!isCancelOverride) {
+        if (validSelectionIds !== null && validSelectionIds.length > 0) {
+          const idsToCheck = validSelectionIds; // TypeScript guard
+          if (!idsToCheck.includes(winnerSelectionIdNum)) {
+            const validIds = idsToCheck.join(', ');
+            throw new BadRequestException(
+              `Invalid winnerSelectionId: ${winnerSelectionId} (${winnerSelectionIdNum}). ` +
+              `This selectionId does not exist in the market runners or found bets. ` +
+              `Valid selectionIds: ${validIds}. ` +
+              `Settlement aborted - winnerSelectionId must be a valid runner.`,
+            );
+          }
+        } else {
+          // No validation possible - but we have strict matching so this should be safe
+          this.logger.warn(
+            `Could not validate winnerSelectionId against API or bets. ` +
+            `Proceeding with strict matching only (bet.eventId === ${eventId} AND bet.marketId === ${marketId}).`,
           );
         }
-      } else {
-        // No validation possible - but we have strict matching so this should be safe
-        this.logger.warn(
-          `Could not validate winnerSelectionId against API or bets. ` +
-          `Proceeding with strict matching only (bet.eventId === ${eventId} AND bet.marketId === ${marketId}).`,
-        );
       }
 
       // 🔐 STRICT VALIDATION: Check if settlement already exists
@@ -2905,9 +2910,11 @@ export class SettlementService {
 
       // 🔐 STRICT TIE HANDLING: Check for tie result using market runners
       // ✅ CORRECT RULE: Market runners define outcome - never bets
-      let isCancel = false;
+      // isCancel can be forced by admin (explicit cancel/refund) or inferred from tie rules
+      let isCancel = isCancelOverride;
       // Reuse marketDetails if already fetched, otherwise try to fetch (but check cache first)
-      if (!marketDetails) {
+      // If admin explicitly requested cancel, skip tie-detection API work
+      if (!isCancel && !marketDetails) {
         // Check if eventId is already known to be expired (avoid unnecessary API calls)
         if (this.isEventIdExpired(eventId)) {
           this.logger.debug(
@@ -2938,7 +2945,7 @@ export class SettlementService {
         }
       }
 
-      if (marketDetails && Array.isArray(marketDetails)) {
+      if (!isCancel && marketDetails && Array.isArray(marketDetails)) {
         // Find Match Odds market (not Match Odds Including Tie)
         const matchOddsMarket = marketDetails.find((market: any) => {
           const marketName = (market.marketName || '').toLowerCase();
@@ -3582,6 +3589,7 @@ export class SettlementService {
     winnerSelectionId: string,
     adminId: string,
     betIds?: string[],
+    isCancel = false,
   ) {
     try {
       // 🔐 STRICT VALIDATION: Validate required parameters
@@ -3718,25 +3726,36 @@ export class SettlementService {
         update: {
           isRollback: false,
           settledBy: adminId,
-          winnerId: winnerSelectionId,
+          winnerId: isCancel ? null : winnerSelectionId,
         },
         create: {
           settlementId,
           eventId,
           marketType: MarketType.TIED_MATCH,
           marketId,
-          winnerId: winnerSelectionId,
+          winnerId: isCancel ? null : winnerSelectionId,
           settledBy: adminId,
         },
       });
 
-      // ✅ ISOLATED TIED MATCH SETTLEMENT ENGINE
-      const affectedUserIds = await this.settleTiedMatchBetsIsolated({
-        settlementId,
-        bets,
-        winnerSelectionIdNum,
-        adminId,
-      });
+      let affectedUserIds: Set<string>;
+
+      if (isCancel) {
+        // Simple cancel/refund: return stake, do not apply win/loss rules
+        affectedUserIds = await this.cancelTiedMatchBets({
+          settlementId,
+          bets,
+          adminId,
+        });
+      } else {
+        // ✅ ISOLATED TIED MATCH SETTLEMENT ENGINE (normal win/loss)
+        affectedUserIds = await this.settleTiedMatchBetsIsolated({
+          settlementId,
+          bets,
+          winnerSelectionIdNum,
+          adminId,
+        });
+      }
 
       // Recalculate P/L (reporting only, no wallet mutation)
       await this.recalculatePnLForUsers(affectedUserIds, eventId, MarketType.TIED_MATCH);
@@ -3978,6 +3997,97 @@ export class SettlementService {
       `ISOLATED Tied Match settlement completed successfully. ` +
       `Settled ${bets.length} bets for ${affectedUserIds.size} users. ` +
       `settlementId: ${settlementId}`,
+    );
+
+    return affectedUserIds;
+  }
+
+  /**
+   * Cancel / refund Tied Match bets.
+   * - Credit back stake for each bet
+   * - Do NOT apply win/loss logic
+   * - Liability is unchanged (Tied Match does not use liability)
+   */
+  private async cancelTiedMatchBets({
+    settlementId,
+    bets,
+    adminId,
+  }: {
+    settlementId: string;
+    bets: any[];
+    adminId: string;
+  }): Promise<Set<string>> {
+    const affectedUserIds = new Set<string>();
+
+    this.logger.log(
+      `Starting Tied Match CANCEL for ${bets.length} bets. settlementId: ${settlementId}`,
+    );
+
+    await this.prisma.$transaction(
+      async (tx) => {
+        const betsByUser = new Map<string, typeof bets>();
+        for (const bet of bets) {
+          if (!betsByUser.has(bet.userId)) {
+            betsByUser.set(bet.userId, []);
+          }
+          betsByUser.get(bet.userId)!.push(bet);
+        }
+
+        for (const [userId, userBets] of betsByUser.entries()) {
+          const wallet = await tx.wallet.findUnique({
+            where: { userId },
+          });
+          if (!wallet) {
+            this.logger.warn(
+              `Wallet not found for user ${userId} during Tied Match cancel.`,
+            );
+            continue;
+          }
+
+          let balanceDelta = 0;
+
+          const now = new Date();
+          for (const bet of userBets) {
+            const stake = Number(bet.betValue ?? bet.amount ?? 0);
+            balanceDelta += stake;
+
+            await tx.bet.update({
+              where: { id: bet.id },
+              data: {
+                status: BetStatus.CANCELLED,
+                pnl: 0,
+                settledAt: now,
+                updatedAt: now,
+              },
+            });
+          }
+
+          if (balanceDelta !== 0) {
+            await tx.wallet.update({
+              where: { userId },
+              data: {
+                balance: wallet.balance + balanceDelta,
+                // Liability unchanged for Tied Match
+              },
+            });
+
+            await tx.transaction.create({
+              data: {
+                walletId: wallet.id,
+                amount: balanceDelta,
+                type: TransactionType.REFUND,
+                description: `Tied Match CANCEL: Refunded ${balanceDelta} - ${settlementId}`,
+              },
+            });
+          }
+
+          affectedUserIds.add(userId);
+        }
+      },
+      {
+        maxWait: 15000,
+        timeout: 30000,
+      },
     );
 
     return affectedUserIds;
@@ -5191,6 +5301,68 @@ export class SettlementService {
       };
     });
 
+    // ✅ Compute cash in/out summary (Topup / Topdown) for this user
+    // In = money received by the user (TOPUP to this user)
+    // Out = money sent from the user (TOPDOWN from this user)
+    const transferDateFilter =
+      startDate || endDate
+        ? {
+            createdAt: {
+              ...(startDate ? { gte: startDate } : {}),
+              ...(endDate ? { lte: endDate } : {}),
+            },
+          }
+        : {};
+
+    const [inAgg, outAgg, transferLogs] = await Promise.all([
+      this.prisma.transferLog.aggregate({
+        _sum: { amount: true },
+        where: {
+          toUserId: userId,
+          type: TransferLogType.TOPUP,
+          ...transferDateFilter,
+        },
+      }),
+      this.prisma.transferLog.aggregate({
+        _sum: { amount: true },
+        where: {
+          fromUserId: userId,
+          type: TransferLogType.TOPDOWN,
+          ...transferDateFilter,
+        },
+      }),
+      this.prisma.transferLog.findMany({
+        where: {
+          OR: [
+            { toUserId: userId, type: TransferLogType.TOPUP },
+            { fromUserId: userId, type: TransferLogType.TOPDOWN },
+          ],
+          ...transferDateFilter,
+        },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          fromUserId: true,
+          toUserId: true,
+          amount: true,
+          remarks: true,
+          type: true,
+          createdAt: true,
+        },
+      }),
+    ]);
+
+    const totalIn = inAgg._sum.amount ?? 0;
+    const totalOut = outAgg._sum.amount ?? 0;
+
+    const cashHistory = transferLogs.map((log) => ({
+      id: log.id,
+      date: log.createdAt,
+      type: log.type === TransferLogType.TOPUP ? 'IN' : 'OUT',
+      amount: log.amount,
+      remarks: log.remarks ?? null,
+    }));
+
     return {
       success: true,
       data: enrichedBets,
@@ -5202,7 +5374,10 @@ export class SettlementService {
       user: {
         balance: wallet?.balance ?? 0,
         liability: wallet?.liability ?? 0,
+        in: totalIn,
+        out: totalOut,
       },
+      cashHistory,
     };
   }
 

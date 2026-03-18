@@ -64,6 +64,10 @@ class SettleMarketDto {
   marketType: 'MATCH_ODDS' | 'BOOKMAKER' | 'TIED_MATCH'; // Market type: MATCH_ODDS, BOOKMAKER, or TIED_MATCH
 
   @IsOptional()
+  @IsBoolean()
+  isCancel?: boolean; // Optional: when true, cancel/refund all matching bets instead of settling by winner
+
+  @IsOptional()
   @IsArray()
   @IsString({ each: true })
   betIds?: string[]; // Optional: settle only specific bets. If not provided, settles all pending bets for the market
@@ -81,6 +85,10 @@ class SettleTiedMatchDto {
   @IsNotEmpty()
   @IsString()
   winnerSelectionId: string; // 37302 for Yes, 37303 for No
+
+  @IsOptional()
+  @IsBoolean()
+  isCancel?: boolean; // Optional: when true, cancel/refund all matching bets instead of settling by winner
 
   @IsOptional()
   @IsArray()
@@ -158,6 +166,7 @@ export class SettlementAdminController {
         dto.winnerSelectionId,
         user.id,
         dto.betIds,
+        dto.isCancel === true,
       );
     }
 
@@ -169,6 +178,7 @@ export class SettlementAdminController {
       MarketType.MATCH_ODDS,
       user.id,
       dto.betIds,
+      dto.isCancel === true,
     );
   }
 
@@ -199,6 +209,7 @@ export class SettlementAdminController {
       dto.winnerSelectionId,
       user.id,
       dto.betIds,
+      dto.isCancel === true,
     );
   }
 
@@ -218,6 +229,7 @@ export class SettlementAdminController {
       MarketType.MATCH_ODDS,
       user.id,
       dto.betIds,
+      false, // deprecated endpoint does not support explicit cancel flag
     );
   }
 
