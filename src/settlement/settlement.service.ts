@@ -240,6 +240,28 @@ export class SettlementService {
         let liabilityDelta = 0;
 
         if (isCancel) {
+          console.log(
+            '[FANCY_DEBUG]',
+            JSON.stringify(
+              {
+                tag: 'cancel_start',
+                settlementId,
+                eventId,
+                selectionId,
+                marketId,
+                userId,
+                walletBefore: { balance: wallet.balance, liability: wallet.liability },
+                bets: userBets.map((b) => ({
+                  id: b.id,
+                  type: (b.betType || '').toUpperCase(),
+                  stake: b.betValue ?? b.amount ?? 0,
+                  lossAmount: b.lossAmount ?? (b.betValue ?? b.amount ?? 0),
+                })),
+              },
+              null,
+              2,
+            ),
+          );
           for (const bet of userBets) {
             const type = (bet.betType || '').toUpperCase();
             const stake = bet.betValue ?? bet.amount ?? 0;
@@ -247,6 +269,24 @@ export class SettlementService {
             const liabilityAmount = type === 'LAY' || type === 'NO' ? lossAmount : stake;
             liabilityDelta -= liabilityAmount;
             balanceDelta += liabilityAmount;
+            console.log(
+              '[FANCY_DEBUG]',
+              JSON.stringify(
+                {
+                  tag: 'cancel_bet',
+                  settlementId,
+                  userId,
+                  betId: bet.id,
+                  type,
+                  stake,
+                  lossAmount,
+                  liabilityAmount,
+                  running: { balanceDelta, liabilityDelta },
+                },
+                null,
+                2,
+              ),
+            );
             await tx.bet.update({
               where: { id: bet.id },
               data: {
@@ -285,9 +325,40 @@ export class SettlementService {
           const totalPnl = perBet.reduce((sum, { pnl }) => sum + pnl, 0);
           const useExposureCredit =
             exposure != null &&
-            exposure.remainingExposure > 0 &&
-            totalPnl > 0;
+            exposure.remainingExposure > 0;
+          // Range/Gola rule requested: if this is a range/gola exposure and net result is LOSS,
+          // do not credit anything to balance (credit should be 0 on loss).
+          const isRangeOrGola = exposure != null && exposure.remainingExposure > 0;
+          const suppressBalanceCreditOnLoss = isRangeOrGola && totalPnl <= 0;
           let appliedExposureCredit = false;
+
+          console.log(
+            '[FANCY_DEBUG]',
+            JSON.stringify(
+              {
+                tag: 'settle_start',
+                settlementId,
+                eventId,
+                selectionId,
+                marketId: marketIdForExposure ?? null,
+                userId,
+                actualRuns,
+                walletBefore: { balance: wallet.balance, liability: wallet.liability },
+                exposure: exposure
+                  ? {
+                      id: exposure.id,
+                      remainingExposure: exposure.remainingExposure,
+                    }
+                  : null,
+                refundPairBetIds: Array.from(refundPairBetIds),
+                totalPnl,
+                useExposureCredit,
+                suppressBalanceCreditOnLoss,
+              },
+              null,
+              2,
+            ),
+          );
 
           for (const { bet, betWins, pnl } of perBet) {
             const type = (bet.betType || '').toUpperCase();
@@ -303,14 +374,65 @@ export class SettlementService {
                 // Gola / range fancy: remaining_exposure is the effective stake, totalPnl is the net profit.
                 const effectiveStake = exposure!.remainingExposure;
                 const profit = totalPnl;
-                balanceDelta += effectiveStake + profit;
+                // GOLA / RANGE RULE:
+                // - Detect gola ONLY via exposure.remainingExposure > 0
+                // - Win (totalPnl > 0): credit = remainingExposure + totalPnl (only once)
+                // - Loss (totalPnl <= 0): credit = 0
+                const credit = totalPnl > 0 ? effectiveStake + profit : 0;
+                balanceDelta += credit;
                 appliedExposureCredit = true;
+                console.log(
+                  '[FANCY_DEBUG]',
+                  JSON.stringify(
+                    {
+                      tag: 'bet_win_exposure_credit',
+                      settlementId,
+                      userId,
+                      betId: bet.id,
+                      type,
+                      stake,
+                      lossAmount,
+                      pnl,
+                      betWins,
+                      alreadyRefunded,
+                      liabilityAmount,
+                      credit,
+                      appliedExposureCredit,
+                      running: { balanceDelta, liabilityDelta },
+                    },
+                    null,
+                    2,
+                  ),
+                );
               } else if (!useExposureCredit) {
                 // BUG 1 FIX: Always treat pnl as profit; credit = stake + profit for normal bets,
                 // and profit only for already-refunded (hedged) bets.
                 const profit = pnl;
-                const credit = alreadyRefunded ? profit : stake + profit;
+                const credit = isRangeOrGola ? 0 : alreadyRefunded ? profit : stake + profit;
                 balanceDelta += credit;
+                console.log(
+                  '[FANCY_DEBUG]',
+                  JSON.stringify(
+                    {
+                      tag: 'bet_win_credit',
+                      settlementId,
+                      userId,
+                      betId: bet.id,
+                      type,
+                      stake,
+                      lossAmount,
+                      pnl,
+                      betWins,
+                      alreadyRefunded,
+                      liabilityAmount,
+                      credit,
+                      appliedExposureCredit,
+                      running: { balanceDelta, liabilityDelta },
+                    },
+                    null,
+                    2,
+                  ),
+                );
               }
               await tx.bet.update({
                 where: { id: bet.id },
@@ -323,6 +445,29 @@ export class SettlementService {
                 },
               });
             } else {
+              console.log(
+                '[FANCY_DEBUG]',
+                JSON.stringify(
+                  {
+                    tag: 'bet_loss',
+                    settlementId,
+                    userId,
+                    betId: bet.id,
+                    type,
+                    stake,
+                    lossAmount,
+                    pnl,
+                    betWins,
+                    alreadyRefunded,
+                    liabilityAmount,
+                    credit: 0,
+                    appliedExposureCredit,
+                    running: { balanceDelta, liabilityDelta },
+                  },
+                  null,
+                  2,
+                ),
+              );
               await tx.bet.update({
                 where: { id: bet.id },
                 data: {
@@ -338,6 +483,27 @@ export class SettlementService {
         }
 
         if (balanceDelta !== 0 || liabilityDelta !== 0) {
+          const walletAfter = {
+            balance: wallet.balance + balanceDelta,
+            liability: Math.max(0, wallet.liability + liabilityDelta),
+          };
+          console.log(
+            '[FANCY_DEBUG]',
+            JSON.stringify(
+              {
+                tag: 'wallet_apply',
+                settlementId,
+                userId,
+                isCancel,
+                actualRuns: isCancel ? null : actualRuns,
+                deltas: { balanceDelta, liabilityDelta },
+                walletBefore: { balance: wallet.balance, liability: wallet.liability },
+                walletAfter,
+              },
+              null,
+              2,
+            ),
+          );
           await tx.wallet.update({
             where: { userId },
             data: {
@@ -2168,6 +2334,163 @@ export class SettlementService {
   //   return affectedUserIds;
   // }
   /**
+   * Cancel/draw for Match Odds (same market): refund per runner = |sum(BACK stakes) − sum(LAY liabilities)|,
+   * summed across selections. Liability cleared to 0 for this cancel path.
+   */
+  private async applySettleMarketCancelRefund(
+    tx: any,
+    params: {
+      userId: string;
+      userBets: any[];
+      marketId: string;
+      settlementId: string;
+      currentBalance: number;
+    },
+  ): Promise<void> {
+    const { userId, userBets, marketId, settlementId, currentBalance } = params;
+
+    const selectionMap = new Map<number, { back: number; lay: number }>();
+    const betLines: Array<{
+      betId: string;
+      betType: string;
+      selectionId: number;
+      stake: number;
+      odds: number;
+      skipped: boolean;
+      skipReason?: string;
+      addedBack?: number;
+      addedLayLiability?: number;
+    }> = [];
+
+    for (const bet of userBets) {
+      if (String(bet.marketId) !== String(marketId)) {
+        betLines.push({
+          betId: bet.id,
+          betType: String(bet.betType ?? '').toUpperCase(),
+          selectionId: Number(bet.selectionId),
+          stake: Number(bet.betValue ?? bet.amount ?? 0),
+          odds: Number(bet.betRate ?? bet.odds ?? 0),
+          skipped: true,
+          skipReason: 'different_marketId',
+        });
+        continue;
+      }
+
+      const selId = Number(bet.selectionId);
+      const stake = Number(bet.betValue ?? bet.amount ?? 0);
+      const odds = Number(bet.betRate ?? bet.odds ?? 0);
+      const bt = String(bet.betType ?? '').toUpperCase();
+
+      if (isNaN(selId)) {
+        betLines.push({
+          betId: bet.id,
+          betType: bt,
+          selectionId: NaN,
+          stake,
+          odds,
+          skipped: true,
+          skipReason: 'invalid_selectionId',
+        });
+        continue;
+      }
+
+      if (!selectionMap.has(selId)) {
+        selectionMap.set(selId, { back: 0, lay: 0 });
+      }
+
+      const entry = selectionMap.get(selId)!;
+      let addedBack: number | undefined;
+      let addedLayLiability: number | undefined;
+
+      if (bt === 'BACK') {
+        entry.back += stake;
+        addedBack = stake;
+      } else if (bt === 'LAY') {
+        const liab = stake * (odds - 1);
+        entry.lay += liab;
+        addedLayLiability = liab;
+      } else {
+        betLines.push({
+          betId: bet.id,
+          betType: bt,
+          selectionId: selId,
+          stake,
+          odds,
+          skipped: true,
+          skipReason: 'not_BACK_or_LAY',
+        });
+        continue;
+      }
+
+      betLines.push({
+        betId: bet.id,
+        betType: bt,
+        selectionId: selId,
+        stake,
+        odds,
+        skipped: false,
+        addedBack,
+        addedLayLiability,
+      });
+    }
+
+    const perSelection: Array<{
+      selectionId: number;
+      backSum: number;
+      layLiabilitySum: number;
+      absDiff: number;
+    }> = [];
+    let refund = 0;
+    for (const [selectionId, { back, lay }] of selectionMap.entries()) {
+      const absDiff = Math.abs(back - lay);
+      refund += absDiff;
+      perSelection.push({
+        selectionId,
+        backSum: back,
+        layLiabilitySum: lay,
+        absDiff,
+      });
+    }
+
+    const newBalance = currentBalance + refund;
+    const newLiability = 0;
+
+    const debugPayload = {
+      tag: 'CANCEL_SIMPLE_OFFSET_DEBUG',
+      userId,
+      settlementId,
+      marketId,
+      currentBalance,
+      refundExact: refund,
+      newBalanceExact: newBalance,
+      newLiabilityExact: newLiability,
+      userBetsCount: userBets.length,
+      betsInMarketApplied: betLines.filter((b) => !b.skipped).length,
+      perSelection,
+      refundFormula: perSelection.map(
+        (p) => `|${p.backSum}(BACK)−${p.layLiabilitySum}(LAY_liab)|=${p.absDiff}`,
+      ),
+      betLines,
+    };
+
+    console.log('[CANCEL_SIMPLE_OFFSET_DEBUG]', JSON.stringify(debugPayload, null, 2));
+
+    this.logger.warn(
+      `[CANCEL SIMPLE OFFSET] user=${userId} settlementId=${settlementId} marketId=${marketId} ` +
+        `refund=${refund} balance ${currentBalance}→${newBalance} liability→0 ` +
+        `perSelection=${JSON.stringify(perSelection)} betCount=${betLines.length}`,
+    );
+
+    await tx.wallet.update({
+      where: { userId },
+      data: {
+        balance: newBalance,
+        liability: newLiability,
+      },
+    });
+  }
+
+  /**
    * Settle Match Odds / Tied Match market.
    * - No exposure recalculation (exposure is at placement only).
    * - PnL per bet, totalPnL per user, release wallet.liability once, set to 0.
@@ -2241,8 +2564,6 @@ export class SettlementService {
           const isWinner = betSelectionId === winnerSelectionIdNum;
 
           if (isCancel) {
-            totalPnL += stake;
-            this.logger.debug(`[SETTLE MARKET] bet=${bet.id} CANCEL refund+=${stake} totalPnL=${totalPnL}`);
             betUpdates.push({ id: bet.id, status: BetStatus.CANCELLED, pnl: 0 });
             continue;
           }
@@ -2279,13 +2600,39 @@ export class SettlementService {
           }
         }
 
-        // Exposure BEFORE settlement (for offset: releasedLiability via calculateExposureFromBets)
+        const now = new Date();
+
+        if (isCancel) {
+          await Promise.all(
+            betUpdates.map((update) =>
+              tx.bet.update({
+                where: { id: update.id },
+                data: {
+                  status: update.status,
+                  pnl: update.pnl,
+                  settledAt: now,
+                  updatedAt: now,
+                },
+              }),
+            ),
+          );
+          await this.applySettleMarketCancelRefund(tx, {
+            userId,
+            userBets,
+            marketId,
+            settlementId,
+            currentBalance: wallet.balance ?? 0,
+          });
+          affectedUserIds.add(userId);
+          continue;
+        }
+
+        // Exposure BEFORE settlement (bets still PENDING)
         const allPendingBefore = await tx.bet.findMany({
           where: { userId, status: 'PENDING' },
         });
         const exposureBefore = this.calculateExposureFromBets(allPendingBefore);
 
-        const now = new Date();
         await Promise.all(
           betUpdates.map((update) =>
             tx.bet.update({
@@ -3551,6 +3898,7 @@ export class SettlementService {
     winnerSelectionId: string,
     adminId: string,
     betIds?: string[],
+    isCancelOverride = false,
   ) {
     return this.settleMarketManual(
       eventId,
@@ -3559,6 +3907,7 @@ export class SettlementService {
       MarketType.MATCH_ODDS,
       adminId,
       betIds,
+      isCancelOverride,
     );
   }
 
@@ -4528,58 +4877,50 @@ export class SettlementService {
       throw new BadRequestException(`Wallet not found for user ${bet.userId}`);
     }
 
-    // Calculate refund amount for logging/audit (stake was deducted at placement)
-    // In Asian exchange: exposure = stake (betValue) for both BACK and LAY
-    const refundAmount = bet.betValue || bet.amount || 0;
+    const liabilityBefore = Number(wallet.liability ?? 0);
+    let refundAmount = 0;
 
-    // ASIAN EXCHANGE RULE: Delete bet and use recalcLiability() to restore wallet
-    // When bet is deleted:
-    // 1. Delete the bet (removes it from PENDING bets)
-    // 2. Call recalcLiability() which will:
-    //    - Recalculate net exposure (excluding deleted bet)
-    //    - Credit back the difference to balance
+    // ASIAN CRICKET EXCHANGE RULE:
+    // - recalcLiability() updates ONLY wallet.liability (never touches balance)
+    // - We credit wallet.balance only by the net liability delta for this specific delete
     await this.prisma.$transaction(async (tx) => {
       // Delete the bet first
       await tx.bet.delete({
         where: { id: bet.id },
       });
 
-      // Create refund transaction record (for audit trail)
-      await tx.transaction.create({
-        data: {
-          walletId: wallet.id,
-          amount: refundAmount,
-          type: TransactionType.REFUND,
-          description: `Bet deleted by admin. Bet ID: ${bet.id}, Settlement ID: ${bet.settlementId || 'N/A'}, Bet Name: ${bet.betName || 'N/A'}`,
-        },
-      });
-
       // CRITICAL: Recalculate liability (bet deleted, so liability decreases)
       await this.recalcLiability(tx, bet.userId);
-      
-      // CRITICAL: Explicitly credit the stake (like CANCEL - refund the locked liability)
-      // Calculate the liability that was released
-      const stake = bet.betValue ?? bet.amount ?? 0;
-      const odds = bet.betRate ?? bet.odds ?? 0;
-      
-      let releasedLiability = 0;
-      if (bet.betType?.toUpperCase() === 'BACK') {
-        releasedLiability = stake;
-      } else if (bet.betType?.toUpperCase() === 'LAY') {
-        releasedLiability = (odds - 1) * stake;
-      }
-      
-      // Credit the released liability (refund)
-      if (releasedLiability > 0) {
+
+      const walletAfter = await tx.wallet.findUnique({
+        where: { userId: bet.userId },
+        select: { balance: true, liability: true, id: true },
+      });
+
+      const liabilityAfter = Number(walletAfter?.liability ?? 0);
+      refundAmount = Math.max(0, liabilityBefore - liabilityAfter);
+
+      if (refundAmount > 0) {
+        // Credit balance by the net liability delta only.
         await tx.wallet.update({
           where: { userId: bet.userId },
-          data: { balance: { increment: releasedLiability } },
+          data: { balance: { increment: refundAmount } },
+        });
+
+        // Create refund transaction record (for audit trail)
+        await tx.transaction.create({
+          data: {
+            walletId: wallet.id,
+            amount: refundAmount,
+            type: TransactionType.REFUND,
+            description: `Bet deleted by admin (refund net exposure). Bet ID: ${bet.id}, Settlement ID: ${bet.settlementId || 'N/A'}, Bet Name: ${bet.betName || 'N/A'}`,
+          },
         });
       }
     });
 
     this.logger.log(
-      `Bet ${bet.id} (settlementId: ${bet.settlementId || 'N/A'}) deleted by admin ${adminId}. Refunded ${refundAmount} to user ${bet.userId}`,
+      `Bet ${bet.id} (settlementId: ${bet.settlementId || 'N/A'}) deleted by admin ${adminId}. Refunded net exposure=${refundAmount} based on liability delta for user ${bet.userId}`,
     );
 
     return {
@@ -4708,134 +5049,47 @@ export class SettlementService {
               continue;
             }
 
-            // ✅ OFFSET DETECTION: Find BACK + LAY pairs with same marketId, selectionId, betValue
-            // Only for Match Odds bets (gtype === 'matchodds' or 'match')
-            // OFFSET bets are already neutralized at bet placement, so cancellation must skip refund
-            const offsetBetIds = new Set<string>();
-            const matchOddsBets = userBets.filter(
-              (bet) =>
-                (bet.gtype?.toLowerCase() === 'matchodds' ||
-                  bet.gtype?.toLowerCase() === 'match') &&
-                bet.marketId &&
-                bet.selectionId !== null &&
-                bet.selectionId !== undefined,
-            );
+            const liabilityBefore = Number(wallet.liability ?? 0);
 
-            if (matchOddsBets.length > 0) {
-              const betMap = new Map<string, { back?: any; lay?: any }>();
-
-              for (const bet of matchOddsBets) {
-                const betKey = `${bet.marketId}_${bet.selectionId}_${
-                  bet.betValue ?? bet.amount ?? 0
-                }`;
-                if (!betMap.has(betKey)) {
-                  betMap.set(betKey, {});
-                }
-                const pair = betMap.get(betKey)!;
-                const betType = bet.betType?.toUpperCase();
-                if (betType === 'BACK') {
-                  pair.back = bet;
-                } else if (betType === 'LAY') {
-                  pair.lay = bet;
-                }
-              }
-
-              // Mark OFFSET pairs (both BACK and LAY exist with same key)
-              for (const [key, pair] of betMap.entries()) {
-                if (pair.back && pair.lay) {
-                  offsetBetIds.add(pair.back.id);
-                  offsetBetIds.add(pair.lay.id);
-                  this.logger.debug(
-                    `OFFSET detected in cancelBetsBulk: BACK bet ${pair.back.id} + LAY bet ${pair.lay.id} ` +
-                      `(marketId: ${pair.back.marketId}, selectionId: ${pair.back.selectionId}, betValue: ${pair.back.betValue ?? pair.back.amount})`,
-                  );
-                }
-              }
-            }
-
-            let totalUserRefund = 0;
-            let totalLiabilityRelease = 0;
-
-            // Process each bet for this user
+            const now = new Date();
             for (const bet of userBets) {
-              const stake = bet.betValue ?? bet.amount ?? 0;
-              const odds = bet.betRate ?? bet.odds ?? 0;
-              const betType = bet.betType?.toUpperCase() || '';
-
-              // ✅ OFFSET: Skip refund/liability calculations for OFFSET bets
-              // OFFSET bets are already neutralized at bet placement, so no refund needed
-              if (offsetBetIds.has(bet.id)) {
-                // Update bet status to CANCELLED (no refund)
-                await tx.bet.update({
-                  where: { id: bet.id },
-                  data: {
-                    status: BetStatus.CANCELLED,
-                    // @ts-ignore
-                    pnl: 0, // No P/L for cancelled bets
-                    settledAt: new Date(),
-                    updatedAt: new Date(),
-                  },
-                });
-
-                cancelledBets.push({
-                  betId: bet.id,
-                  userId: bet.userId,
-                  userName: bet.user.name || bet.user.username || 'Unknown',
-                  refundAmount: 0, // OFFSET bets get no refund
-                });
-
-                continue; // Skip refund/liability calculations
-              }
-
-              // ✅ NON-OFFSET BETS: Calculate refund/liability (existing logic)
-              // Calculate liability/refund amount based on bet type
-              let refundAmount = 0;
-              let liabilityRelease = 0;
-
-              if (betType === 'BACK' || betType === 'YES') {
-                // BACK/YES: liability = stake
-                refundAmount = stake;
-                liabilityRelease = stake;
-              } else if (betType === 'LAY' || betType === 'NO') {
-                // LAY/NO: For Match Odds, liability = (odds - 1) * stake
-                // For Fancy, check lossAmount
-                if (bet.lossAmount) {
-                  refundAmount = bet.lossAmount;
-                  liabilityRelease = bet.lossAmount;
-                } else {
-                  liabilityRelease = (odds - 1) * stake;
-                  refundAmount = liabilityRelease;
-                }
-              } else {
-                // Fallback: use stake
-                refundAmount = stake;
-                liabilityRelease = stake;
-              }
-
-              // Update bet status to CANCELLED
               await tx.bet.update({
                 where: { id: bet.id },
                 data: {
                   status: BetStatus.CANCELLED,
                   // @ts-ignore
-                  pnl: 0, // No P/L for cancelled bets
-                  settledAt: new Date(),
-                  updatedAt: new Date(),
+                  pnl: 0,
+                  settledAt: now,
+                  updatedAt: now,
                 },
               });
+            }
 
-              totalUserRefund += refundAmount;
-              totalLiabilityRelease += liabilityRelease;
+            await this.recalcLiability(tx, userId);
 
+            const walletAfterRecalc = await tx.wallet.findUnique({
+              where: { userId },
+            });
+            const liabilityAfter = Number(walletAfterRecalc?.liability ?? 0);
+            const totalUserRefund = Math.max(0, liabilityBefore - liabilityAfter);
+
+            this.logger.warn(
+              `[BULK CANCEL][LIABILITY_REFUND] user=${userId} cancelledBets=${userBets.length} ` +
+                `liabilityBefore=${liabilityBefore} liabilityAfter=${liabilityAfter} balanceRefund=${totalUserRefund} ` +
+                `(same delta as liability recalc log)`,
+            );
+
+            for (let i = 0; i < userBets.length; i++) {
+              const bet = userBets[i];
               cancelledBets.push({
                 betId: bet.id,
                 userId: bet.userId,
                 userName: bet.user.name || bet.user.username || 'Unknown',
-                refundAmount,
+                refundAmount: i === 0 ? totalUserRefund : 0,
               });
             }
 
-            // Update wallet: credit refund
+            // Update wallet: credit refund (exact net exposure released)
             if (totalUserRefund > 0) {
               await tx.wallet.update({
                 where: { userId },
@@ -4857,15 +5111,6 @@ export class SettlementService {
                 },
               });
             }
-
-            // ✅ RECALCULATE LIABILITY: After cancelling bets, recalculate liability properly
-            // This ensures Match Odds offset cancellation works correctly
-            // recalcLiability will:
-            // 1. Load all remaining PENDING bets (cancelled bets are excluded)
-            // 2. Calculate correct liability using proper exposure services
-            // 3. Update wallet.liability to the correct value
-            // This handles both offset and non-offset bets correctly
-            await this.recalcLiability(tx, userId);
 
             totalRefundAmount += totalUserRefund;
           }

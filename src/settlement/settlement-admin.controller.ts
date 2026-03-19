@@ -229,7 +229,7 @@ export class SettlementAdminController {
       MarketType.MATCH_ODDS,
       user.id,
       dto.betIds,
-      false, // deprecated endpoint does not support explicit cancel flag
+      dto.isCancel === true,
     );
   }
 
