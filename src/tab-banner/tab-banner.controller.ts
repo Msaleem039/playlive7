@@ -14,7 +14,7 @@ import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from '@prisma/client';
 
-@Controller('tab-banners')
+@Controller('admin/site/tab-banners')
 export class TabBannerController {
   constructor(private readonly service: TabBannerService) {}
 
@@ -34,10 +34,21 @@ export class TabBannerController {
    * Admin: upload / replace banner for **one** tab only (multipart file or imageUrl).
    * PATCH semantics: only the `:tab` row changes.
    */
+  @Post(':tab')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  async uploadDirect(@Param('tab') tab: string, @Req() request: FastifyRequest) {
+    return this.handleUpload(tab, request);
+  }
+
   @Post(':tab/upload')
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
   async upload(@Param('tab') tab: string, @Req() request: FastifyRequest) {
+    return this.handleUpload(tab, request);
+  }
+
+  private async handleUpload(tab: string, request: FastifyRequest) {
     if (!request.isMultipart()) {
       const body = request.body as { imageUrl?: string };
       if (body?.imageUrl?.trim()) {
