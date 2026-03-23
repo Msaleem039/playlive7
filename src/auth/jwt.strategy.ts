@@ -49,6 +49,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         throw new UnauthorizedException('Invalid token: user not found');
       }
 
+      if (!user.isActive) {
+        this.logger.warn(`JWT rejected: inactive user ${payload.sub}`);
+        throw new UnauthorizedException('Unauthorized');
+      }
+
       // Log successful validation in debug mode only
       if (process.env.NODE_ENV === 'development') {
         this.logger.debug(`JWT validated successfully for user: ${user.username} (${user.id})`);

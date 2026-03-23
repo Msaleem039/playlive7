@@ -16,6 +16,7 @@ import { BetsModule } from './bets/bets.module';
 import { ResultsModule } from './results/results.module';
 import { SettlementModule } from './settlement/settlement.module';
 import { SiteVideoModule } from './site-video/site-video.module';
+import { TabBannerModule } from './tab-banner/tab-banner.module';
 import { PositionModule } from './positions/position.module';
 import { ComplaintModule } from './complaint/complaint.module';
 import { NewsModule } from './news/news.module';
@@ -43,6 +44,7 @@ import { BackgroundProcessorModule } from './common/background/background-proces
     ResultsModule,
     SettlementModule,
     SiteVideoModule,
+    TabBannerModule,
     PositionModule,
     ComplaintModule,
     NewsModule,

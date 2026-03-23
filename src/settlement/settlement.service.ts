@@ -4819,18 +4819,39 @@ export class SettlementService {
   }
 
   /**
+   * Match Odds only: identifies bets that should be grouped when admin deletes one MO bet
+   * (same user + event + market).
+   */
+  private isMatchOddsBetForAdminDelete(bet: {
+    marketType?: string | null;
+    gtype?: string | null;
+  }): boolean {
+    const mtRaw = (bet.marketType || '').trim();
+    const mt = mtRaw.toUpperCase().replace(/\s+/g, '_');
+    if (mt === 'BOOKMAKER' || mt === 'TIED_MATCH') return false;
+    if (mt.includes('FANCY')) return false;
+    if (mt === 'MATCH_ODDS' || mt === 'MATCHODDS') return true;
+    const g = (bet.gtype || '').toLowerCase();
+    if (g === 'bookmaker' || g.includes('fancy')) return false;
+    return g === 'matchodds' || g === 'match';
+  }
+
+  /**
    * Delete a bet for a specific user (Admin only)
    * Releases liability and restores wallet state
    * Can delete by betId or settlementId
-   * 
+   *
+   * Match Odds: also deletes every other PENDING Match Odds bet for the same user, event, and
+   * market — same refund pattern as cancelBetsBulk (one recalcLiability + net liability delta to balance).
+   *
    * IMPORTANT: This method ONLY works for PENDING bets.
    * ASIAN CRICKET EXCHANGE RULE:
    * - Balance was deducted at bet placement (stake amount)
    * - Liability tracks net exposure across all bets
-   * - When bet is deleted, recalcLiability() will:
-   *   1. Recalculate net exposure (excluding deleted bet)
+   * - When bet(s) deleted, recalcLiability() will:
+   *   1. Recalculate net exposure (excluding deleted bets)
    *   2. Credit back the difference to balance
-   * 
+   *
    * This is safe because:
    * - Only PENDING bets can be deleted (enforced by status check)
    * - Settled bets should use rollbackSettlement instead
@@ -4868,69 +4889,123 @@ export class SettlementService {
       );
     }
 
+    /** All bets to hard-delete (single bet, or all MO siblings on same market/event/user). */
+    let betsToDelete: typeof bet[] = [bet];
+
+    if (
+      bet.eventId &&
+      bet.marketId &&
+      this.isMatchOddsBetForAdminDelete(bet)
+    ) {
+      const candidates = await this.prisma.bet.findMany({
+        where: {
+          userId: bet.userId,
+          eventId: bet.eventId,
+          marketId: bet.marketId,
+          status: BetStatus.PENDING,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+        },
+      });
+      const matchOddsPending = candidates.filter((b) =>
+        this.isMatchOddsBetForAdminDelete(b),
+      );
+      if (matchOddsPending.length > 0) {
+        betsToDelete = matchOddsPending;
+      }
+    }
+
+    for (const b of betsToDelete) {
+      if (b.status !== BetStatus.PENDING) {
+        throw new BadRequestException(
+          `Cannot delete bet with status ${b.status}. Only PENDING bets can be deleted.`,
+        );
+      }
+    }
+
+    const primaryBet = bet;
+    const userId = primaryBet.userId;
+
     // Get wallet
     const wallet = await this.prisma.wallet.findUnique({
-      where: { userId: bet.userId },
+      where: { userId },
     });
 
     if (!wallet) {
-      throw new BadRequestException(`Wallet not found for user ${bet.userId}`);
+      throw new BadRequestException(`Wallet not found for user ${userId}`);
     }
 
     const liabilityBefore = Number(wallet.liability ?? 0);
     let refundAmount = 0;
 
-    // ASIAN CRICKET EXCHANGE RULE:
-    // - recalcLiability() updates ONLY wallet.liability (never touches balance)
-    // - We credit wallet.balance only by the net liability delta for this specific delete
-    await this.prisma.$transaction(async (tx) => {
-      // Delete the bet first
-      await tx.bet.delete({
-        where: { id: bet.id },
-      });
+    // Same pattern as cancelBetsBulk: delete all → one recalcLiability → net liability delta → REFUND tx
+    await this.prisma.$transaction(
+      async (tx) => {
+        for (const b of betsToDelete) {
+          await tx.bet.delete({
+            where: { id: b.id },
+          });
+        }
 
-      // CRITICAL: Recalculate liability (bet deleted, so liability decreases)
-      await this.recalcLiability(tx, bet.userId);
+        await this.recalcLiability(tx, userId);
 
-      const walletAfter = await tx.wallet.findUnique({
-        where: { userId: bet.userId },
-        select: { balance: true, liability: true, id: true },
-      });
-
-      const liabilityAfter = Number(walletAfter?.liability ?? 0);
-      refundAmount = Math.max(0, liabilityBefore - liabilityAfter);
-
-      if (refundAmount > 0) {
-        // Credit balance by the net liability delta only.
-        await tx.wallet.update({
-          where: { userId: bet.userId },
-          data: { balance: { increment: refundAmount } },
+        const walletAfter = await tx.wallet.findUnique({
+          where: { userId },
+          select: { balance: true, liability: true, id: true },
         });
 
-        // Create refund transaction record (for audit trail)
-        await tx.transaction.create({
-          data: {
-            walletId: wallet.id,
-            amount: refundAmount,
-            type: TransactionType.REFUND,
-            description: `Bet deleted by admin (refund net exposure). Bet ID: ${bet.id}, Settlement ID: ${bet.settlementId || 'N/A'}, Bet Name: ${bet.betName || 'N/A'}`,
-          },
-        });
-      }
-    });
+        const liabilityAfter = Number(walletAfter?.liability ?? 0);
+        refundAmount = Math.max(0, liabilityBefore - liabilityAfter);
+
+        if (refundAmount > 0) {
+          await tx.wallet.update({
+            where: { userId },
+            data: { balance: { increment: refundAmount } },
+          });
+
+          const idsSnippet = betsToDelete.map((b) => b.id).join(', ');
+          await tx.transaction.create({
+            data: {
+              walletId: wallet.id,
+              amount: refundAmount,
+              type: TransactionType.REFUND,
+              description:
+                betsToDelete.length > 1
+                  ? `Admin delete Match Odds market (${betsToDelete.length} bet(s), refund net exposure). ` +
+                    `Bet IDs: ${idsSnippet}. Settlement ID: ${primaryBet.settlementId || 'N/A'}`
+                  : `Bet deleted by admin (refund net exposure). Bet ID: ${primaryBet.id}, Settlement ID: ${primaryBet.settlementId || 'N/A'}, Bet Name: ${primaryBet.betName || 'N/A'}`,
+            },
+          });
+        }
+      },
+      { maxWait: 15000, timeout: 30000 },
+    );
 
     this.logger.log(
-      `Bet ${bet.id} (settlementId: ${bet.settlementId || 'N/A'}) deleted by admin ${adminId}. Refunded net exposure=${refundAmount} based on liability delta for user ${bet.userId}`,
+      `deleteBet: ${betsToDelete.length} bet(s) for user ${userId} by admin ${adminId}. ` +
+        `Primary bet ${primaryBet.id}. Refunded net exposure=${refundAmount} (liability delta, same as cancelBetsBulk).`,
     );
 
     return {
       success: true,
-      message: 'Bet deleted successfully',
+      message:
+        betsToDelete.length > 1
+          ? `Deleted ${betsToDelete.length} Match Odds bet(s) (same user, event, market) and refunded net exposure`
+          : 'Bet deleted successfully',
       data: {
-        betId: bet.id,
-        settlementId: bet.settlementId,
-        userId: bet.userId,
-        userName: bet.user.name,
+        betId: primaryBet.id,
+        deletedBetIds: betsToDelete.map((b) => b.id),
+        deletedCount: betsToDelete.length,
+        settlementId: primaryBet.settlementId,
+        userId,
+        userName: primaryBet.user.name,
         refundAmount,
       },
     };

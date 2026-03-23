@@ -59,6 +59,11 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
+    if (!user.isActive) {
+      // Same message as wrong password — do not reveal account status
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
     // Generate JWT token with username included
     const payload = { sub: user.id, username: user.username, role: user.role };
     const accessToken = this.jwtService.sign(payload);

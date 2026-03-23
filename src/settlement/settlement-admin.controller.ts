@@ -492,12 +492,15 @@ export class SettlementAdminController {
   /**
    * Delete a bet for a specific user (Admin only)
    * DELETE /admin/settlement/bet/:betIdOrSettlementId
-   * 
+   *
    * This will:
-   * - Refund the user's wallet balance and release liability
+   * - Refund the user's wallet balance and release liability (same net-liability delta logic as POST /admin/settlement/cancel-bets / cancelBetsBulk)
    * - Create a refund transaction record
    * - Delete the bet (only if status is PENDING)
-   * 
+   *
+   * Match Odds: if the bet is Match Odds and has eventId + marketId, deletes **all** pending Match Odds
+   * bets for that same user + event + market in one go, with a single liability recalc and one refund total.
+   *
    * You can use either:
    * - Bet ID: DELETE /admin/settlement/bet/cmirm7k73000kv380tjra2djr
    * - Settlement ID: DELETE /admin/settlement/bet/705374333_690220
