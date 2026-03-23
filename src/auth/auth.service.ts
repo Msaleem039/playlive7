@@ -29,6 +29,7 @@ export class AuthService {
     // Try to find user by username first (case-insensitive), then by email
     let user = await this.prisma.user.findFirst({
       where: {
+        isActive: true,
         username: {
           equals: username,
           mode: 'insensitive', // Case-insensitive search
@@ -40,6 +41,7 @@ export class AuthService {
       // If not found by username, try email (case-insensitive)
       user = await this.prisma.user.findFirst({
         where: {
+          isActive: true,
           email: {
             equals: username,
             mode: 'insensitive', // Case-insensitive search
