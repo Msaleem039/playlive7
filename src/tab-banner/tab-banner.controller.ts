@@ -18,7 +18,7 @@ import { UserRole } from '@prisma/client';
 export class TabBannerController {
   constructor(private readonly service: TabBannerService) {}
 
-  /** Public: all tab banners (cricket / soccer / tennis). Null if not set. */
+  
   @Get()
   async getAll() {
     return this.service.getAllBanners();
