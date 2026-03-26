@@ -323,9 +323,13 @@ export class SettlementService {
 
           const perBet = this.fancyExposureService.getPerBetPnLForOutcome(userBets, actualRuns);
           const totalPnl = perBet.reduce((sum, { pnl }) => sum + pnl, 0);
-          const useExposureCredit =
+          const hasRefundPairs = refundPairBetIds.size > 0;
+          const hasExposure =
             exposure != null &&
             exposure.remainingExposure > 0;
+          const useExposureCredit =
+            hasExposure &&
+            hasRefundPairs;
           // Range/Gola rule requested: if this is a range/gola exposure and net result is LOSS,
           // do not credit anything to balance (credit should be 0 on loss).
           const isRangeOrGola = exposure != null && exposure.remainingExposure > 0;
@@ -370,7 +374,7 @@ export class SettlementService {
             liabilityDelta -= liabilityAmount;
 
             if (betWins) {
-              if (useExposureCredit && !appliedExposureCredit) {
+              if (useExposureCredit && alreadyRefunded && !appliedExposureCredit) {
                 // Gola / range fancy: remaining_exposure is the effective stake, totalPnl is the net profit.
                 const effectiveStake = exposure!.remainingExposure;
                 const profit = totalPnl;
@@ -404,11 +408,18 @@ export class SettlementService {
                     2,
                   ),
                 );
-              } else if (!useExposureCredit) {
-                // BUG 1 FIX: Always treat pnl as profit; credit = stake + profit for normal bets,
-                // and profit only for already-refunded (hedged) bets.
+              } else {
+                // In exposure mode, refunded bets are credited only once via exposure credit.
+                // All other bets are settled individually.
                 const profit = pnl;
-                const credit = isRangeOrGola ? 0 : alreadyRefunded ? profit : stake + profit;
+                const credit =
+                  useExposureCredit && alreadyRefunded
+                    ? 0
+                    : !hasExposure && hasRefundPairs && totalPnl <= 0 && alreadyRefunded
+                      ? 0
+                    : alreadyRefunded
+                      ? profit
+                      : stake + profit;
                 balanceDelta += credit;
                 console.log(
                   '[FANCY_DEBUG]',
