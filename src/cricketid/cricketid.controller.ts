@@ -25,34 +25,47 @@ export class CricketIdController {
    * ✅ MULTI-SPORT: Soccer (1), Tennis (2), Cricket (4). Example Tennis: sportId=2
    */
   @Get('series')
-  getSeriesList(@Query('sportId') sportId?: number) {
-    const normalizedSportId = sportId !== undefined && sportId !== null ? Number(sportId) : 4;
+  getSeriesList(@Query() query: Record<string, string | number | undefined>) {
+    const rawSportId = query?.sportId ?? query?.sportid;
+    const normalizedSportId =
+      rawSportId !== undefined && rawSportId !== null ? Number(rawSportId) : 4;
     return this.cricketIdService.getSeriesList(normalizedSportId);
   }
 
+  @Get('series/:sportId')
+  getSeriesListByParam(@Param('sportId') sportId: string) {
+    return this.cricketIdService.getSeriesList(sportId);
+  }
+
   /**
-   * Get all matches for a competition (vendor: v3/matchList).
-   * GET /cricketid/matches?sportId=2&competitionId=12674623
-   * Or: GET /cricketid/matches?sportId=2&competition=12674623
-   * Returns array of matches with eventId for use with /markets and /bookmaker-fancy.
-   * ✅ MULTI-SPORT: Soccer (1), Tennis (2), Cricket (4)
+   * Get match detail by marketId or eventId.
+   * GET /cricketid/match-detail?marketId=1.255542873
+   * GET /cricketid/match-detail?marketId=35414637  (eventId passed in marketId field)
+   * GET /cricketid/match-detail?eventId=35402112
    */
-  @Get('matches')
-  getMatchDetails(
-    @Query('competitionId') competitionId?: string | number,
-    @Query('competition') competition?: string | number,
-    @Query('sportId') sportId?: number,
+  @Get('match-detail')
+  async getMatchDetailByEventId(
+    @Query() query: Record<string, string | number | undefined>,
   ) {
-    const compId = competitionId ?? competition;
-    if (compId === undefined || compId === null || String(compId).trim() === '') {
+    const marketId = query?.marketId ?? query?.marketid;
+    const eventId = query?.eventId ?? query?.eventid;
+    if (marketId) {
+      return this.cricketIdService.getMatchDetailByMarketId(String(marketId));
+    }
+    if (!eventId) {
       throw new BadRequestException({
         statusCode: HttpStatus.BAD_REQUEST,
-        message: 'competitionId or competition query parameter is required',
+        message: 'marketId or eventId query parameter is required',
         error: 'Bad Request',
       });
     }
-    const normalizedSportId = sportId !== undefined && sportId !== null ? Number(sportId) : 4;
-    return this.cricketIdService.getMatchDetails(compId, normalizedSportId);
+    return this.cricketIdService.getMatchDetails(String(eventId));
+  }
+
+  // Backward-compatible alias (some clients call /cricketid/matches?eventId=...)
+  @Get('matches')
+  async getMatchDetailAlias(@Query() query: Record<string, string | number | undefined>) {
+    return this.getMatchDetailByEventId(query);
   }
 
   /**
@@ -63,7 +76,8 @@ export class CricketIdController {
    * @param eventId - Event ID from the match list (e.g., "34917574")
    */
   @Get('markets')
-  async getMarketList(@Query('eventId') eventId: string | number) {
+  async getMarketList(@Query() query: Record<string, string | number | undefined>) {
+    const eventId = query?.eventId ?? query?.eventid;
     if (!eventId) {
       throw new HttpException(
         {
@@ -105,7 +119,8 @@ export class CricketIdController {
    * @param eventId - Event ID (e.g., "34917574")
    */
   @Get('bookmaker-fancy')
-  async getBookmakerFancy(@Query('eventId') eventId: string | number) {
+  async getBookmakerFancy(@Query() query: Record<string, string | number | undefined>) {
+    const eventId = query?.eventId ?? query?.eventid;
     if (!eventId) {
       throw new HttpException(
         {
@@ -126,6 +141,26 @@ export class CricketIdController {
       }
       throw error;
     }
+  }
+
+  /**
+   * Fancy (Diamond) vendor API
+   * GET /cricketid/fancy?eventId=35401953
+   */
+  @Get('fancy')
+  async getDiamondFancy(@Query() query: Record<string, string | number | undefined>) {
+    const eventId = query?.eventId ?? query?.eventid;
+    if (!eventId) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'eventId query parameter is required',
+          error: 'Bad Request',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    return this.cricketIdService.getDiamondFancy(eventId);
   }
 
   /**
@@ -154,6 +189,28 @@ export class CricketIdController {
     const normalizedLimit = limit !== undefined && limit !== null ? Number(limit) : 10;
 
     return this.cricketIdService.getTopMatchesBySport(normalizedSportId, normalizedLimit);
+  }
+
+  /**
+   * Direct vendor sport-wise matches (no aggregation via series/competition loops).
+   * GET /cricketid/events-by-sport?sportId=4
+   * GET /cricketid/events-by-sport/4
+   */
+  @Get('events-by-sport')
+  async getEventsBySport(@Query('sportId') sportId?: string | number) {
+    if (sportId === undefined || sportId === null || String(sportId).trim() === '') {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'sportId query parameter is required',
+        error: 'Bad Request',
+      });
+    }
+    return this.cricketIdService.getEventsBySportId(sportId);
+  }
+
+  @Get('events-by-sport/:sportId')
+  async getEventsBySportParam(@Param('sportId') sportId: string) {
+    return this.cricketIdService.getEventsBySportId(sportId);
   }
 
   /**

@@ -9,7 +9,7 @@ import { CricketIdService } from './cricketid.service';
 @Injectable()
 export class AggregatorService {
   private readonly logger = new Logger(AggregatorService.name);
-  private readonly baseUrl = 'https://72.61.140.55';
+  private readonly baseUrl = 'https://fancy.fancyres.in';
   private cache = new Map<string, { data: any; expiresAt: number }>();
   private activeMatches = new Map<string, { eventId: string; marketIds: string; lastAccessed: number }>();
 
@@ -101,13 +101,13 @@ export class AggregatorService {
       
       // Force refresh by directly fetching and updating cache
       const [fancyResult, oddsResult] = await Promise.allSettled([
-        this.fetch('/v3/bookmakerFancy', { eventId })
+        this.cricketIdService.getBookmakerFancy(eventId)
           .then((data) => {
             // Update cache directly
             this.cache.set(`fancy:${eventId}`, { data, expiresAt: now + 2_000 });
             return data;
           }),
-        this.fetch('/v3/betfairOdds', { marketIds })
+        this.cricketIdService.getBetfairOdds(marketIds)
           .then((data) => {
             // Update cache directly
             this.cache.set(`odds:${marketIds}`, { data, expiresAt: now + 1_500 });
@@ -376,10 +376,10 @@ export class AggregatorService {
       return cached;
     }
 
-    // Cache miss - fetch from vendor API (original logic unchanged)
-    this.logger.debug(`Redis cache MISS for match-detail: ${eventId} - fetching from vendor API`);
+    // Cache miss - fetch from CricketIdService (marketId/eventId normalized flow)
+    this.logger.debug(`Redis cache MISS for match-detail: ${eventId} - fetching from CricketIdService`);
     try {
-      const response = await this.fetch('/cricketid/markets', { eventId });
+      const response = await this.cricketIdService.getMatchDetails(eventId);
       
       // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
       try {
@@ -415,7 +415,7 @@ export class AggregatorService {
       `fancy:${eventId}`,
       2_000, // cache 2 seconds
       async () => {
-        return this.fetch('/v3/bookmakerFancy', { eventId });
+        return this.cricketIdService.getBookmakerFancy(eventId);
       },
     );
   }
@@ -428,7 +428,7 @@ export class AggregatorService {
       `odds:${marketIds}`,
       1_500, // cache 1.5 seconds
       async () => {
-        return this.fetch('/v3/betfairOdds', { marketIds });
+        return this.cricketIdService.getBetfairOdds(marketIds);
       },
     );
   }

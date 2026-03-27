@@ -5,7 +5,7 @@ import { GetResultDto } from './get-result.dto';
 
 @Injectable()
 export class ResultsService {
-  private readonly baseUrl = 'https://api.cricketid.xyz';
+  private readonly baseUrl = 'https://fancy.fancyres.in';
   private readonly apiKey = process.env.CRICKET_ID_API_KEY ?? 'dijbfuwd719e12rqhfbjdqdnkqnd11';
   private readonly apiSid = process.env.CRICKET_ID_API_SID ?? '4';
 

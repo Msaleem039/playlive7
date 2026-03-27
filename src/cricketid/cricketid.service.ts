@@ -13,10 +13,30 @@ export class CricketIdService {
   // ✅ MULTI-SPORT: Supported sport IDs
   // 1 = Soccer, 2 = Tennis, 4 = Cricket
   private readonly DEFAULT_SPORT_ID = 4; // Cricket (backward compatibility)
-  private readonly baseUrl = 'https://vendorapi.tresting.com';
+  // private readonly baseUrl = 'https://vendorapi.tresting.com';
+  private readonly baseUrl = "https://listing.fancyres.in/horsedata"
   private readonly maxRetries = 3;
   private readonly retryDelay = 1000; // Initial delay in ms
   private readonly timeout = 30000; // 30 seconds timeout
+  private readonly fancyBaseUrl = 'https://fancy.fancyres.in';
+
+  private normalizeSportId(
+    sportId?: string | number | null,
+    fallback: number = this.DEFAULT_SPORT_ID,
+  ): number {
+    if (sportId === undefined || sportId === null || String(sportId).trim() === '') {
+      return fallback;
+    }
+    const parsed = Number(sportId);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'sportId must be a positive number',
+        error: 'Bad Request',
+      });
+    }
+    return parsed;
+  }
 
   /**
    * Redis TTLs (in seconds) – betting-platform data refresh model.
@@ -253,6 +273,72 @@ export class CricketIdService {
     throw lastError;
   }
 
+  private async fetchFancy<T>(path: string, params: Record<string, any> = {}): Promise<T> {
+    const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+    const url = `${this.fancyBaseUrl}${normalizedPath}`;
+    const requestConfig: any = {
+      timeout: this.timeout,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'PlayLive-API/1.0',
+      },
+      httpAgent: new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: this.timeout,
+      }),
+      httpsAgent: new https.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 1000,
+        maxSockets: 50,
+        maxFreeSockets: 10,
+        timeout: this.timeout,
+      }),
+      params,
+    };
+
+    try {
+      const { data } = await firstValueFrom(this.http.get<any>(url, requestConfig));
+      // Some vendor responses come as JSON string (content-type not application/json).
+      if (typeof data === 'string') {
+        try {
+          return JSON.parse(data) as T;
+        } catch {
+          // return raw string if parsing fails
+          return data as unknown as T;
+        }
+      }
+      return data as T;
+    } catch (error) {
+      // Keep same shape as fetch(): wrap axios errors into HttpException
+      if (error instanceof AxiosError) {
+        const status = error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR;
+        const responseData = error.response?.data;
+        throw new HttpException(
+          {
+            statusCode: status,
+            message:
+              responseData?.message ||
+              responseData?.error ||
+              error.message ||
+              'Failed to fetch fancy data from vendor API',
+            error: 'Vendor API Error',
+            details: {
+              ...(responseData || {}),
+              code: error.code,
+              url,
+              params,
+            },
+          },
+          status,
+        );
+      }
+      throw error;
+    }
+  }
+
   /**
    * Get all sports/events
    * Endpoint: /v3/eventList
@@ -296,9 +382,10 @@ export class CricketIdService {
    * ✅ MULTI-SPORT: Supports Soccer (1), Tennis (2), Cricket (4)
    * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
-  async getSeriesList(sportId: number = this.DEFAULT_SPORT_ID) {
+  async getSeriesList(sportId: string | number = this.DEFAULT_SPORT_ID) {
+    const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
     // Build URL manually so vendor gets exact format (same pattern as matchList)
-    const url = `/v3/seriesList?sportId=${sportId}`;
+    const url = `/v3/seriesList?sportId=${sid}`;
     const raw = await this.fetch(url);
     // Vendor may return a raw array of { competition, competitionRegion, marketCount }; return as-is
     return this.normalizeToArray(raw, ['data', 'series', 'competitions', 'list', 'result', 'items']);
@@ -312,47 +399,188 @@ export class CricketIdService {
    * @param competitionId - Competition ID from the series list (e.g. "12597512")
    * @param sportId - Sport ID (1=Soccer, 2=Tennis, 4=Cricket, default: 4)
    */
-  async getMatchDetails(competitionId: string | number, sportId: number = this.DEFAULT_SPORT_ID) {
-    const comp = String(competitionId);
-    let raw: unknown;
-    try {
-      // Vendor API expects non-standard format: ?sportId=X?competition=Y (not &)
-      const url = `/v3/matchList?sportId=${sportId}?competition=${comp}`;
-      raw = await this.fetch(url);
-    } catch (error: any) {
-      const status = error?.response?.status ?? error?.statusCode ?? error?.getStatus?.();
-      if (status === 400) {
-        this.logger.debug(
-          `Vendor returned 400 for matchList (sportId=${sportId}, competitionId=${comp}); returning empty list`,
-        );
-        return [];
-      }
-      throw error;
-    }
-    const matches = this.normalizeToArray<any>(raw, ['data', 'matches', 'events', 'eventList']);
-    const now = new Date();
-    // Deduplicate by eventId (vendor can return same match more than once in one response)
-    const seenEventIds = new Set<string>();
-    const uniqueMatches = matches.filter((match) => {
-      const eventId = match?.event?.id ?? match?.eventId;
-      const id = eventId != null ? String(eventId).trim() : '';
-      if (!id || seenEventIds.has(id)) return false;
-      seenEventIds.add(id);
-      return true;
-    });
-    return uniqueMatches.map((match) => {
-      const eventId = match?.event?.id ?? match?.eventId;
-      const openDate = match?.event?.openDate;
-      const hasStarted = openDate ? new Date(openDate) <= now : false;
-      return {
-        ...match,
-        ...(eventId != null && String(eventId).trim() !== '' ? { eventId: String(eventId) } : {}),
-        live: hasStarted,
-        upcoming: openDate ? !hasStarted : false,
-      };
-    });
+  // async getMatchDetails(
+  //   competitionId: string | number,
+  //   sportId: string | number = this.DEFAULT_SPORT_ID,
+  // ) {
+  //   const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
+  //   const comp = String(competitionId);
+  //   let raw: unknown;
+  //   try {
+  //     // Vendor API expects non-standard format: ?sportId=X?competition=Y (not &)
+  //     const url = `/v3/matchList?sportId=${sid}?competition=${comp}`;
+  //     raw = await this.fetch(url);
+  //   } catch (error: any) {
+  //     const status = error?.response?.status ?? error?.statusCode ?? error?.getStatus?.();
+  //     if (status === 400) {
+  //       this.logger.debug(
+  //         `Vendor returned 400 for matchList (sportId=${sid}, competitionId=${comp}); returning empty list`,
+  //       );
+  //       return [];
+  //     }
+  //     throw error;
+  //   }
+  //   const matches = this.normalizeToArray<any>(raw, ['data', 'matches', 'events', 'eventList']);
+  //   const now = new Date();
+  //   // Deduplicate by eventId (vendor can return same match more than once in one response)
+  //   const seenEventIds = new Set<string>();
+  //   const uniqueMatches = matches.filter((match) => {
+  //     const eventId = match?.event?.id ?? match?.eventId;
+  //     const id = eventId != null ? String(eventId).trim() : '';
+  //     if (!id || seenEventIds.has(id)) return false;
+  //     seenEventIds.add(id);
+  //     return true;
+  //   });
+  //   return uniqueMatches.map((match) => {
+  //     const eventId = match?.event?.id ?? match?.eventId;
+  //     const openDate = match?.event?.openDate;
+  //     const hasStarted = openDate ? new Date(openDate) <= now : false;
+  //     return {
+  //       ...match,
+  //       ...(eventId != null && String(eventId).trim() !== '' ? { eventId: String(eventId) } : {}),
+  //       live: hasStarted,
+  //       upcoming: openDate ? !hasStarted : false,
+  //     };
+  //   });
+  // }
+  async getMatchDetails(
+    eventId: string,
+    sportId: string | number = this.DEFAULT_SPORT_ID,
+  ) {
+    const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
+    const eid = String(eventId);
+
+    // Source of truth: listeventsbysport feed (same data you show in frontend list)
+    const match: any = await this.getEventDetailFromSportFeed(eid, sid);
+    if (!match) return null;
+    // Keep response format consistent with marketId flow (normalized array).
+    const marketId = String(match?.MarketId ?? match?.marketId ?? '').trim();
+    if (!marketId) return [];
+    return this.getMatchDetailByMarketId(marketId);
   }
 
+  /**
+   * Lookup a single event from the same live/upcoming list used by events-by-sport.
+   */
+  async getEventDetailFromSportFeed(
+    eventId: string | number,
+    sportId: string | number = this.DEFAULT_SPORT_ID,
+  ) {
+    const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
+    const eid = String(eventId);
+    const grouped: any = await this.getEventsBySportId(sid);
+    const all = [
+      ...(Array.isArray(grouped?.live) ? grouped.live : []),
+      ...(Array.isArray(grouped?.upcoming) ? grouped.upcoming : []),
+    ];
+    return all.find((m: any) => String(m?.EventId ?? m?.eventId ?? '').trim() === eid) ?? null;
+  }
+
+  /**
+   * Match detail from vendor market-id endpoint:
+   * https://listing.fancyres.in/horsedata/{marketId}
+   *
+   * Supports both:
+   * - true marketId (e.g. 1.255542873)
+   * - eventId passed in marketId field (we resolve to current Match Odds marketId from list feed)
+   */
+  async getMatchDetailByMarketId(
+    marketIdOrEventId: string | number,
+  ) {
+    const sid = this.DEFAULT_SPORT_ID;
+    const rawInput = String(marketIdOrEventId).trim();
+    if (!rawInput) {
+      throw new BadRequestException({
+        statusCode: HttpStatus.BAD_REQUEST,
+        message: 'marketId is required',
+        error: 'Bad Request',
+      });
+    }
+
+    // If caller sends eventId in marketId query, resolve to marketId from list feed.
+    let resolvedMarketId = rawInput;
+    let feedMatch: any = null;
+    if (!rawInput.includes('.')) {
+      const eid = rawInput;
+      const grouped: any = await this.getEventsBySportId(sid);
+      const all = [
+        ...(Array.isArray(grouped?.live) ? grouped.live : []),
+        ...(Array.isArray(grouped?.upcoming) ? grouped.upcoming : []),
+      ];
+      feedMatch =
+        all.find((m: any) => String(m?.EventId ?? m?.eventId ?? '').trim() === eid) ?? null;
+      if (!feedMatch) {
+        return [];
+      }
+      resolvedMarketId = String(feedMatch?.MarketId ?? feedMatch?.marketId ?? '').trim();
+      if (!resolvedMarketId) {
+        return [];
+      }
+    } else {
+      const grouped: any = await this.getEventsBySportId(sid);
+      const all = [
+        ...(Array.isArray(grouped?.live) ? grouped.live : []),
+        ...(Array.isArray(grouped?.upcoming) ? grouped.upcoming : []),
+      ];
+      feedMatch =
+        all.find((m: any) => String(m?.MarketId ?? m?.marketId ?? '').trim() === resolvedMarketId) ??
+        null;
+    }
+
+    const vendor = await this.fetch<any>(`/${resolvedMarketId}`);
+    const eventTypeNode = Array.isArray(vendor?.eventTypes) ? vendor.eventTypes[0] : null;
+    const eventNode = Array.isArray(eventTypeNode?.eventNodes) ? eventTypeNode.eventNodes[0] : null;
+    const marketNodes = Array.isArray(eventNode?.marketNodes) ? eventNode.marketNodes : [];
+
+    const eventId = String(feedMatch?.EventId ?? feedMatch?.eventId ?? eventNode?.eventId ?? '');
+    const eventName = feedMatch?.Event ?? feedMatch?.event ?? null;
+    const competitionId = String(feedMatch?.CompetitionId ?? feedMatch?.competitionId ?? '');
+    const competitionName = feedMatch?.Competition ?? feedMatch?.competition ?? null;
+    const startTime = feedMatch?.StartTime ?? feedMatch?.startTime ?? null;
+    const sportsId = String(feedMatch?.SportsId ?? feedMatch?.sportsId ?? eventTypeNode?.eventTypeId ?? '');
+    const sportsName = feedMatch?.Sports ?? feedMatch?.sports ?? null;
+
+    const normalized = marketNodes.map((m: any) => {
+      const runners = Array.isArray(m?.runners)
+        ? m.runners.map((r: any) => ({
+            selectionId: r?.selectionId,
+            runnerName: r?.description?.runnerName ?? null,
+            handicap: Number(r?.handicap ?? 0),
+            sortPriority: Number(r?.state?.sortPriority ?? 0),
+          }))
+        : [];
+
+      const totalMatched = Array.isArray(m?.runners)
+        ? m.runners.reduce((sum: number, r: any) => sum + Number(r?.state?.totalMatched ?? 0), 0)
+        : 0;
+
+      return {
+        marketId: String(m?.marketId ?? resolvedMarketId),
+        competition: {
+          id: competitionId || null,
+          name: competitionName || null,
+          provider: 'BETFAIR',
+        },
+        event: {
+          id: eventId || null,
+          name: eventName || null,
+          countryCode: vendor?.currencyCode || 'GB',
+          timezone: 'GMT',
+          openDate: startTime || null,
+        },
+        eventType: {
+          id: sportsId || String(eventTypeNode?.eventTypeId ?? ''),
+          name: sportsName || (sportsId === '4' ? 'Cricket' : null),
+        },
+        marketName: feedMatch?.Market ?? feedMatch?.market ?? 'Match Odds',
+        runners,
+        totalMatched,
+        marketStartTime: startTime || null,
+      };
+    });
+
+    return normalized;
+  }
   /**
    * Validate that the sportId is supported for VendorService (Soccer/Tennis only).
    * Allowed sportIds:
@@ -519,6 +747,107 @@ export class CricketIdService {
   }
 
   /**
+   * Direct match list by sport (no aggregation loops).
+   * Vendor endpoint: /listeventsbysport?sportId={sportId}
+   *
+   * This is useful when vendor already provides sport-wise events directly.
+   * Supported sport ids are vendor-defined (commonly 1=soccer, 2=tennis, 4=cricket).
+   */
+  async getEventsBySportId(sportId: string | number) {
+    const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
+
+    // v3 cache key: grouped response { total, live, upcoming }.
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v3', String(sid));
+    const cached = await this.redisService.get<any>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
+      return cached;
+    }
+
+    this.logger.debug(`Redis cache MISS for events-by-sport: sportId=${sid} - fetching vendor API`);
+
+    // Vendor supports path style: /listeventsbysport/4
+    // Query style (?sportId=4) may return empty; keep fallback only.
+    let raw = await this.fetch(`/listeventsbysport/${sid}`);
+    let events = this.normalizeToArray<any>(raw, [
+      'data',
+      'matches',
+      'events',
+      'eventList',
+      'result',
+      'items',
+    ]);
+    if (!events.length) {
+      const fallbackRaw = await this.fetch(`/listeventsbysport?sportId=${sid}`);
+      events = this.normalizeToArray<any>(fallbackRaw, [
+        'data',
+        'matches',
+        'events',
+        'eventList',
+        'result',
+        'items',
+      ]);
+      raw = fallbackRaw;
+    }
+
+    const now = new Date();
+    const transformed = events.map((item) => {
+      const eventId = item?.event?.id ?? item?.eventId ?? item?.id;
+      const openDate =
+        item?.event?.openDate ??
+        item?.openDate ??
+        item?.startTime ??
+        item?.StartTime;
+      const hasStarted = openDate ? new Date(openDate) <= now : false;
+      return {
+        ...item,
+        ...(eventId != null && String(eventId).trim() !== '' ? { eventId: String(eventId) } : {}),
+        live: hasStarted,
+        upcoming: openDate ? !hasStarted : false,
+      };
+    });
+
+    // Deduplicate by eventId to avoid multiple markets of the same event in list endpoints.
+    const seen = new Set<string>();
+    const uniqueMatches = transformed.filter((m) => {
+      const id = String(m?.eventId ?? m?.EventId ?? '').trim();
+      if (!id) return false;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+
+    // Match aggregator shape: only live/upcoming buckets.
+    const live = uniqueMatches.filter((m) => m.live === true);
+    const upcoming = uniqueMatches.filter((m) => m.upcoming === true);
+    const response = {
+      total: live.length + upcoming.length,
+      live,
+      upcoming,
+    };
+
+    try {
+      // Similar profile as match-detail cache.
+      await this.redisService.set(
+        cacheKey,
+        response,
+        this.REDIS_TTL.VENDOR_MATCH_DETAIL,
+      );
+      this.logger.debug(
+        `Redis cache SET for events-by-sport: sportId=${sid} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to set Redis cache for events-by-sport sportId=${sid}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    return response;
+  }
+
+  /**
    * Get market list (odds/markets) for a specific event/match
    * Endpoint: /v3/marketList?eventId={eventId}
    * Returns markets with runners, odds, selectionId, etc.
@@ -571,17 +900,57 @@ export class CricketIdService {
    */
   async getBetfairOdds(marketIds: string) {
     // ✅ PERFORMANCE: Try Redis cache first
-    // Use consistent key format with getVendorKey()
-    const cacheKey = this.redisService.getVendorKey('odds', marketIds);
+    const cacheKey = this.redisService.getVendorKey('odds-v2', marketIds);
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for odds: ${marketIds}`);
       return cached;
     }
 
-    // Cache miss - fetch from vendor API (original logic unchanged)
-    this.logger.debug(`Redis cache MISS for odds: ${marketIds} - fetching from vendor API`);
-    const response = await this.fetch('/v3/betfairOdds', { marketIds });
+    // Cache miss - fetch from fair-demo API (old vendor removed)
+    this.logger.debug(`Redis cache MISS for odds: ${marketIds} - fetching from fair-demo API`);
+    const ids = Array.from(
+      new Set(
+        String(marketIds)
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+      ),
+    );
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const chunks = await Promise.all(
+      ids.map(async (id) => {
+        const url = `https://api.fancyres.in/api/fair/demo/${encodeURIComponent(id)}`;
+        const { data } = await firstValueFrom(
+          this.http.get<any>(url, {
+            timeout: this.timeout,
+            headers: {
+              Accept: 'application/json',
+              'User-Agent': 'PlayLive-API/1.0',
+            },
+            httpAgent: new http.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+            httpsAgent: new https.Agent({
+              keepAlive: true,
+              keepAliveMsecs: 1000,
+              maxSockets: 50,
+              maxFreeSockets: 10,
+              timeout: this.timeout,
+            }),
+          }),
+        );
+        return Array.isArray(data) ? data : [data];
+      }),
+    );
+    const response = chunks.flat().filter(Boolean);
     
     // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
     try {
@@ -615,7 +984,8 @@ export class CricketIdService {
    */
   async getBookmakerFancy(eventId: string | number) {
     // ✅ PERFORMANCE: Try Redis cache first
-    const cacheKey = this.redisService.getVendorKey('bookmaker-fancy', String(eventId));
+    // v2 key: switched to diamond vendor (avoid stale cache from v3/bookmakerFancy)
+    const cacheKey = this.redisService.getVendorKey('bookmaker-fancy-v3', String(eventId));
     const cached = await this.redisService.get<{
       success: boolean;
       msg: string;
@@ -632,9 +1002,24 @@ export class CricketIdService {
       return cached;
     }
 
-    // Cache miss - fetch from vendor API (original logic unchanged)
-    this.logger.debug(`Redis cache MISS for bookmaker-fancy: ${eventId} - fetching from vendor API`);
-    const response = await this.fetch<{
+    // Cache miss - fetch from diamond vendor (DO NOT use listing.fancyres.in/v3/bookmakerFancy)
+    this.logger.debug(`Redis cache MISS for bookmaker-fancy: ${eventId} - fetching from DIAMOND vendor API`);
+
+    // Fetch diamond data inline (avoid chaining through getDiamondFancy())
+    const eid = String(eventId);
+    const rawPrimary = await this.fetchFancy<any>('/getdiamondapi', { eventid: eid });
+    let diamondData = Array.isArray(rawPrimary)
+      ? rawPrimary
+      : this.normalizeToArray(rawPrimary, ['data', 'result', 'items']);
+    if (!diamondData.length) {
+      const rawFallback = await this.fetchFancy<any>('/getdiamondapi', { eventId: eid });
+      diamondData = Array.isArray(rawFallback)
+        ? rawFallback
+        : this.normalizeToArray(rawFallback, ['data', 'result', 'items']);
+    }
+
+    // Normalize diamond response into the existing bookmaker-fancy shape
+    const response: {
       success: boolean;
       msg: string;
       status: number;
@@ -643,7 +1028,12 @@ export class CricketIdService {
         gtype: string;
         [key: string]: any;
       }>;
-    }>('/v3/bookmakerFancy', { eventId });
+    } = {
+      success: true,
+      msg: 'diamond-fancy',
+      status: 200,
+      data: diamondData,
+    };
 
     // Sort the data array according to the required sequence
     // Note: MATCH_ODDS will be sorted but filtered out later
@@ -688,39 +1078,44 @@ export class CricketIdService {
         return snoA - snoB;
       });
 
-      // Filter to ONLY include these exact market names (all others are skipped):
+      // Filter to ONLY include these market names (vendor varies):
+      // - "MATCH_ODDS"
       // - "Normal"
-      // - "Bookmaker"
-      // - "TIED_MATCH"
-      // Excludes: 
-      // - MATCH_ODDS markets
+      // - "Bookmaker" / "Bookmaker 2" / anything containing "BOOKMAKER"
+      // - "Tied Match" / "TIED_MATCH" / anything containing "TIED"
+      // Excludes:
       // - Sections containing "bhav" in their nat field (case-insensitive)
       response.data = response.data.filter((market) => {
         const mname = market.mname?.toUpperCase() || '';
         const originalMname = market.mname || '';
 
-        // Skip MATCH_ODDS
-        if (mname === 'MATCH_ODDS') {
-          return false;
-        }
+        // // Skip MATCH_ODDS
+        // if (mname === 'MATCH_ODDS') {
+        //   return false;
+        // }
 
         // Skip markets containing "bhav" (case-insensitive)
         if (originalMname.toLowerCase().includes('bhav')) {
           return false;
         }
 
-        // 1. Bookmaker (exact match, case-sensitive)
-        if (originalMname === 'Bookmaker') {
+        // Include Match Odds
+        if (mname === 'MATCH_ODDS') {
           return true;
         }
 
-        // 2. TIED_MATCH (case-insensitive)
-        if (mname === 'TIED_MATCH') {
+        // 1. Bookmaker (Diamond uses Bookmaker, Bookmaker 2, and sometimes other bookmaker labels)
+        if (mname.includes('BOOKMAKER')) {
           return true;
         }
 
-        // 3. Normal (exact match, case-sensitive)
-        if (originalMname === 'Normal') {
+        // 2. Tied Match (vendor may use "Tied Match" or "TIED_MATCH")
+        if (mname.includes('TIED')) {
+          return true;
+        }
+
+        // 3. Normal
+        if (mname === 'NORMAL') {
           return true;
         }
 
@@ -759,6 +1154,57 @@ export class CricketIdService {
   }
 
   /**
+   * Fancy (Diamond) vendor API
+   * Vendor: https://fancy.fancyres.in/getdiamondapi?eventId={eventId}
+   *
+   * ✅ PERFORMANCE: Redis cached (short TTL).
+   */
+  async getDiamondFancy(eventId: string | number) {
+    const eid = String(eventId);
+    const cacheKey = this.redisService.getVendorKey('diamond-fancy-v2', eid);
+    const cached = await this.redisService.get<any>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for diamond-fancy: ${eid}`);
+      return cached;
+    }
+
+    this.logger.debug(`Redis cache MISS for diamond-fancy: ${eid} - fetching from vendor API`);
+
+    // Vendor parameter key is `eventid` (lowercase) in many deployments.
+    // Try `eventid` first; fallback to `eventId` for compatibility.
+    const rawPrimary = await this.fetchFancy<any>('/getdiamondapi', { eventid: eid });
+    let data = Array.isArray(rawPrimary)
+      ? rawPrimary
+      : this.normalizeToArray(rawPrimary, ['data', 'result', 'items']);
+    if (!data.length) {
+      const rawFallback = await this.fetchFancy<any>('/getdiamondapi', { eventId: eid });
+      data = Array.isArray(rawFallback)
+        ? rawFallback
+        : this.normalizeToArray(rawFallback, ['data', 'result', 'items']);
+    }
+
+    const response = {
+      success: true,
+      eventId: eid,
+      count: data.length,
+      data,
+    };
+
+    try {
+      await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_FANCY);
+      this.logger.debug(
+        `Redis cache SET for diamond-fancy: ${eid} (TTL: ${this.REDIS_TTL.VENDOR_FANCY}s)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to set Redis cache for diamond-fancy ${eid}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    return response;
+  }
+
+  /**
    * Get live score by eventId from cache.tresting.com
    * Endpoint: https://cache.tresting.com/v2/api/getScoreByEventIdNew?eventId={eventId}
    *
@@ -767,9 +1213,7 @@ export class CricketIdService {
    */
   async getScoreByEventId(eventId: string | number) {
     const id = String(eventId);
-    const url = `https://cache.tresting.com/v2/api/getScoreByEventIdNew?eventId=${encodeURIComponent(
-      id,
-    )}`;
+    const url = `https://score.fancyres.in/api/MatchOdds/score/${encodeURIComponent(id)}`;
 
     try {
       const { data } = await firstValueFrom(
