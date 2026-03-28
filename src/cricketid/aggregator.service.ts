@@ -306,57 +306,116 @@ export class AggregatorService {
     normalizedSportId: string,
     sportIdNum: number,
   ) {
+    // Cricket: fancy.fancyres.in /cricketid/series and /cricketid/matches return 404.
+    // Use listing.fancyres.in listeventsbysport via CricketIdService (same feed as public APIs).
+    if (sportIdNum === 4 || String(normalizedSportId) === '4') {
+      const grouped = await this.cricketIdService.getEventsBySportId(sportIdNum);
+      const rawList = [
+        ...(Array.isArray(grouped?.live) ? grouped.live : []),
+        ...(Array.isArray(grouped?.upcoming) ? grouped.upcoming : []),
+      ];
+
+      const seenEventIds = new Set<string>();
+      const uniqueMatches: any[] = [];
+      for (const item of rawList) {
+        const rawId =
+          item?.EventId ??
+          item?.eventId ??
+          item?.event?.id ??
+          item?.id;
+        if (rawId == null || String(rawId).trim() === '') continue;
+        const id = String(rawId).trim();
+        if (seenEventIds.has(id)) continue;
+        seenEventIds.add(id);
+
+        const name =
+          item?.Event ??
+          item?.event ??
+          item?.event?.name ??
+          'Unknown Match';
+        const openDate =
+          item?.StartTime ??
+          item?.startTime ??
+          item?.event?.openDate ??
+          item?.openDate ??
+          null;
+
+        uniqueMatches.push({
+          event: {
+            id,
+            name,
+            openDate,
+          },
+        });
+      }
+
+      const eventIds = uniqueMatches.map((m) => m?.event?.id).filter((id): id is string => !!id);
+      if (eventIds.length > 0) {
+        this.matchVisibilityService.syncMatchesBatch(eventIds).catch((err) => {
+          this.logger.debug(`Failed to batch sync ${eventIds.length} matches:`, err);
+        });
+      }
+
+      const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
+      const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
+        uniqueMatches,
+        visibilityMap,
+      );
+
+      const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
+      const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
+
+      return {
+        total: visibleMatches.length,
+        live,
+        upcoming,
+      };
+    }
+
     const competitions = await this.getCompetitions(normalizedSportId);
 
-        const allMatches: any[] = [];
+    const allMatches: any[] = [];
 
-        for (const competition of competitions) {
-      // ✅ MULTI-SPORT: Handle competition.id extraction with fallback
-      // Some sports may return comp.id directly, others use comp.competition.id
+    for (const competition of competitions) {
       const compId = competition?.competition?.id || competition?.id || null;
       if (!compId) {
         this.logger.debug(
           `Skipping competition with missing ID for sportId ${normalizedSportId}:`,
-          { competition: competition?.competition?.name || competition?.name || 'unknown' }
+          { competition: competition?.competition?.name || competition?.name || 'unknown' },
         );
         continue;
       }
 
       const matches = await this.getMatchesByCompetition(compId, sportIdNum);
-          allMatches.push(...matches);
-        }
+      allMatches.push(...matches);
+    }
 
-        // Deduplicate by eventId (same match can appear in multiple competitions, e.g. Specials + league)
-        const seenEventIds = new Set<string>();
-        const uniqueMatches = allMatches.filter((m) => {
-          const eventId = m?.event?.id ?? m?.eventId;
-          const id = eventId != null ? String(eventId) : null;
-          if (!id || seenEventIds.has(id)) return false;
-          seenEventIds.add(id);
-          return true;
-        });
+    const seenEventIds = new Set<string>();
+    const uniqueMatches = allMatches.filter((m) => {
+      const eventId = m?.event?.id ?? m?.eventId;
+      const id = eventId != null ? String(eventId) : null;
+      if (!id || seenEventIds.has(id)) return false;
+      seenEventIds.add(id);
+      return true;
+    });
 
-        // Extract eventIds and get visibility map
-        const eventIds = uniqueMatches
-          .map((m) => m?.event?.id)
-          .filter((id): id is string => !!id);
+    const eventIds = uniqueMatches.map((m) => m?.event?.id).filter((id): id is string => !!id);
 
-        const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
+    const visibilityMap = await this.matchVisibilityService.getVisibilityMap(eventIds);
 
-        // Filter matches by visibility (only show enabled matches)
-        const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
-          uniqueMatches,
-          visibilityMap,
-        );
+    const visibleMatches = this.matchVisibilityService.filterMatchesByVisibility(
+      uniqueMatches,
+      visibilityMap,
+    );
 
-        const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
-        const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
+    const live = visibleMatches.filter((m) => new Date(m?.event?.openDate) <= new Date());
+    const upcoming = visibleMatches.filter((m) => new Date(m?.event?.openDate) > new Date());
 
-        return {
-          total: visibleMatches.length,
-          live,
-          upcoming,
-        };
+    return {
+      total: visibleMatches.length,
+      live,
+      upcoming,
+    };
   }
 
   /**

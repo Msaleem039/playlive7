@@ -9,6 +9,9 @@ const TAB_FOLDER: Record<SportTab, string> = {
   [SportTab.TENNIS]: 'tennis',
 };
 
+/** Max upload size for tab banner images (multipart buffer). */
+const MAX_BANNER_IMAGE_BYTES = 10 * 1024 * 1024;
+
 @Injectable()
 export class TabBannerService {
   constructor(private readonly prisma: PrismaService) {}
@@ -64,6 +67,11 @@ export class TabBannerService {
     const tab = this.parseTab(tabParam);
     if (!file?.buffer?.length) {
       throw new BadRequestException('Image file is required');
+    }
+    if (file.buffer.length > MAX_BANNER_IMAGE_BYTES) {
+      throw new BadRequestException(
+        `Image must be at most ${MAX_BANNER_IMAGE_BYTES / (1024 * 1024)} MB`,
+      );
     }
     const mime = (file.mimetype || '').toLowerCase();
     if (mime && !mime.startsWith('image/')) {
