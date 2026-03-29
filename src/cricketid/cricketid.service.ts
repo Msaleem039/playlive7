@@ -974,10 +974,8 @@ export class CricketIdService {
    * 2. tie match (Tied Match, TIED_MATCH)
    * 3. normal fancy (all other fancy types)
    * 
-   * Public GET /cricketid/bookmaker-fancy omits MATCH_ODDS (match odds use /cricketid/odds).
-   * This method still includes MATCH_ODDS in data for Redis + placeBet rate checks.
-   *
-   * Excluded from data (by name):
+   * Excluded markets:
+   * - MATCH_ODDS
    * - Markets containing "bhav" in the name (case-insensitive)
    * 
    * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
@@ -1038,6 +1036,7 @@ export class CricketIdService {
     };
 
     // Sort the data array according to the required sequence
+    // Note: MATCH_ODDS will be sorted but filtered out later
     if (response && response.data && Array.isArray(response.data)) {
       response.data.sort((a, b) => {
         // Helper function to get sort priority
@@ -1045,6 +1044,7 @@ export class CricketIdService {
           const mname = item.mname?.toUpperCase() || '';
           const gtype = item.gtype?.toLowerCase() || '';
 
+          // 1. match_odds (MATCH_ODDS) - will be filtered out later
           if (mname === 'MATCH_ODDS') {
             return 1;
           }
@@ -1079,7 +1079,7 @@ export class CricketIdService {
       });
 
       // Filter to ONLY include these market names (vendor varies):
-      // - "MATCH_ODDS" (kept for server-side validation; not returned by GET bookmaker-fancy)
+      // - "MATCH_ODDS"
       // - "Normal"
       // - "Bookmaker" / "Bookmaker 2" / anything containing "BOOKMAKER"
       // - "Tied Match" / "TIED_MATCH" / anything containing "TIED"
@@ -1089,12 +1089,17 @@ export class CricketIdService {
         const mname = market.mname?.toUpperCase() || '';
         const originalMname = market.mname || '';
 
+        // // Skip MATCH_ODDS
+        // if (mname === 'MATCH_ODDS') {
+        //   return false;
+        // }
+
         // Skip markets containing "bhav" (case-insensitive)
         if (originalMname.toLowerCase().includes('bhav')) {
           return false;
         }
 
-        // Keep MATCH_ODDS for internal rate validation; controller strips for public API.
+        // Include Match Odds
         if (mname === 'MATCH_ODDS') {
           return true;
         }

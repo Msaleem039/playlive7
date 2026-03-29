@@ -116,7 +116,6 @@ export class CricketIdController {
    * Get bookmaker fancy for a specific event
    * GET /cricketid/bookmaker-fancy?eventId=34917574
    * Returns bookmaker fancy data with markets, sections, odds, etc.
-   * Omits Diamond `MATCH_ODDS` rows (match odds are served via /cricketid/odds).
    * @param eventId - Event ID (e.g., "34917574")
    */
   @Get('bookmaker-fancy')
@@ -134,17 +133,7 @@ export class CricketIdController {
     }
 
     try {
-      const payload = await this.cricketIdService.getBookmakerFancy(eventId);
-      if (payload?.data && Array.isArray(payload.data)) {
-        return {
-          ...payload,
-          data: payload.data.filter(
-            (m: { mname?: string }) =>
-              String(m?.mname || '').toUpperCase() !== 'MATCH_ODDS',
-          ),
-        };
-      }
-      return payload;
+      return await this.cricketIdService.getBookmakerFancy(eventId);
     } catch (error) {
       // Only log non-400 errors (400 errors are expected for invalid/expired eventIds)
       if (error instanceof HttpException && error.getStatus() !== 400) {
