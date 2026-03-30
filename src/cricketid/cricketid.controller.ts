@@ -101,14 +101,96 @@ export class CricketIdController {
   }
 
   /**
-   * Get Betfair odds for specific markets
-   * GET /cricketid/odds?marketIds=1.250049502,1.250049500
-   * Returns detailed odds data including availableToBack, availableToLay, tradedVolume, etc.
-   * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
+   * Get Betfair odds for specific markets.
+   * Supports either:
+   * - GET /cricketid/odds?marketIds=1.250049502,1.250049500
+   * - GET /cricketid/odds?eventId=34917574
+   *
+   * When eventId is provided, Match Odds marketId(s) are resolved automatically.
    */
   @Get('odds')
-  getBetfairOdds(@Query('marketIds') marketIds: string) {
-    return this.cricketIdService.getBetfairOdds(marketIds);
+  async getBetfairOdds(@Query() query: Record<string, string | number | undefined>) {
+    const marketIds = query?.marketIds;
+    if (marketIds) {
+      return this.cricketIdService.getBetfairOdds(String(marketIds));
+    }
+
+    const eventId = query?.eventId ?? query?.eventid;
+    if (!eventId) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: 'marketIds or eventId query parameter is required',
+          error: 'Bad Request',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    // 1) Preferred source: market-list by eventId
+    let matchOddsMarketIds: string[] = [];
+    try {
+      const markets = await this.cricketIdService.getMarketList(String(eventId));
+      matchOddsMarketIds = Array.from(
+        new Set(
+          (Array.isArray(markets) ? markets : [])
+            .filter((m: any) => {
+              const marketName = String(m?.marketName ?? '').toLowerCase().trim();
+              return marketName === 'match odds';
+            })
+            .map((m: any) => String(m?.marketId ?? '').trim())
+            .filter(Boolean),
+        ),
+      );
+    } catch {
+      // vendor /v3/marketList may 404 for some events; fallback below
+    }
+
+    // 2) Fallback: resolve from sport feed mapping (EventId -> MarketId)
+    if (!matchOddsMarketIds.length) {
+      try {
+        const feedMatch = await this.cricketIdService.getEventDetailFromSportFeed(String(eventId), 4);
+        const marketIdFromFeed = String(feedMatch?.MarketId ?? feedMatch?.marketId ?? '').trim();
+        if (marketIdFromFeed) {
+          matchOddsMarketIds = [marketIdFromFeed];
+        }
+      } catch {
+        // best effort fallback
+      }
+    }
+
+    // 3) Final fallback: horses-data normalized detail path
+    if (!matchOddsMarketIds.length) {
+      try {
+        const detail = await this.cricketIdService.getMatchDetailByMarketId(String(eventId));
+        matchOddsMarketIds = Array.from(
+          new Set(
+            (Array.isArray(detail) ? detail : [])
+              .filter((m: any) => {
+                const marketName = String(m?.marketName ?? '').toLowerCase().trim();
+                return marketName === 'match odds';
+              })
+              .map((m: any) => String(m?.marketId ?? '').trim())
+              .filter(Boolean),
+          ),
+        );
+      } catch {
+        // best effort fallback
+      }
+    }
+
+    if (!matchOddsMarketIds.length) {
+      throw new HttpException(
+        {
+          statusCode: HttpStatus.BAD_REQUEST,
+          message: `No Match Odds market found for eventId ${eventId} (market-list/feed/horsedata lookups failed)`,
+          error: 'Bad Request',
+        },
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    return this.cricketIdService.getBetfairOdds(matchOddsMarketIds.join(','));
   }
 
 

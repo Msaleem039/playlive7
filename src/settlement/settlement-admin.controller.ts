@@ -84,7 +84,7 @@ class SettleTiedMatchDto {
 
   @IsNotEmpty()
   @IsString()
-  winnerSelectionId: string; // 37302 for Yes, 37303 for No
+  winnerSelectionId: string; // 1 or 37302 = Yes; 2 or 37303 = No (Diamond sid 1/2)
 
   @IsOptional()
   @IsBoolean()
@@ -186,16 +186,14 @@ export class SettlementAdminController {
    * Settle Tied Match bets manually (Admin only)
    * POST /admin/settlement/tied-match
    * 
-   * Tied Match is a Yes/No market where:
-   * - Yes (selectionId 37302) = Match will be tied
-   * - No (selectionId 37303) = Match will not be tied
-   * 
+   * Tied Match is a Yes/No market (Diamond API: section sid 1 = YES, 2 = NO; legacy 37302/37303).
+   *
    * Request Body:
    * {
    *   "eventId": "35226952",
    *   "marketId": "1.253607053",
-   *   "winnerSelectionId": "37302",  // 37302 for Yes, 37303 for No
-   *   "betIds": ["bet1", "bet2"]      // Optional: settle only specific bets
+   *   "winnerSelectionId": "1",   // "1" or "37302" = Yes; "2" or "37303" = No
+   *   "betIds": ["bet1", "bet2"]  // Optional
    * }
    */
   @Post('tied-match')

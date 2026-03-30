@@ -951,17 +951,63 @@ export class CricketIdService {
       }),
     );
     const response = chunks.flat().filter(Boolean);
+
+    // Enrich fair-demo odds with stable Match Odds labels and runner names when available.
+    // fair-demo often returns runnerName: null, so we backfill from market-detail by marketId.
+    const enrichedResponse = await Promise.all(
+      response.map(async (market: any) => {
+        const normalized = {
+          ...market,
+          mname: market?.mname ?? market?.marketName ?? 'MATCH_ODDS',
+          marketName: market?.marketName ?? market?.mname ?? 'MATCH_ODDS',
+        };
+
+        const marketId = String(normalized?.marketId ?? '').trim();
+        const runners = Array.isArray(normalized?.runners) ? normalized.runners : [];
+        const missingRunnerNames = runners.some((r: any) => !String(r?.runnerName ?? '').trim());
+
+        if (!marketId || runners.length === 0 || !missingRunnerNames) {
+          return normalized;
+        }
+
+        try {
+          const detail = await this.getMatchDetailByMarketId(marketId);
+          const detailMarket = Array.isArray(detail) ? detail[0] : null;
+          const detailRunners = Array.isArray(detailMarket?.runners) ? detailMarket.runners : [];
+          const runnerNameBySelectionId = new Map(
+            detailRunners
+              .map((r: any) => [String(r?.selectionId ?? ''), r?.runnerName ?? null] as const)
+              .filter(([sid]) => sid !== ''),
+          );
+
+          return {
+            ...normalized,
+            runners: runners.map((r: any) => {
+              const sid = String(r?.selectionId ?? '').trim();
+              const existingName = String(r?.runnerName ?? '').trim();
+              return {
+                ...r,
+                runnerName: existingName || (sid ? runnerNameBySelectionId.get(sid) ?? null : null),
+              };
+            }),
+          };
+        } catch {
+          // Best effort enrichment only; keep original odds payload on any lookup failure.
+          return normalized;
+        }
+      }),
+    );
     
     // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
     try {
-      await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_ODDS);
+      await this.redisService.set(cacheKey, enrichedResponse, this.REDIS_TTL.VENDOR_ODDS);
       this.logger.debug(`Redis cache SET for odds: ${marketIds} (TTL: ${this.REDIS_TTL.VENDOR_ODDS}s)`);
     } catch (error) {
       // Log but don't fail - cache is optional
       this.logger.warn(`Failed to set Redis cache for odds ${marketIds}: ${error instanceof Error ? error.message : String(error)}`);
     }
     
-    return response;
+    return enrichedResponse;
   }
 
 

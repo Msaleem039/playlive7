@@ -2796,6 +2796,36 @@ export class SettlementService {
     if (betType === 'LAY') return stake * (odds - 1);
     return 0;
   }
+
+  /**
+   * Tied Match markets are often placed with bookmaker-style gtype (percentage odds).
+   * Must match grouping in calculateExposureFromBets for bookmaker bets.
+   */
+  private isTiedMatchBookmakerStyleBet(bet: any): boolean {
+    const g = (bet?.gtype || '').toLowerCase();
+    return (
+      g === 'bookmaker' ||
+      (g.startsWith('match') && g !== 'match' && g !== 'matchodds')
+    );
+  }
+
+  /**
+   * Diamond / bookmaker-fancy Tied Match uses `section[].sid` 1 = YES, 2 = NO (`gtype` e.g. match1).
+   * Legacy / exchange-style ids: 37302 = Yes, 37303 = No.
+   */
+  private normalizeTiedMatchSide(
+    selectionId: number | null | undefined,
+  ): 'yes' | 'no' | null {
+    if (selectionId == null || Number.isNaN(Number(selectionId))) return null;
+    const n = Number(selectionId);
+    if (n === 1 || n === 37302) return 'yes';
+    if (n === 2 || n === 37303) return 'no';
+    return null;
+  }
+
+  private isTiedMatchSelectionId(selectionId: number | null | undefined): boolean {
+    return this.normalizeTiedMatchSide(selectionId) !== null;
+  }
   /**
    * @deprecated This method uses legacy fallback matching which violates strict identity rules.
    * Use strict matching in settleMarketManual instead (bet.eventId === eventId AND bet.marketId === marketId).
@@ -3927,19 +3957,17 @@ export class SettlementService {
    * 
    * Handles settlement for Tied Match markets (Yes/No market).
    * Tied Match is a binary market where:
-   * - Yes (selectionId 37302) = Match will be tied
-   * - No (selectionId 37303) = Match will not be tied
+   * - Yes: vendor `sid` 1 or legacy 37302
+   * - No: vendor `sid` 2 or legacy 37303
    * 
    * BUSINESS RULES:
-   * - ONLY BACK bets exist (NO LAY, NO exposure, NO offset)
-   * - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
-   * - LOSS → credit NOTHING (stake already deducted at placement)
-   * - NO liability changes (wallet.liability remains unchanged)
-   * - NO exposure calculations
+   * - BACK / YES: win → credit bet.winAmount; loss → no credit (legacy)
+   * - LAY: bookmaker-style (gtype bookmaker / matchN) uses same rules as bookmaker settlement;
+   *   match-odds-style uses decimal odds + balance/liability like match-odds settlement
    * 
    * @param eventId - Exchange event ID
    * @param marketId - Exchange market ID
-   * @param winnerSelectionId - Winner selection ID (37302 for Yes, 37303 for No)
+   * @param winnerSelectionId - Winning runner: 1 or 37302 (Yes), 2 or 37303 (No)
    * @param adminId - Admin user ID who is settling
    * @param betIds - Optional: settle only specific bets
    */
@@ -3966,11 +3994,14 @@ export class SettlementService {
         throw new BadRequestException('adminId is required');
       }
 
-      // 🔐 STRICT RULE: winnerSelectionId must be valid (37302 for Yes, 37303 for No)
       const winnerSelectionIdNum = Number(winnerSelectionId);
-      if (isNaN(winnerSelectionIdNum) || (winnerSelectionIdNum !== 37302 && winnerSelectionIdNum !== 37303)) {
+      if (
+        isNaN(winnerSelectionIdNum) ||
+        this.normalizeTiedMatchSide(winnerSelectionIdNum) === null
+      ) {
         throw new BadRequestException(
-          `Invalid winnerSelectionId: ${winnerSelectionId}. Tied Match winnerSelectionId must be 37302 (Yes) or 37303 (No).`,
+          `Invalid winnerSelectionId: ${winnerSelectionId}. ` +
+            `Use 1 or 37302 (Yes), or 2 or 37303 (No) — vendor Tied Match uses sid 1/2.`,
         );
       }
 
@@ -4009,13 +4040,14 @@ export class SettlementService {
           OR: [
             // New format
             { settlementId: { startsWith: 'CRICKET:TIED_MATCH:' } },
-            // Legacy format: eventId_selectionId where selectionId is 37302 or 37303
+            // Legacy: 37302/37303; Diamond Tied Match: section sid 1 = YES, 2 = NO
             {
               AND: [
-                { selectionId: { in: [37302, 37303] } },
+                { selectionId: { in: [1, 2, 37302, 37303] } },
                 { betName: { in: ['Yes', 'No'] } },
               ],
             },
+            { selectionId: { in: [1, 2] } },
           ],
           ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
         },
@@ -4027,8 +4059,7 @@ export class SettlementService {
         if (bet.settlementId?.startsWith('CRICKET:FANCY:')) {
           return false;
         }
-        // Include if selectionId is 37302 or 37303 (Tied Match)
-        if (bet.selectionId === 37302 || bet.selectionId === 37303) {
+        if (this.isTiedMatchSelectionId(bet.selectionId)) {
           return true;
         }
         // Include if settlementId matches Tied Match pattern
@@ -4055,7 +4086,7 @@ export class SettlementService {
         throw new BadRequestException(
           `No pending Tied Match bets found for strict settlement criteria. ` +
           `eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}. ` +
-          `Settlement requires exact matching: bet.eventId === ${eventId} AND bet.marketId === ${marketId} AND selectionId in [37302, 37303].`,
+          `Settlement requires matching bets: selectionId in [1,2,37302,37303] (Yes/No) for this market.`,
         );
       }
 
@@ -4139,19 +4170,14 @@ export class SettlementService {
 
   /**
    * ✅ ISOLATED TIED MATCH SETTLEMENT ENGINE
-   * 
-   * This function is COMPLETELY ISOLATED from other settlement logic.
-   * It handles ONLY Tied Match bets with the following rules:
-   * 
-   * - ONLY BACK bets exist (NO LAY)
-   * - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
-   * - LOSS → credit NOTHING (stake already deducted at placement)
-   * - NO liability changes
-   * - NO exposure calculations
-   * 
+   *
+   * BACK / YES: unchanged legacy behavior — win credits bet.winAmount; loss no credit.
+   * LAY: aligns with bookmaker strict settlement (percentage odds) or match-odds (decimal),
+   * including balance + liability release consistent with placeBet exposure.
+   *
    * @param settlementId - Settlement ID
    * @param bets - Array of Tied Match bets to settle
-   * @param winnerSelectionIdNum - Winner selection ID (37302 or 37303)
+   * @param winnerSelectionIdNum - Winning runner: 1 / 37302 (Yes) or 2 / 37303 (No)
    * @param adminId - Admin user ID
    * @returns Set of affected user IDs
    */
@@ -4175,6 +4201,14 @@ export class SettlementService {
 
     await this.prisma.$transaction(
       async (tx) => {
+        const winnerSide = this.normalizeTiedMatchSide(winnerSelectionIdNum);
+        if (winnerSide === null) {
+          throw new BadRequestException(
+            `Invalid winnerSelectionId: ${winnerSelectionIdNum}. ` +
+              `Use 1 or 37302 (Yes), or 2 or 37303 (No).`,
+          );
+        }
+
         // 🔐 HARD GUARD: Abort if ANY bet is already settled (idempotency enforcement)
         const alreadySettledBets = bets.filter(
           bet => bet.status !== BetStatus.PENDING,
@@ -4202,20 +4236,18 @@ export class SettlementService {
             );
           }
 
-          // 🔐 HARD GUARD: Tied Match ONLY supports BACK bets
           const betType = (bet.betType || '').toUpperCase();
-          if (betType !== 'BACK' && betType !== 'YES') {
+          if (betType !== 'BACK' && betType !== 'YES' && betType !== 'LAY') {
             throw new BadRequestException(
               `CRITICAL: Bet ${bet.id} has invalid betType: ${bet.betType}. ` +
-              `Tied Match ONLY supports BACK bets. LAY bets are not allowed.`,
+              `Tied Match supports BACK, YES, or LAY.`,
             );
           }
 
-          // 🔐 HARD GUARD: Validate selectionId
-          if (bet.selectionId !== 37302 && bet.selectionId !== 37303) {
+          if (!this.isTiedMatchSelectionId(bet.selectionId)) {
             throw new BadRequestException(
               `CRITICAL: Bet ${bet.id} has invalid selectionId: ${bet.selectionId}. ` +
-              `Tied Match selectionId must be 37302 (Yes) or 37303 (No).`,
+                `Tied Match expects Yes (1 or 37302) or No (2 or 37303).`,
             );
           }
 
@@ -4229,7 +4261,7 @@ export class SettlementService {
         for (const [userId, userBets] of betsByUser.entries()) {
           const wallet = await tx.wallet.findUnique({
             where: { userId },
-            select: { id: true, balance: true }, // Only need ID for transaction records, balance for logging
+            select: { id: true, balance: true },
           });
 
           if (!wallet) {
@@ -4237,58 +4269,104 @@ export class SettlementService {
             continue;
           }
 
-          // Track balance delta for atomic update
           let balanceDelta = 0;
+          let liabilityDelta = 0;
 
-          // 🚀 OPTIMIZATION: Collect bet updates for batching
-          const betUpdates: Array<{ id: string; status: BetStatus; pnl: number; creditedAmount: number }> = [];
+          const betUpdates: Array<{ id: string; status: BetStatus; pnl: number }> = [];
 
-          // 3️⃣ Process each bet with TIED MATCH-SPECIFIC rules
           for (const bet of userBets) {
-            const betSelectionId = Number(bet.selectionId);
-            const isWinner = betSelectionId === winnerSelectionIdNum;
-
-            // ✅ TIED MATCH SETTLEMENT RULES:
-            // - WIN → credit ONLY bet.winAmount (stake already deducted at placement)
-            // - LOSS → credit NOTHING (stake already deducted at placement)
-            // - NO liability changes
-            // - NO exposure calculations
-
-            if (isWinner) {
-              // ✅ BACK WIN: credit ONLY winAmount (NOT stake + winAmount)
-              const winAmount = bet.winAmount ?? 0;
-              balanceDelta += winAmount;
-              
-              betUpdates.push({
-                id: bet.id,
-                status: BetStatus.WON,
-                pnl: winAmount, // For reporting: profit = winAmount
-                creditedAmount: winAmount,
-              });
-
-              this.logger.log(
-                `Tied Match WIN: betId=${bet.id}, userId=${userId}, ` +
-                `selectionId=${betSelectionId}, winAmount=${winAmount}, creditedAmount=${winAmount}`,
+            const stake = Number(bet.betValue ?? bet.amount ?? 0);
+            const odds = Number(bet.betRate ?? bet.odds ?? 0);
+            const betType = (bet.betType || '').toUpperCase();
+            const betSide = this.normalizeTiedMatchSide(bet.selectionId);
+            if (betSide === null) {
+              throw new BadRequestException(
+                `CRITICAL: Bet ${bet.id} has invalid selectionId: ${bet.selectionId}.`,
               );
-            } else {
-              // ✅ BACK LOSS: credit NOTHING (stake already deducted at placement)
-              const stake = bet.betValue ?? bet.amount ?? 0;
-              
-              betUpdates.push({
-                id: bet.id,
-                status: BetStatus.LOST,
-                pnl: -stake, // For reporting: loss = stake
-                creditedAmount: 0,
-              });
+            }
+            const outcomeMatchesBetSide = betSide === winnerSide;
 
-              this.logger.log(
-                `Tied Match LOSS: betId=${bet.id}, userId=${userId}, ` +
-                `selectionId=${betSelectionId}, stake=${stake}, creditedAmount=0`,
-              );
+            if (betType === 'BACK' || betType === 'YES') {
+              if (outcomeMatchesBetSide) {
+                const winAmount = Number(bet.winAmount ?? 0);
+                balanceDelta += winAmount;
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.WON,
+                  pnl: winAmount,
+                });
+                this.logger.log(
+                  `Tied Match BACK WIN: betId=${bet.id}, userId=${userId}, winAmount=${winAmount}`,
+                );
+              } else {
+                betUpdates.push({
+                  id: bet.id,
+                  status: BetStatus.LOST,
+                  pnl: -stake,
+                });
+                this.logger.log(
+                  `Tied Match BACK LOSS: betId=${bet.id}, userId=${userId}, stake=${stake}`,
+                );
+              }
+              continue;
+            }
+
+            // LAY — same rules as bookmaker strict vs match-odds settleMarket
+            if (betType === 'LAY') {
+              const bookmakerStyle = this.isTiedMatchBookmakerStyleBet(bet);
+              if (bookmakerStyle) {
+                const layLiability = this.bookmakerLayLiability(stake, odds);
+                if (!outcomeMatchesBetSide) {
+                  liabilityDelta -= layLiability;
+                  betUpdates.push({
+                    id: bet.id,
+                    status: BetStatus.WON,
+                    pnl: stake,
+                  });
+                  this.logger.log(
+                    `Tied Match LAY WIN (bookmaker): betId=${bet.id}, userId=${userId}, liabilityRelease=${layLiability}`,
+                  );
+                } else {
+                  balanceDelta -= layLiability;
+                  liabilityDelta -= layLiability;
+                  betUpdates.push({
+                    id: bet.id,
+                    status: BetStatus.LOST,
+                    pnl: -layLiability,
+                  });
+                  this.logger.log(
+                    `Tied Match LAY LOSS (bookmaker): betId=${bet.id}, userId=${userId}, pay=${layLiability}`,
+                  );
+                }
+              } else {
+                const layLiability = this.layLiability(stake, odds);
+                if (outcomeMatchesBetSide) {
+                  balanceDelta -= layLiability;
+                  liabilityDelta -= layLiability;
+                  betUpdates.push({
+                    id: bet.id,
+                    status: BetStatus.LOST,
+                    pnl: -layLiability,
+                  });
+                  this.logger.log(
+                    `Tied Match LAY LOSS (match odds): betId=${bet.id}, userId=${userId}, pay=${layLiability}`,
+                  );
+                } else {
+                  balanceDelta += stake + layLiability;
+                  liabilityDelta -= layLiability;
+                  betUpdates.push({
+                    id: bet.id,
+                    status: BetStatus.WON,
+                    pnl: stake,
+                  });
+                  this.logger.log(
+                    `Tied Match LAY WIN (match odds): betId=${bet.id}, userId=${userId}, creditNet=${stake + layLiability}`,
+                  );
+                }
+              }
             }
           }
 
-          // 🚀 BATCH UPDATE: Update all bets at once instead of individually
           if (betUpdates.length > 0) {
             const now = new Date();
             await Promise.all(
@@ -4307,43 +4385,48 @@ export class SettlementService {
             );
           }
 
-          // 4️⃣ Apply wallet changes ONCE per user (ATOMIC UPDATE ONLY)
-          // ✅ CRITICAL: Only update balance if there's a win (balanceDelta > 0)
-          // ✅ CRITICAL: NEVER touch liability (Tied Match has NO liability model)
-          if (balanceDelta > 0) {
+          const clampedLiabilityDelta = Math.min(0, liabilityDelta);
+
+          if (balanceDelta !== 0 || clampedLiabilityDelta !== 0) {
             await tx.wallet.update({
               where: { userId },
               data: {
-                balance: { increment: balanceDelta }, // ✅ ATOMIC: Never use direct assignment
-                // ✅ CRITICAL: NO liability update (Tied Match has NO liability)
+                balance: { increment: balanceDelta },
+                liability: { increment: clampedLiabilityDelta },
               },
             });
 
-            // Create transaction record
-            await tx.transaction.create({
-              data: {
-                walletId: wallet.id,
-                amount: balanceDelta,
-                type: TransactionType.BET_WON,
-                description: `Tied Match Settlement: Profit credited ${balanceDelta} - ${settlementId}`,
-              },
-            });
+            if (balanceDelta > 0) {
+              await tx.transaction.create({
+                data: {
+                  walletId: wallet.id,
+                  amount: balanceDelta,
+                  type: TransactionType.BET_WON,
+                  description: `Tied Match Settlement: credited ${balanceDelta} - ${settlementId}`,
+                },
+              });
+            } else if (balanceDelta < 0) {
+              await tx.transaction.create({
+                data: {
+                  walletId: wallet.id,
+                  amount: Math.abs(balanceDelta),
+                  type: TransactionType.BET_PLACED,
+                  description: `Tied Match Settlement: deducted ${Math.abs(balanceDelta)} - ${settlementId}`,
+                },
+              });
+            }
 
             this.logger.log(
-              `Tied Match wallet updated (ATOMIC) for userId=${userId}: ` +
-              `balanceDelta=${balanceDelta}, liabilityDelta=0 (NO liability changes). ` +
-              `Previous balance: ${wallet.balance}, New balance: ${wallet.balance + balanceDelta}`,
+              `Tied Match wallet userId=${userId}: balanceDelta=${balanceDelta}, liabilityDelta=${clampedLiabilityDelta}`,
             );
+          } else if (betUpdates.length > 0) {
+            this.logger.log(
+              `Tied Match settlement userId=${userId}: bet rows updated, no wallet delta (e.g. LAY win bookmaker-style).`,
+            );
+          }
 
+          if (betUpdates.length > 0) {
             affectedUserIds.add(userId);
-          } else {
-            // No balance change (all bets lost)
-            this.logger.log(
-              `Tied Match settlement for userId=${userId}: ` +
-              `All bets lost, no balance change. ` +
-              `Settled ${betUpdates.length} bet(s).`,
-            );
-            affectedUserIds.add(userId); // Still mark as affected for P/L recalculation
           }
         }
       },
@@ -8692,7 +8775,7 @@ export class SettlementService {
         },
       ];
     } else if (marketType === 'tied-match') {
-      // Tied Match: CRICKET:TIED_MATCH: prefix OR selectionId 37302/37303 OR betName Yes/No
+      // Tied Match: vendor sid 1/2 (Yes/No) or legacy 37302/37303
       whereClause.OR = [
         {
           settlementId: {
@@ -8701,7 +8784,7 @@ export class SettlementService {
         },
         {
           selectionId: {
-            in: [37302, 37303],
+            in: [1, 2, 37302, 37303],
           },
         },
         {
@@ -8721,7 +8804,7 @@ export class SettlementService {
                 },
                 {
                   selectionId: {
-                    in: [37302, 37303],
+                    in: [1, 2, 37302, 37303],
                   },
                 },
               ],
@@ -8781,10 +8864,9 @@ export class SettlementService {
         const marketName = (bet.marketName || '').toLowerCase();
         const selectionId = bet.selectionId ? Number(bet.selectionId) : null;
 
-        // Must be Yes/No with selectionId 37302/37303 or marketName contains 'tied match'
         return (
           (betName === 'yes' || betName === 'no') &&
-          (selectionId === 37302 || selectionId === 37303 || marketName.includes('tied match'))
+          (this.isTiedMatchSelectionId(selectionId) || marketName.includes('tied match'))
         );
       } else if (marketType === 'match-odds') {
         // For match-odds, exclude tied match and match odds including tie
@@ -8872,32 +8954,21 @@ export class SettlementService {
       }
     }
 
-    // For tied-match: Always include both Yes (37302) and No (37303) options
+    // Tied Match: ensure Yes/No runners — vendor sid 1 & 2 (Diamond) or legacy 37302 & 37303
     if (marketType === 'tied-match') {
       for (const match of matchMap.values()) {
         if (!match.runners) {
           match.runners = [];
         }
-        
-        // Ensure Yes option (37302) exists
-        const hasYes = match.runners.some(r => r.selectionId === 37302);
-        if (!hasYes) {
-          match.runners.push({
-            selectionId: 37302,
-            name: 'Yes',
-          });
+        const ids = new Set(match.runners.map((r) => r.selectionId));
+        const hasYesSide = [1, 37302].some((id) => ids.has(id));
+        const hasNoSide = [2, 37303].some((id) => ids.has(id));
+        if (!hasYesSide) {
+          match.runners.push({ selectionId: 1, name: 'Yes' });
         }
-        
-        // Ensure No option (37303) exists
-        const hasNo = match.runners.some(r => r.selectionId === 37303);
-        if (!hasNo) {
-          match.runners.push({
-            selectionId: 37303,
-            name: 'No',
-          });
+        if (!hasNoSide) {
+          match.runners.push({ selectionId: 2, name: 'No' });
         }
-        
-        // Sort runners by selectionId
         match.runners.sort((a, b) => a.selectionId - b.selectionId);
       }
     } else {
