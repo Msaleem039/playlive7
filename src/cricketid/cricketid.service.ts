@@ -848,12 +848,17 @@ export class CricketIdService {
   }
 
   /**
-   * Get market list (odds/markets) for a specific event/match
-   * Endpoint: /v3/marketList?eventId={eventId}
-   * Returns markets with runners, odds, selectionId, etc.
-   * 
-   * ✅ PERFORMANCE: Reads from Redis cache first, falls back to vendor API if cache miss
-   * 
+   * Get market list (odds/markets) for a specific event/match.
+   *
+   * Primary source:
+   * - Resolve eventId -> marketId from sport feed (listeventsbysport),
+   * - Fetch odds from fair-demo: https://api.fancyres.in/api/fair/demo/{marketId}
+   *
+   * Fallback source (legacy):
+   * - /v3/marketList?eventId={eventId}
+   *
+   * ✅ PERFORMANCE: Reads from Redis cache first, stores normalized response.
+   *
    * @param eventId - Event ID from the match list (e.g., "34917574")
    */
   async getMarketList(eventId: string | number) {
@@ -865,9 +870,52 @@ export class CricketIdService {
       return cached;
     }
 
-    // Cache miss - fetch from vendor API (original logic unchanged)
-    this.logger.debug(`Redis cache MISS for market-list: ${eventId} - fetching from vendor API`);
-    const response = await this.fetch('/v3/marketList', { eventId });
+    // Cache miss - fetch from fair-demo first (market list vendor can 404 on some events)
+    this.logger.debug(
+      `Redis cache MISS for market-list: ${eventId} - resolving marketId and fetching fair-demo`,
+    );
+
+    const eid = String(eventId).trim();
+    let response: any[] = [];
+
+    try {
+      const feedMatch = await this.getEventDetailFromSportFeed(eid, this.DEFAULT_SPORT_ID);
+      const resolvedMarketId = String(
+        feedMatch?.MarketId ?? feedMatch?.marketId ?? '',
+      ).trim();
+
+      if (resolvedMarketId) {
+        const fairDemo = await this.getBetfairOdds(resolvedMarketId);
+        const oddsMarkets = Array.isArray(fairDemo) ? fairDemo : [];
+
+        response = oddsMarkets.map((m: any) => ({
+          marketId: String(m?.marketId ?? resolvedMarketId),
+          marketName: m?.marketName ?? m?.mname ?? 'Match Odds',
+          totalMatched: Number(m?.totalMatched ?? 0),
+          status: m?.status ?? 'OPEN',
+          eventId: eid,
+          runners: Array.isArray(m?.runners)
+            ? m.runners.map((r: any) => ({
+                selectionId: Number(r?.selectionId ?? 0),
+                runnerName: r?.runnerName ?? null,
+                handicap: Number(r?.handicap ?? 0),
+                sortPriority: Number(r?.sortPriority ?? 0),
+              }))
+            : [],
+        }));
+      }
+    } catch {
+      // best-effort; fallback to legacy source below
+    }
+
+    // Legacy fallback if fair-demo path could not resolve anything.
+    if (!response.length) {
+      this.logger.debug(
+        `Fair-demo market-list fallback to legacy /v3/marketList for eventId=${eventId}`,
+      );
+      const legacy = await this.fetch('/v3/marketList', { eventId });
+      response = Array.isArray(legacy) ? legacy : this.normalizeToArray<any>(legacy, ['data', 'result', 'items']);
+    }
     
     // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
     try {

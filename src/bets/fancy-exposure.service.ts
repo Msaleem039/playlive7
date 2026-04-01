@@ -85,35 +85,34 @@ export class FancyExposureService {
   private calculateFancyMaxLoss(fancyBets: any[]): number {
     if (fancyBets.length === 0) return 0;
 
-    // Determine outcome range based on bet rates
-    // Use bet rates to determine reasonable outcome range
-    const allRates: number[] = [];
+    // Evaluate targeted candidate outcomes that capture worst-case boundary transitions.
+    // Includes each line and immediate neighbors, plus global min/max bounds.
+    const candidateSet = new Set<number>([
+      this.MIN_FANCY_OUTCOME,
+      this.MAX_FANCY_OUTCOME,
+    ]);
     for (const bet of fancyBets) {
-      const rate = bet.betRate ?? bet.odds ?? 0;
-      if (rate > 0) {
-        allRates.push(rate);
+      const line = Number(bet?.betRate ?? bet?.odds ?? 0);
+      if (!Number.isFinite(line)) continue;
+      const floorLine = Math.floor(line);
+      const ceilLine = Math.ceil(line);
+      for (const p of [floorLine - 1, floorLine, floorLine + 1, ceilLine - 1, ceilLine, ceilLine + 1]) {
+        if (p >= this.MIN_FANCY_OUTCOME && p <= this.MAX_FANCY_OUTCOME) {
+          candidateSet.add(p);
+        }
       }
     }
+    const candidateOutcomes = Array.from(candidateSet).sort((a, b) => a - b);
+    console.log('Fancy Candidate Outcomes:', candidateOutcomes);
 
-    // Determine outcome range: from min(0, minRate - buffer) to max(maxRate + buffer, MAX_FANCY_OUTCOME)
-    const minRate = allRates.length > 0 ? Math.min(...allRates) : 0;
-    const maxRate = allRates.length > 0 ? Math.max(...allRates) : this.MAX_FANCY_OUTCOME;
-    const buffer = Math.max(50, maxRate * 0.2); // 20% buffer or minimum 50
-
-    const minOutcome = Math.max(this.MIN_FANCY_OUTCOME, Math.floor(minRate - buffer));
-    const maxOutcome = Math.min(this.MAX_FANCY_OUTCOME, Math.ceil(maxRate + buffer));
-
-    // Simulate each possible outcome and calculate total P/L
     let maxLoss = 0;
-
-    for (let actualRuns = minOutcome; actualRuns <= maxOutcome; actualRuns++) {
+    for (const actualRuns of candidateOutcomes) {
       const totalPl = this.calculateTotalPlForOutcome(fancyBets, actualRuns);
-      
-      // Loss is negative P/L, so maximum loss is the absolute value of the most negative P/L
       if (totalPl < 0) {
         maxLoss = Math.max(maxLoss, Math.abs(totalPl));
       }
     }
+    console.log('Calculated Max Loss:', maxLoss);
 
     return maxLoss;
   }

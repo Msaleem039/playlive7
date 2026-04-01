@@ -569,11 +569,21 @@ export class AuthService {
           const totalCredit = wins.reduce((s, b) => s + (Number(b.pnl) || 0), 0);
           const totalDebit = losses.reduce((s, b) => s + Math.abs(Number(b.pnl) || 0), 0);
           const netPnl = totalCredit - totalDebit;
+          const amount = Math.abs(netPnl);
+          const amountType = netPnl >= 0 ? 'credit' : 'debit';
+          const decisionRunCandidate = groupBets.find(
+            (b) => b?.decisionRun !== null && b?.decisionRun !== undefined,
+          );
+          const decisionRun =
+            decisionRunCandidate && Number.isFinite(Number(decisionRunCandidate.decisionRun))
+              ? Number(decisionRunCandidate.decisionRun)
+              : null;
           const latestSettledAt = groupBets.reduce((max, b) => {
             const t = b.settledAt ? new Date(b.settledAt).getTime() : 0;
             return t > max ? t : max;
           }, 0);
           const description =
+            first?.betName ||
             first?.marketName ||
             first?.match?.eventName ||
             (first?.match ? `${first.match.homeTeam || ''} - ${first.match.awayTeam || ''}`.trim() : '') ||
@@ -590,8 +600,9 @@ export class AuthService {
             selectionId: first?.selectionId ?? null,
             description,
             totalStake,
-            totalCredit,
-            totalDebit,
+            amount,
+            amountType,
+            decisionRun,
             netPnl,
             runningBalance: 0, // filled below
             result,
@@ -603,6 +614,12 @@ export class AuthService {
               odds: b.odds,
               stake: Number(b.amount) || 0,
               pnl: Number(b.pnl) ?? 0,
+              decisionRun:
+                b?.decisionRun !== null &&
+                b?.decisionRun !== undefined &&
+                Number.isFinite(Number(b.decisionRun))
+                  ? Number(b.decisionRun)
+                  : null,
               status: b.status,
             })),
           });
