@@ -70,7 +70,7 @@ export class CricketIdController {
 
   /**
    * Get market list (odds/markets) for a specific event/match
-   * GET /cricketid/markets?eventId={eventId}
+   * GET /cricketid/markets?eventId={eventId}&sportId=1
    * Example: GET /cricketid/markets?eventId=34917574
    * Returns markets with runners, selectionId, marketName, etc.
    * @param eventId - Event ID from the match list (e.g., "34917574")
@@ -78,6 +78,7 @@ export class CricketIdController {
   @Get('markets')
   async getMarketList(@Query() query: Record<string, string | number | undefined>) {
     const eventId = query?.eventId ?? query?.eventid;
+    const sportId = query?.sportId ?? query?.sportid;
     if (!eventId) {
       throw new HttpException(
         {
@@ -90,7 +91,7 @@ export class CricketIdController {
     }
 
     try {
-      return await this.cricketIdService.getMarketList(eventId);
+      return await this.cricketIdService.getMarketList(eventId, sportId);
     } catch (error) {
       // Only log non-400 errors (400 errors are expected for invalid/expired eventIds)
       if (error instanceof HttpException && error.getStatus() !== 400) {
@@ -105,6 +106,7 @@ export class CricketIdController {
    * Supports either:
    * - GET /cricketid/odds?marketIds=1.250049502,1.250049500
    * - GET /cricketid/odds?eventId=34917574
+   * - GET /cricketid/odds?eventId=…&sportId=1   (1=soccer, 2=tennis, 4=cricket; omit = try 4→1→2)
    *
    * When eventId is provided, Match Odds marketId(s) are resolved automatically.
    */
@@ -116,6 +118,7 @@ export class CricketIdController {
     }
 
     const eventId = query?.eventId ?? query?.eventid;
+    const sportId = query?.sportId ?? query?.sportid;
     if (!eventId) {
       throw new HttpException(
         {
@@ -127,55 +130,49 @@ export class CricketIdController {
       );
     }
 
-    // 1) Preferred source: market-list by eventId
-    let matchOddsMarketIds: string[] = [];
-    try {
-      const markets = await this.cricketIdService.getMarketList(String(eventId));
-      matchOddsMarketIds = Array.from(
+    const isMatchOddsRow = (m: any) => {
+      const marketName = String(m?.marketName ?? m?.mname ?? '').toLowerCase().trim();
+      return (
+        marketName === 'match odds' ||
+        marketName === 'match_odds' ||
+        (marketName.includes('match') && marketName.includes('odd'))
+      );
+    };
+
+    const extractMatchOddsIds = (items: any) =>
+      Array.from(
         new Set(
-          (Array.isArray(markets) ? markets : [])
-            .filter((m: any) => {
-              const marketName = String(m?.marketName ?? '').toLowerCase().trim();
-              return marketName === 'match odds';
-            })
+          (Array.isArray(items) ? items : [])
+            .filter(isMatchOddsRow)
             .map((m: any) => String(m?.marketId ?? '').trim())
             .filter(Boolean),
         ),
       );
+
+    // 1) market-list (fair-demo primary + legacy fallback inside service)
+    let matchOddsMarketIds: string[] = [];
+    try {
+      const markets = await this.cricketIdService.getMarketList(String(eventId), sportId);
+      matchOddsMarketIds = extractMatchOddsIds(markets);
     } catch {
-      // vendor /v3/marketList may 404 for some events; fallback below
+      // continue to fallbacks
     }
 
-    // 2) Fallback: resolve from sport feed mapping (EventId -> MarketId)
+    // 2) Resolve MarketId from sport feed(s), optional horsedata rows for exact name match
     if (!matchOddsMarketIds.length) {
       try {
-        const feedMatch = await this.cricketIdService.getEventDetailFromSportFeed(String(eventId), 4);
-        const marketIdFromFeed = String(feedMatch?.MarketId ?? feedMatch?.marketId ?? '').trim();
-        if (marketIdFromFeed) {
-          matchOddsMarketIds = [marketIdFromFeed];
+        const mid = await this.cricketIdService.resolveMarketIdFromEvent(String(eventId), sportId);
+        if (mid) {
+          try {
+            const detail = await this.cricketIdService.getMatchDetailByMarketId(mid);
+            const fromDetail = extractMatchOddsIds(detail);
+            matchOddsMarketIds = fromDetail.length ? fromDetail : [mid];
+          } catch {
+            matchOddsMarketIds = [mid];
+          }
         }
       } catch {
-        // best effort fallback
-      }
-    }
-
-    // 3) Final fallback: horses-data normalized detail path
-    if (!matchOddsMarketIds.length) {
-      try {
-        const detail = await this.cricketIdService.getMatchDetailByMarketId(String(eventId));
-        matchOddsMarketIds = Array.from(
-          new Set(
-            (Array.isArray(detail) ? detail : [])
-              .filter((m: any) => {
-                const marketName = String(m?.marketName ?? '').toLowerCase().trim();
-                return marketName === 'match odds';
-              })
-              .map((m: any) => String(m?.marketId ?? '').trim())
-              .filter(Boolean),
-          ),
-        );
-      } catch {
-        // best effort fallback
+        // best effort
       }
     }
 

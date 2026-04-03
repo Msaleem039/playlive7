@@ -477,6 +477,30 @@ export class CricketIdService {
   }
 
   /**
+   * Resolve listing-feed MarketId for an event (used for fair-demo odds).
+   * If sportId is omitted, tries cricket (4), soccer (1), then tennis (2).
+   */
+  async resolveMarketIdFromEvent(
+    eventId: string | number,
+    sportId?: string | number | null,
+  ): Promise<string | null> {
+    const eid = String(eventId).trim();
+    if (!eid) return null;
+
+    const trySports: number[] =
+      sportId !== undefined && sportId !== null && String(sportId).trim() !== ''
+        ? [this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID)]
+        : [4, 1, 2];
+
+    for (const sid of trySports) {
+      const match = await this.getEventDetailFromSportFeed(eid, sid);
+      const mid = String(match?.MarketId ?? match?.marketId ?? '').trim();
+      if (mid) return mid;
+    }
+    return null;
+  }
+
+  /**
    * Match detail from vendor market-id endpoint:
    * https://listing.fancyres.in/horsedata/{marketId}
    *
@@ -860,29 +884,30 @@ export class CricketIdService {
    * ✅ PERFORMANCE: Reads from Redis cache first, stores normalized response.
    *
    * @param eventId - Event ID from the match list (e.g., "34917574")
+   * @param sportId - Optional: 4=cricket, 1=soccer, 2=tennis. When omitted, tries 4 then 1 then 2.
    */
-  async getMarketList(eventId: string | number) {
-    // ✅ PERFORMANCE: Try Redis cache first
-    const cacheKey = this.redisService.getVendorKey('market-list', String(eventId));
+  async getMarketList(eventId: string | number, sportId?: string | number | null) {
+    const eid = String(eventId).trim();
+    const cacheId =
+      sportId !== undefined && sportId !== null && String(sportId).trim() !== ''
+        ? `${this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID)}:${eid}`
+        : `auto:${eid}`;
+    const cacheKey = this.redisService.getVendorKey('market-list-v2', cacheId);
+
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
-      this.logger.debug(`Redis cache HIT for market-list: ${eventId}`);
+      this.logger.debug(`Redis cache HIT for market-list-v2: ${cacheId}`);
       return cached;
     }
 
-    // Cache miss - fetch from fair-demo first (market list vendor can 404 on some events)
     this.logger.debug(
-      `Redis cache MISS for market-list: ${eventId} - resolving marketId and fetching fair-demo`,
+      `Redis cache MISS for market-list-v2: ${cacheId} - resolving marketId and fetching fair-demo`,
     );
 
-    const eid = String(eventId).trim();
     let response: any[] = [];
 
     try {
-      const feedMatch = await this.getEventDetailFromSportFeed(eid, this.DEFAULT_SPORT_ID);
-      const resolvedMarketId = String(
-        feedMatch?.MarketId ?? feedMatch?.marketId ?? '',
-      ).trim();
+      const resolvedMarketId = await this.resolveMarketIdFromEvent(eid, sportId ?? null);
 
       if (resolvedMarketId) {
         const fairDemo = await this.getBetfairOdds(resolvedMarketId);
@@ -911,19 +936,19 @@ export class CricketIdService {
     // Legacy fallback if fair-demo path could not resolve anything.
     if (!response.length) {
       this.logger.debug(
-        `Fair-demo market-list fallback to legacy /v3/marketList for eventId=${eventId}`,
+        `Fair-demo market-list fallback to legacy /v3/marketList for eventId=${eid}`,
       );
-      const legacy = await this.fetch('/v3/marketList', { eventId });
+      const legacy = await this.fetch('/v3/marketList', { eventId: eid });
       response = Array.isArray(legacy) ? legacy : this.normalizeToArray<any>(legacy, ['data', 'result', 'items']);
     }
     
     // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
     try {
       await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_MATCH_DETAIL);
-      this.logger.debug(`Redis cache SET for market-list: ${eventId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`);
+      this.logger.debug(`Redis cache SET for market-list-v2: ${cacheId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`);
     } catch (error) {
       // Log but don't fail - cache is optional
-      this.logger.warn(`Failed to set Redis cache for market-list ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+      this.logger.warn(`Failed to set Redis cache for market-list-v2 ${cacheId}: ${error instanceof Error ? error.message : String(error)}`);
     }
     
     return response;
@@ -933,8 +958,8 @@ export class CricketIdService {
    * Get markets for a specific match/event.
    * Reuses existing getMarketList() with Redis caching.
    */
-  async getMatchMarkets(eventId: string) {
-    return this.getMarketList(eventId);
+  async getMatchMarkets(eventId: string, sportId?: string | number | null) {
+    return this.getMarketList(eventId, sportId);
   }
 
   /**
