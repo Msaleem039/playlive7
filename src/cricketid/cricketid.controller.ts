@@ -272,6 +272,7 @@ export class CricketIdController {
 
   /**
    * Direct vendor sport-wise matches (no aggregation via series/competition loops).
+   * Only rows with MarketType MATCH_ODDS (excludes fancy/bookmaker-only list lines).
    * GET /cricketid/events-by-sport?sportId=4
    * GET /cricketid/events-by-sport/4
    */

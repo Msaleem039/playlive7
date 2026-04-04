@@ -780,8 +780,8 @@ export class CricketIdService {
   async getEventsBySportId(sportId: string | number) {
     const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
 
-    // v3 cache key: grouped response { total, live, upcoming }.
-    const cacheKey = this.redisService.getVendorKey('events-by-sport-v3', String(sid));
+    // v4: same shape but only list rows with MarketType MATCH_ODDS (vendor sends multiple market types per event).
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v4', String(sid));
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
@@ -815,8 +815,14 @@ export class CricketIdService {
     }
 
     const now = new Date();
-    const transformed = events.map((item) => {
-      const eventId = item?.event?.id ?? item?.eventId ?? item?.id;
+    const isMatchOddsListRow = (item: any) => {
+      const mt = String(item?.MarketType ?? item?.marketType ?? '').trim().toUpperCase();
+      return mt === 'MATCH_ODDS' || mt === 'MATCHODDS';
+    };
+    const matchOddsEvents = events.filter(isMatchOddsListRow);
+
+    const transformed = matchOddsEvents.map((item) => {
+      const eventId = item?.event?.id ?? item?.eventId ?? item?.id ?? item?.EventId;
       const openDate =
         item?.event?.openDate ??
         item?.openDate ??
