@@ -588,13 +588,6 @@ export class AuthService {
             first?.match?.eventName ||
             (first?.match ? `${first.match.homeTeam || ''} - ${first.match.awayTeam || ''}`.trim() : '') ||
             'Market';
-          let result = 'SETTLED';
-          if (groupBets.every((b) => b.status === 'WON')) result = 'WON';
-          else if (groupBets.every((b) => b.status === 'LOST')) result = 'LOST';
-          else if (groupBets.every((b) => b.status === 'CANCELLED')) result = 'CANCELLED';
-          else if (netPnl > 0) result = 'WON';
-          else if (netPnl < 0) result = 'LOST';
-
           statementEntries.push({
             marketId: first?.marketId ?? null,
             selectionId: first?.selectionId ?? null,
@@ -605,7 +598,8 @@ export class AuthService {
             decisionRun,
             netPnl,
             runningBalance: 0, // filled below
-            result,
+            win: totalCredit,
+            loss: totalDebit,
             latestSettledAt: latestSettledAt ? new Date(latestSettledAt).toISOString() : null,
             bets: groupBets.map((b: any) => ({
               id: b.id,

@@ -6,14 +6,12 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { User } from '@prisma/client';
 import { UserRole } from '@prisma/client';
 import { MatchVisibilityService } from '../cricketid/match-visibility.service';
-import { AggregatorService } from '../cricketid/aggregator.service';
 
 @Controller('admin')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class AdminController {
   constructor(
     private readonly matchVisibilityService: MatchVisibilityService,
-    private readonly aggregatorService: AggregatorService,
   ) {}
 
   @Get('dashboard')
@@ -44,75 +42,6 @@ export class AdminController {
       },
       timestamp: new Date().toISOString(),
     };
-  }
-
-  /**
-   * GET /admin/matches
-   * Get all matches with their visibility status
-   * Returns matches from vendor API merged with visibility settings
-   */
-  @Get('matches')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT, UserRole.CLIENT)
-  async getAllMatches() {
-    try {
-      // Get all matches from vendor API (bypass cache to get fresh data)
-      const cricketData = await this.aggregatorService.getAllCricketMatches();
-      const allMatches = [
-        ...(cricketData.live || []),
-        ...(cricketData.upcoming || []),
-      ];
-
-      // Get visibility settings from database
-      const visibilityRecords = await this.matchVisibilityService.getAllMatchesWithVisibility();
-      // Use string keys so lookup works when vendor API returns event.id as number
-      const visibilityMap = new Map(
-        visibilityRecords.map((v) => [String(v.eventId), v.isEnabled]),
-      );
-
-      // Merge match data with visibility
-      const matchesWithVisibility = allMatches.map((match: any) => {
-        const rawId = match?.event?.id;
-        const eventId = rawId != null ? String(rawId) : '';
-        const eventName = match?.event?.name || 'Unknown Match';
-        const eventDate = match?.event?.openDate || null;
-
-        // Lookup by string so number/string from API both match DB
-        const isEnabled = eventId ? (visibilityMap.get(eventId) ?? true) : true;
-
-        return {
-          eventId,
-          name: eventName,
-          isEnabled,
-          date: eventDate ? new Date(eventDate).toISOString() : null,
-        };
-      });
-
-      // Remove duplicates by eventId (keep first occurrence)
-      const uniqueMatches = Array.from(
-        new Map(matchesWithVisibility.map((m) => [m.eventId, m])).values(),
-      );
-
-      // Also include matches that are in visibility DB but not in current vendor data
-      for (const visibility of visibilityRecords) {
-        const exists = uniqueMatches.some((m) => m.eventId === visibility.eventId);
-        if (!exists) {
-          uniqueMatches.push({
-            eventId: visibility.eventId,
-            name: 'Match not available in vendor API',
-            isEnabled: visibility.isEnabled,
-            date: null, // No date available for matches not in vendor API
-          });
-        }
-      }
-
-      return uniqueMatches.sort((a, b) => a.name.localeCompare(b.name));
-    } catch (error) {
-      return {
-        success: false,
-        message: error instanceof Error ? error.message : 'Failed to fetch matches',
-        error: 'Internal Server Error',
-      };
-    }
   }
 
   /**

@@ -780,8 +780,8 @@ export class CricketIdService {
   async getEventsBySportId(sportId: string | number) {
     const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
 
-    // v4: same shape but only list rows with MarketType MATCH_ODDS (vendor sends multiple market types per event).
-    const cacheKey = this.redisService.getVendorKey('events-by-sport-v4', String(sid));
+    // v7: MATCH_ODDS only; excludes selected competitions from the list.
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v7', String(sid));
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
@@ -819,7 +819,27 @@ export class CricketIdService {
       const mt = String(item?.MarketType ?? item?.marketType ?? '').trim().toUpperCase();
       return mt === 'MATCH_ODDS' || mt === 'MATCHODDS';
     };
-    const matchOddsEvents = events.filter(isMatchOddsListRow);
+    const listCompetitionName = (item: any) =>
+      String(
+        item?.Competition ??
+          item?.competition ??
+          item?.competitionName ??
+          item?.event?.competition?.name ??
+          '',
+      )
+        .trim()
+        .toLowerCase();
+    const EXCLUDED_SPORT_LIST_COMPETITIONS = new Set([
+      'county championship',
+      'international twenty20 matches',
+      'mumbai premier league',
+    ]);
+    const isExcludedCompetitionForSportList = (item: any) =>
+      EXCLUDED_SPORT_LIST_COMPETITIONS.has(listCompetitionName(item));
+
+    const matchOddsEvents = events
+      .filter(isMatchOddsListRow)
+      .filter((item) => !isExcludedCompetitionForSportList(item));
 
     const transformed = matchOddsEvents.map((item) => {
       const eventId = item?.event?.id ?? item?.eventId ?? item?.id ?? item?.EventId;
