@@ -17,6 +17,7 @@ import { BetProcessingQueue } from './bet-processing.queue';
 @Injectable()
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
+  private readonly MATCH_ODDS_BLOCKED_EVENTS_KEY = 'blocked_matchodds_event_ids';
 
   constructor(
     private readonly prisma: PrismaService,
@@ -26,6 +27,55 @@ export class BetsService {
     private readonly fancyExposureService: FancyExposureService,
     private readonly betProcessingQueue: BetProcessingQueue,
   ) {}
+
+  private parseBlockedMatchOddsEventIds(rawValue: string | null | undefined): Set<string> {
+    if (!rawValue) return new Set<string>();
+    try {
+      const parsed = JSON.parse(rawValue);
+      if (!Array.isArray(parsed)) return new Set<string>();
+      return new Set(parsed.map((v) => String(v).trim()).filter(Boolean));
+    } catch {
+      return new Set<string>();
+    }
+  }
+
+  async setMatchOddsBlockedForEvent(eventId: string, blocked: boolean) {
+    const normalizedEventId = String(eventId || '').trim();
+    if (!normalizedEventId) {
+      throw new BadRequestException('eventId is required');
+    }
+
+    const existing = await this.prisma.setting.findUnique({
+      where: { key: this.MATCH_ODDS_BLOCKED_EVENTS_KEY },
+      select: { value: true },
+    });
+
+    const blockedSet = this.parseBlockedMatchOddsEventIds(existing?.value);
+    if (blocked) blockedSet.add(normalizedEventId);
+    else blockedSet.delete(normalizedEventId);
+
+    const value = JSON.stringify(Array.from(blockedSet));
+    await this.prisma.setting.upsert({
+      where: { key: this.MATCH_ODDS_BLOCKED_EVENTS_KEY },
+      update: { value },
+      create: { key: this.MATCH_ODDS_BLOCKED_EVENTS_KEY, value },
+    });
+
+    return {
+      eventId: normalizedEventId,
+      blocked,
+      totalBlockedEvents: blockedSet.size,
+    };
+  }
+
+  async getBlockedMatchOddsEvents() {
+    const existing = await this.prisma.setting.findUnique({
+      where: { key: this.MATCH_ODDS_BLOCKED_EVENTS_KEY },
+      select: { value: true },
+    });
+    const blockedSet = this.parseBlockedMatchOddsEventIds(existing?.value);
+    return Array.from(blockedSet);
+  }
 
   /**
    * ✅ EXCHANGE-ACCURATE LIABILITY CALCULATION
@@ -504,6 +554,22 @@ export class BetsService {
     // Handle "match" as alias for "matchodds"
     if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
       actualMarketType = 'matchodds';
+    }
+
+    // Global admin control: stop Match Odds betting for a specific event across all clients.
+    if (actualMarketType === 'matchodds') {
+      const normalizedEventId = String(eventId || match_id || '').trim();
+      if (normalizedEventId) {
+        const blockedEventIds = await this.getBlockedMatchOddsEvents();
+        if (blockedEventIds.includes(normalizedEventId)) {
+          throw new BadRequestException({
+            success: false,
+            error: 'Match Odds betting is stopped for this match by admin.',
+            code: 'MATCH_ODDS_STOPPED_FOR_MATCH',
+            eventId: normalizedEventId,
+          });
+        }
+      }
     }
 
     if (!['matchodds', 'fancy', 'bookmaker'].includes(actualMarketType)) {

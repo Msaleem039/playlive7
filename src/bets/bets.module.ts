@@ -19,6 +19,7 @@ import { BetProcessingWorker } from './bet-processing.worker';
     BetProcessingQueue,
     BetProcessingWorker,
   ],
+  exports: [BetsService],
 })
 export class BetsModule {}
 
