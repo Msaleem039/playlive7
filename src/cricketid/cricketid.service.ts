@@ -780,8 +780,8 @@ export class CricketIdService {
   async getEventsBySportId(sportId: string | number) {
     const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
 
-    // v7: MATCH_ODDS only; excludes selected competitions from the list.
-    const cacheKey = this.redisService.getVendorKey('events-by-sport-v7', String(sid));
+    // v9: MATCH_ODDS only; allow-list selected competitionIds for sport list.
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v9', String(sid));
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
@@ -829,17 +829,24 @@ export class CricketIdService {
       )
         .trim()
         .toLowerCase();
-    const EXCLUDED_SPORT_LIST_COMPETITIONS = new Set([
-      'county championship',
-      'international twenty20 matches',
-      'mumbai premier league',
+    const ALLOWED_SPORT_LIST_COMPETITION_IDS = new Set([
+      '101480',
+      '10693181',
+      '12649673',
     ]);
-    const isExcludedCompetitionForSportList = (item: any) =>
-      EXCLUDED_SPORT_LIST_COMPETITIONS.has(listCompetitionName(item));
+    const listCompetitionId = (item: any) =>
+      String(
+        item?.CompetitionId ??
+          item?.competitionId ??
+          item?.event?.competition?.id ??
+          '',
+      ).trim();
+    const isAllowedCompetitionForSportList = (item: any) =>
+      ALLOWED_SPORT_LIST_COMPETITION_IDS.has(listCompetitionId(item));
 
     const matchOddsEvents = events
       .filter(isMatchOddsListRow)
-      .filter((item) => !isExcludedCompetitionForSportList(item));
+      .filter((item) => isAllowedCompetitionForSportList(item));
 
     const transformed = matchOddsEvents.map((item) => {
       const eventId = item?.event?.id ?? item?.eventId ?? item?.id ?? item?.EventId;

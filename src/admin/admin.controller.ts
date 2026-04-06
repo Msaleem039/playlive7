@@ -6,12 +6,14 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { User } from '@prisma/client';
 import { UserRole } from '@prisma/client';
 import { MatchVisibilityService } from '../cricketid/match-visibility.service';
+import { BetsService } from '../bets/bets.service';
 
 @Controller('admin')
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class AdminController {
   constructor(
     private readonly matchVisibilityService: MatchVisibilityService,
+    private readonly betsService: BetsService,
   ) {}
 
   @Get('dashboard')
@@ -109,5 +111,48 @@ export class AdminController {
         error: 'Internal Server Error',
       };
     }
+  }
+
+  /**
+   * PATCH /admin/matchodds/stop/:eventId
+   * Stop/allow Match Odds betting for a specific match (all clients).
+   * Body: { blocked: boolean }
+   */
+  @Patch('matchodds/stop/:eventId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  async setMatchOddsStopForEvent(
+    @Param('eventId') eventId: string,
+    @Body() body: { blocked?: boolean },
+  ) {
+    if (typeof body?.blocked !== 'boolean') {
+      return {
+        success: false,
+        message: 'blocked must be a boolean value',
+      };
+    }
+
+    const result = await this.betsService.setMatchOddsBlockedForEvent(eventId, body.blocked);
+    return {
+      success: true,
+      message: body.blocked
+        ? `Match Odds betting stopped for eventId ${result.eventId}`
+        : `Match Odds betting resumed for eventId ${result.eventId}`,
+      ...result,
+    };
+  }
+
+  /**
+   * GET /admin/matchodds/stop
+   * Returns list of eventIds currently blocked for Match Odds.
+   */
+  @Get('matchodds/stop')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  async getStoppedMatchOddsEvents() {
+    const eventIds = await this.betsService.getBlockedMatchOddsEvents();
+    return {
+      success: true,
+      total: eventIds.length,
+      eventIds,
+    };
   }
 }
