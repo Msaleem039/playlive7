@@ -1017,7 +1017,13 @@ export class AuthService {
 
     const downlineApplied = applyToDownline ? ' and entire downline' : ' (this user only)';
     return {
+      success: true,
       message: `Betting ${bettingEnabled ? 'enabled' : 'disabled'} for user${downlineApplied}`,
+      status: bettingEnabled ? 'ALLOWED' : 'STOPPED',
+      action: bettingEnabled ? 'ALLOW' : 'STOP',
+      isBettingAllowed: bettingEnabled,
+      isBettingStopped: !bettingEnabled,
+      appliedToDownline: applyToDownline,
       user: updated,
     };
   }

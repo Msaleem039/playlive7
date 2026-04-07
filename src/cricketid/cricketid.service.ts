@@ -780,8 +780,10 @@ export class CricketIdService {
   async getEventsBySportId(sportId: string | number) {
     const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
 
-    // v9: MATCH_ODDS only; allow-list selected competitionIds for sport list.
-    const cacheKey = this.redisService.getVendorKey('events-by-sport-v9', String(sid));
+    // v10: MATCH_ODDS only.
+    // - Cricket (4): allow-list selected competitionIds
+    // - Others: return only top 5 matches
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v10', String(sid));
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
@@ -829,7 +831,7 @@ export class CricketIdService {
       )
         .trim()
         .toLowerCase();
-    const ALLOWED_SPORT_LIST_COMPETITION_IDS = new Set([
+    const ALLOWED_CRICKET_COMPETITION_IDS = new Set([
       '101480',
       '10693181',
       '12649673',
@@ -841,12 +843,12 @@ export class CricketIdService {
           item?.event?.competition?.id ??
           '',
       ).trim();
-    const isAllowedCompetitionForSportList = (item: any) =>
-      ALLOWED_SPORT_LIST_COMPETITION_IDS.has(listCompetitionId(item));
+    const isAllowedCricketCompetitionForSportList = (item: any) =>
+      ALLOWED_CRICKET_COMPETITION_IDS.has(listCompetitionId(item));
 
     const matchOddsEvents = events
       .filter(isMatchOddsListRow)
-      .filter((item) => isAllowedCompetitionForSportList(item));
+      .filter((item) => (sid === 4 ? isAllowedCricketCompetitionForSportList(item) : true));
 
     const transformed = matchOddsEvents.map((item) => {
       const eventId = item?.event?.id ?? item?.eventId ?? item?.id ?? item?.EventId;
@@ -875,8 +877,15 @@ export class CricketIdService {
     });
 
     // Match aggregator shape: only live/upcoming buckets.
-    const live = uniqueMatches.filter((m) => m.live === true);
-    const upcoming = uniqueMatches.filter((m) => m.upcoming === true);
+    let live = uniqueMatches.filter((m) => m.live === true);
+    let upcoming = uniqueMatches.filter((m) => m.upcoming === true);
+
+    // For non-cricket sports, keep the response small: 5 matches max (live first, then upcoming).
+    if (sid !== 4) {
+      live = live.slice(0, 5);
+      const remaining = 5 - live.length;
+      upcoming = remaining > 0 ? upcoming.slice(0, remaining) : [];
+    }
     const response = {
       total: live.length + upcoming.length,
       live,

@@ -122,21 +122,39 @@ export class AdminController {
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
   async setMatchOddsStopForEvent(
     @Param('eventId') eventId: string,
-    @Body() body: { blocked?: boolean },
+    @Body() body: { blocked?: boolean; status?: boolean | string },
   ) {
-    if (typeof body?.blocked !== 'boolean') {
+    let blocked: boolean | null = null;
+    if (typeof body?.blocked === 'boolean') {
+      blocked = body.blocked;
+    } else if (typeof body?.status === 'boolean') {
+      blocked = body.status;
+    } else if (typeof body?.status === 'string') {
+      const normalized = body.status.trim().toLowerCase();
+      if (normalized === 'true' || normalized === 'stop' || normalized === 'stopped') {
+        blocked = true;
+      } else if (normalized === 'false' || normalized === 'allow' || normalized === 'allowed') {
+        blocked = false;
+      }
+    }
+
+    if (blocked === null) {
       return {
         success: false,
-        message: 'blocked must be a boolean value',
+        message: 'Provide blocked (boolean) or status ("true"/"false"/"STOPPED"/"ALLOWED")',
       };
     }
 
-    const result = await this.betsService.setMatchOddsBlockedForEvent(eventId, body.blocked);
+    const result = await this.betsService.setMatchOddsBlockedForEvent(eventId, blocked);
     return {
       success: true,
-      message: body.blocked
+      message: blocked
         ? `Match Odds betting stopped for eventId ${result.eventId}`
         : `Match Odds betting resumed for eventId ${result.eventId}`,
+      status: blocked ? 'STOPPED' : 'ALLOWED',
+      action: blocked ? 'STOP' : 'ALLOW',
+      isMatchOddsBlocked: blocked,
+      isMatchOddsAllowed: !blocked,
       ...result,
     };
   }
@@ -151,6 +169,7 @@ export class AdminController {
     const eventIds = await this.betsService.getBlockedMatchOddsEvents();
     return {
       success: true,
+      status: 'ACTIVE_BLOCKLIST',
       total: eventIds.length,
       eventIds,
     };

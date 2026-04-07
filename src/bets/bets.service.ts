@@ -564,8 +564,8 @@ export class BetsService {
         if (blockedEventIds.includes(normalizedEventId)) {
           throw new BadRequestException({
             success: false,
-            error: 'Match Odds betting is stopped for this match by admin.',
-            code: 'MATCH_ODDS_STOPPED_FOR_MATCH',
+            error: 'rate not matched or rate is not available.',
+            code: 'RATE_NOT_MATCHED_OR_NOT_AVAILABLE',
             eventId: normalizedEventId,
           });
         }
