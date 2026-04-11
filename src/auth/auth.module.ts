@@ -50,6 +50,6 @@ import { SettlementModule } from '../settlement/settlement.module';
   ],
   providers: [AuthService, JwtStrategy, AccountStatementService],
   controllers: [AuthController],
-  exports: [JwtModule, PassportModule],
+  exports: [JwtModule, PassportModule, AuthService],
 })
 export class AuthModule {}

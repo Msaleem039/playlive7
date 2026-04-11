@@ -1,4 +1,12 @@
-import { Injectable, ConflictException, UnauthorizedException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  ConflictException,
+  UnauthorizedException,
+  ForbiddenException,
+  BadRequestException,
+  NotFoundException,
+  Logger,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { UsersService } from '../users/users.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -14,6 +22,8 @@ import * as bcrypt from 'bcrypt';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private usersService: UsersService,
     private jwtService: JwtService,
@@ -84,6 +94,66 @@ export class AuthService {
         balance: wallet?.balance ?? 0,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
+      },
+      accessToken,
+    };
+  }
+
+  /**
+   * Super Admin only: issue a JWT as the target user (Agent or Client) for support / debugging.
+   * Password is never read or returned. Token payload includes `impersonatedBy` (super admin id).
+   */
+  async loginAsUser(superAdmin: User, targetUserId: string) {
+    if (superAdmin.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('Only Super Admin can impersonate users');
+    }
+
+    if (targetUserId === superAdmin.id) {
+      throw new BadRequestException('Cannot impersonate your own account');
+    }
+
+    const target = await this.usersService.findById(targetUserId);
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (target.role !== UserRole.AGENT && target.role !== UserRole.CLIENT) {
+      throw new ForbiddenException(
+        'Impersonation is only allowed for AGENT or CLIENT accounts',
+      );
+    }
+
+    if (!target.isActive) {
+      throw new ForbiddenException('Cannot impersonate an inactive user');
+    }
+
+    const payload = {
+      sub: target.id,
+      username: target.username,
+      role: target.role,
+      impersonatedBy: superAdmin.id,
+    };
+    const accessToken = this.jwtService.sign(payload);
+
+    this.logger.warn(
+      `Impersonation token issued: superAdminId=${superAdmin.id} → targetUserId=${target.id} role=${target.role}`,
+    );
+
+    const wallet = await this.prisma.wallet.findUnique({
+      where: { userId: target.id },
+    });
+
+    return {
+      success: true,
+      impersonatedBy: superAdmin.id,
+      user: {
+        id: target.id,
+        name: target.name,
+        username: target.username,
+        role: target.role,
+        balance: wallet?.balance ?? 0,
+        createdAt: target.createdAt,
+        updatedAt: target.updatedAt,
       },
       accessToken,
     };
@@ -650,14 +720,41 @@ export class AuthService {
         const totalRecords = statementEntries.length;
         const page = Math.floor(offset / limit) + 1;
         const paginatedStatement = statementEntries.slice(offset, offset + limit);
+        const transferLogs = transferLogsMap.get(user.id) || [];
+        const transactions = transferLogs.map((log) => {
+          const isCashIn = log.type === TransferLogType.TOPUP && log.toUserId === user.id;
+          const isCashOut = log.type === TransferLogType.TOPDOWN && log.fromUserId === user.id;
+
+          return {
+            id: log.id,
+            date: log.createdAt,
+            type: isCashIn ? 'CashIn' : 'CashOut',
+            description: isCashIn
+              ? `CashIn To ${log.remarks || ''}`.trim() || 'CashIn To'
+              : `CashOut From ${log.remarks || ''}`.trim() || 'CashOut From',
+            transferType: log.type,
+            result: null,
+            credit: isCashIn ? log.amount : 0,
+            debit: isCashOut ? log.amount : 0,
+            amount: log.amount,
+          };
+        });
 
         return {
           success: true,
           user: {
             id: user.id,
+            name: user.name,
+            username: user.username,
+            role: user.role,
+            balance,
+            liability: user.wallet?.liability ?? 0,
+            availableBalance: balance - (user.wallet?.liability ?? 0),
+            profitLoss: pnlMap[user.id] ?? 0,
             openingBalance,
           },
           statement: paginatedStatement,
+          transactions,
           pagination: {
             page,
             limit,

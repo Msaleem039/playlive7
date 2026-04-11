@@ -1,4 +1,13 @@
-import { Controller, Get, Patch, Param, Body, UseGuards, ValidationPipe } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Patch,
+  Post,
+  Param,
+  Body,
+  UseGuards,
+  ValidationPipe,
+} from '@nestjs/common';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -7,6 +16,7 @@ import type { User } from '@prisma/client';
 import { UserRole } from '@prisma/client';
 import { MatchVisibilityService } from '../cricketid/match-visibility.service';
 import { BetsService } from '../bets/bets.service';
+import { AuthService } from '../auth/auth.service';
 
 @Controller('admin')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -14,7 +24,21 @@ export class AdminController {
   constructor(
     private readonly matchVisibilityService: MatchVisibilityService,
     private readonly betsService: BetsService,
+    private readonly authService: AuthService,
   ) {}
+
+  /**
+   * Super Admin only: obtain a JWT for an Agent or Client without their password.
+   * Token payload includes `impersonatedBy` (super admin user id). Use `Authorization: Bearer <accessToken>` as usual.
+   */
+  @Post('login-as-user/:userId')
+  @Roles(UserRole.SUPER_ADMIN)
+  async loginAsUser(
+    @Param('userId') userId: string,
+    @CurrentUser() currentUser: User,
+  ) {
+    return this.authService.loginAsUser(currentUser, userId);
+  }
 
   @Get('dashboard')
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)

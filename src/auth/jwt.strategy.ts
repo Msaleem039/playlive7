@@ -59,6 +59,15 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         this.logger.debug(`JWT validated successfully for user: ${user.username} (${user.id})`);
       }
 
+      const impersonatedBy =
+        typeof payload.impersonatedBy === 'string' && payload.impersonatedBy.length > 0
+          ? payload.impersonatedBy
+          : undefined;
+
+      if (impersonatedBy) {
+        return { ...user, impersonatedBy };
+      }
+
       return user;
     } catch (error) {
       // If it's already an UnauthorizedException, re-throw it
@@ -96,6 +105,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
             password: '',
             createdAt: new Date(),
             updatedAt: new Date(),
+            ...(typeof payload.impersonatedBy === 'string'
+              ? { impersonatedBy: payload.impersonatedBy }
+              : {}),
           };
         }
       }

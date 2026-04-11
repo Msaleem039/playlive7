@@ -319,10 +319,11 @@ export class SettlementAdminController {
    * - marketType: Filter by market type (FANCY, MATCH_ODDS, BOOKMAKER)
    * - isRollback: Filter by rollback status (true/false)
    * - settledBy: Filter by who settled (user ID or "AUTO")
-   * - startDate: Filter from date (ISO string)
-   * - endDate: Filter to date (ISO string)
+   * - startDate: Start of day in Asia/Karachi (prefer YYYY-MM-DD; avoids UTC-midnight parsing bugs)
+   * - endDate: End of day in Asia/Karachi (same)
    * - limit: Number of results (default: 100)
    * - offset: Pagination offset (default: 0)
+   * - includeSettlementsWithoutBets: If true, include settlement rows with no bets left (audit orphans). Default false.
    */
   @Get('history')
   async getSettlementHistory(
@@ -332,6 +333,7 @@ export class SettlementAdminController {
     @Query('settledBy') settledBy?: string,
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
+    @Query('includeSettlementsWithoutBets') includeSettlementsWithoutBets?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ) {
@@ -359,28 +361,54 @@ export class SettlementAdminController {
       filters.settledBy = settledBy;
     }
 
+    const dateOnlyPkt = /^\d{4}-\d{2}-\d{2}$/;
+
     if (startDate) {
       try {
-        const parsedStartDate = new Date(startDate);
-        if (isNaN(parsedStartDate.getTime())) {
-          throw new BadRequestException(`Invalid startDate format: ${startDate}. Expected ISO 8601 format.`);
+        const trimmed = startDate.trim();
+        if (dateOnlyPkt.test(trimmed)) {
+          filters.startDate = trimmed;
+        } else {
+          const parsedStartDate = new Date(trimmed);
+          if (isNaN(parsedStartDate.getTime())) {
+            throw new BadRequestException(
+              `Invalid startDate format: ${startDate}. Use YYYY-MM-DD (PKT calendar day) or ISO 8601.`,
+            );
+          }
+          filters.startDate = parsedStartDate;
         }
-        filters.startDate = parsedStartDate;
       } catch (error) {
+        if (error instanceof BadRequestException) {
+          throw error;
+        }
         throw new BadRequestException(`Invalid startDate: ${startDate}. ${(error as Error).message}`);
       }
     }
 
     if (endDate) {
       try {
-        const parsedEndDate = new Date(endDate);
-        if (isNaN(parsedEndDate.getTime())) {
-          throw new BadRequestException(`Invalid endDate format: ${endDate}. Expected ISO 8601 format.`);
+        const trimmed = endDate.trim();
+        if (dateOnlyPkt.test(trimmed)) {
+          filters.endDate = trimmed;
+        } else {
+          const parsedEndDate = new Date(trimmed);
+          if (isNaN(parsedEndDate.getTime())) {
+            throw new BadRequestException(
+              `Invalid endDate format: ${endDate}. Use YYYY-MM-DD (PKT calendar day) or ISO 8601.`,
+            );
+          }
+          filters.endDate = parsedEndDate;
         }
-        filters.endDate = parsedEndDate;
       } catch (error) {
+        if (error instanceof BadRequestException) {
+          throw error;
+        }
         throw new BadRequestException(`Invalid endDate: ${endDate}. ${(error as Error).message}`);
       }
+    }
+
+    if (includeSettlementsWithoutBets === 'true') {
+      filters.includeSettlementsWithoutBets = true;
     }
 
     if (limit) {

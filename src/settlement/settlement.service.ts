@@ -1,4 +1,5 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { formatInTimeZone, fromZonedTime as zonedTimeToUtc } from 'date-fns-tz';
 import { PrismaClient, BetStatus, MarketType, TransactionType, TransferLogType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AggregatorService } from '../cricketid/aggregator.service';
@@ -225,6 +226,29 @@ export class SettlementService {
       return { success: true, message: 'No pending bets to settle' };
     }
 
+    // Same as other markets: persist a row in `settlements` (bets stay in `bets` and link via settlement_id).
+    // FANCY: winnerId stores decision run (runs scored); null when void/cancel.
+    const fancyMarketId = marketId ?? bets[0]?.marketId ?? null;
+    await this.prisma.settlement.upsert({
+      where: { settlementId },
+      update: {
+        isRollback: false,
+        settledBy: adminId,
+        winnerId: isCancel ? null : String(actualRuns),
+        ...(fancyMarketId != null && fancyMarketId !== ''
+          ? { marketId: fancyMarketId }
+          : {}),
+      },
+      create: {
+        settlementId,
+        eventId,
+        marketType: MarketType.FANCY,
+        marketId: fancyMarketId,
+        winnerId: isCancel ? null : String(actualRuns),
+        settledBy: adminId,
+      },
+    });
+
     const betsByUser = new Map<string, typeof bets>();
     for (const bet of bets) {
       if (!betsByUser.has(bet.userId)) betsByUser.set(bet.userId, []);
@@ -290,6 +314,7 @@ export class SettlementService {
             await tx.bet.update({
               where: { id: bet.id },
               data: {
+                settlementId,
                 status: BetStatus.CANCELLED,
                 pnl: 0,
                 settledAt: new Date(),
@@ -448,6 +473,7 @@ export class SettlementService {
               await tx.bet.update({
                 where: { id: bet.id },
                 data: {
+                  settlementId,
                   status: BetStatus.WON,
                   pnl,
                   settledAt: new Date(),
@@ -482,6 +508,7 @@ export class SettlementService {
               await tx.bet.update({
                 where: { id: bet.id },
                 data: {
+                  settlementId,
                   status: BetStatus.LOST,
                   pnl,
                   settledAt: new Date(),
@@ -2619,6 +2646,7 @@ export class SettlementService {
               tx.bet.update({
                 where: { id: update.id },
                 data: {
+                  settlementId,
                   status: update.status,
                   pnl: update.pnl,
                   settledAt: now,
@@ -2649,6 +2677,7 @@ export class SettlementService {
             tx.bet.update({
               where: { id: update.id },
               data: {
+                settlementId,
                 status: update.status,
                 pnl: update.pnl,
                 settledAt: now,
@@ -3296,6 +3325,19 @@ export class SettlementService {
         `settlementId: ${settlementId}, eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}`,
       );
 
+      const matchOddsBetsToNormalize = bets.filter(
+        (bet) => !bet.settlementId?.startsWith('CRICKET:MATCHODDS:'),
+      );
+      if (matchOddsBetsToNormalize.length > 0) {
+        await this.prisma.bet.updateMany({
+          where: { id: { in: matchOddsBetsToNormalize.map((b) => b.id) } },
+          data: { settlementId },
+        });
+        this.logger.log(
+          `Normalized ${matchOddsBetsToNormalize.length} match-odds bet(s) to settlementId=${settlementId}`,
+        );
+      }
+
       // 🔐 STRICT TIE HANDLING: Check for tie result using market runners
       // ✅ CORRECT RULE: Market runners define outcome - never bets
       // isCancel can be forced by admin (explicit cancel/refund) or inferred from tie rules
@@ -3562,6 +3604,19 @@ export class SettlementService {
         `settlementId: ${settlementId}, eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}`,
       );
 
+      const bookmakerBetsToNormalize = bets.filter(
+        (bet) => !bet.settlementId?.startsWith('CRICKET:BOOKMAKER:'),
+      );
+      if (bookmakerBetsToNormalize.length > 0) {
+        await this.prisma.bet.updateMany({
+          where: { id: { in: bookmakerBetsToNormalize.map((b) => b.id) } },
+          data: { settlementId },
+        });
+        this.logger.log(
+          `Normalized ${bookmakerBetsToNormalize.length} bookmaker bet(s) to settlementId=${settlementId}`,
+        );
+      }
+
       // Create settlement record
       await this.createSettlementRecord(
         settlementId,
@@ -3824,6 +3879,7 @@ export class SettlementService {
                 tx.bet.update({
                   where: { id: update.id },
                   data: {
+                    settlementId,
                     status: update.status,
                     // @ts-ignore
                     pnl: update.pnl,
@@ -4374,6 +4430,7 @@ export class SettlementService {
                 tx.bet.update({
                   where: { id: update.id },
                   data: {
+                    settlementId,
                     status: update.status,
                     // @ts-ignore
                     pnl: update.pnl,
@@ -4497,6 +4554,7 @@ export class SettlementService {
             await tx.bet.update({
               where: { id: bet.id },
               data: {
+                settlementId,
                 status: BetStatus.CANCELLED,
                 pnl: 0,
                 settledAt: now,
@@ -8057,6 +8115,59 @@ export class SettlementService {
     };
   }
 
+  private static readonly SETTLEMENT_HISTORY_FILTER_TZ = 'Asia/Karachi';
+
+  /**
+   * Calendar day in Asia/Karachi → UTC bounds for DB queries.
+   * Plain `YYYY-MM-DD` is that calendar date in PKT (not `Date`’s UTC-midnight parsing).
+   * For Date/ISO values, the PKT calendar day is derived via {@link formatInTimeZone}.
+   */
+  private settlementHistoryFilterPktBoundUtc(
+    value: Date | string,
+    bound: 'start' | 'end',
+  ): Date | null {
+    const tz = SettlementService.SETTLEMENT_HISTORY_FILTER_TZ;
+    let ymd: string | null = null;
+
+    if (typeof value === 'string') {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+      if (m) {
+        ymd = `${m[1]}-${m[2]}-${m[3]}`;
+      } else {
+        const t = Date.parse(value);
+        if (Number.isNaN(t)) {
+          return null;
+        }
+        ymd = formatInTimeZone(t, tz, 'yyyy-MM-dd');
+      }
+    } else {
+      if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+        return null;
+      }
+      ymd = formatInTimeZone(value, tz, 'yyyy-MM-dd');
+    }
+
+    const wall =
+      bound === 'start' ? `${ymd}T00:00:00.000` : `${ymd}T23:59:59.999`;
+    return zonedTimeToUtc(wall, tz);
+  }
+
+  /** ISO-like instant formatted in Asia/Karachi for admin APIs (avoids client TZ misreads of UTC). */
+  private formatInstantPkt(date: Date | null | undefined): string | null {
+    if (date == null) {
+      return null;
+    }
+    const d = date instanceof Date ? date : new Date(date);
+    if (Number.isNaN(d.getTime())) {
+      return null;
+    }
+    return formatInTimeZone(
+      d,
+      SettlementService.SETTLEMENT_HISTORY_FILTER_TZ,
+      "yyyy-MM-dd HH:mm:ss XXX",
+    );
+  }
+
   /**
    * Get all settlements with detailed information
    * Includes bet counts, amounts, and can be filtered
@@ -8066,8 +8177,10 @@ export class SettlementService {
     marketType?: MarketType;
     isRollback?: boolean;
     settledBy?: string;
-    startDate?: Date;
-    endDate?: Date;
+    startDate?: Date | string;
+    endDate?: Date | string;
+    /** When false (default), only settlements that still have ≥1 bet with matching settlementId. */
+    includeSettlementsWithoutBets?: boolean;
     limit?: number;
     offset?: number;
   }) {
@@ -8075,7 +8188,8 @@ export class SettlementService {
       `[GET ALL SETTLEMENTS] Filters: eventId=${filters?.eventId}, ` +
       `marketType=${filters?.marketType}, isRollback=${filters?.isRollback}, ` +
       `settledBy=${filters?.settledBy}, startDate=${filters?.startDate}, ` +
-      `endDate=${filters?.endDate}, limit=${filters?.limit}, offset=${filters?.offset}`
+      `endDate=${filters?.endDate}, includeSettlementsWithoutBets=${filters?.includeSettlementsWithoutBets}, ` +
+      `limit=${filters?.limit}, offset=${filters?.offset}`
     );
 
     const where: any = {};
@@ -8099,30 +8213,76 @@ export class SettlementService {
     if (filters?.startDate || filters?.endDate) {
       where.createdAt = {};
       if (filters.startDate) {
-        // Ensure date is valid
-        const startDate = new Date(filters.startDate);
-        if (isNaN(startDate.getTime())) {
+        const startUtc = this.settlementHistoryFilterPktBoundUtc(
+          filters.startDate,
+          'start',
+        );
+        if (!startUtc) {
           this.logger.warn(`Invalid startDate: ${filters.startDate}`);
         } else {
-          where.createdAt.gte = startDate;
-          this.logger.log(`[GET ALL SETTLEMENTS] Filtering by startDate: ${startDate.toISOString()}`);
+          where.createdAt.gte = startUtc;
+          this.logger.log(
+            `[GET ALL SETTLEMENTS] startDate PKT 00:00:00 → UTC: ${startUtc.toISOString()}`,
+          );
         }
       }
       if (filters.endDate) {
-        // Ensure date is valid
-        const endDate = new Date(filters.endDate);
-        if (isNaN(endDate.getTime())) {
+        const endUtc = this.settlementHistoryFilterPktBoundUtc(filters.endDate, 'end');
+        if (!endUtc) {
           this.logger.warn(`Invalid endDate: ${filters.endDate}`);
         } else {
-          where.createdAt.lte = endDate;
-          this.logger.log(`[GET ALL SETTLEMENTS] Filtering by endDate: ${endDate.toISOString()}`);
+          where.createdAt.lte = endUtc;
+          this.logger.log(
+            `[GET ALL SETTLEMENTS] endDate PKT 23:59:59.999 → UTC: ${endUtc.toISOString()}`,
+          );
+        }
       }
     }
+
+    const tz = SettlementService.SETTLEMENT_HISTORY_FILTER_TZ;
+    const emptyHistoryResponse = () => ({
+      success: true as const,
+      meta: {
+        timeZone: tz,
+        nowUtc: new Date().toISOString(),
+        todayPkt: formatInTimeZone(new Date(), tz, 'yyyy-MM-dd'),
+      },
+      data: [] as any[],
+      pagination: {
+        total: 0,
+        limit: filters?.limit || 100,
+        offset: filters?.offset || 0,
+        hasMore: false,
+      },
+    });
+
+    // Settlements and bets are separate tables; deleting bets leaves orphan settlement rows.
+    // By default, only list settlements that still have at least one linked bet.
+    if (!filters?.includeSettlementsWithoutBets) {
+      const withBets = await this.prisma.bet.groupBy({
+        by: ['settlementId'],
+        where: {
+          settlementId: { not: null },
+        },
+      });
+      const settlementIdsHavingBets = [
+        ...new Set(
+          withBets
+            .map((r) => r.settlementId)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        ),
+      ];
+      if (settlementIdsHavingBets.length === 0) {
+        this.logger.log(
+          '[GET ALL SETTLEMENTS] No bets with settlementId — returning empty history (?includeSettlementsWithoutBets=true shows orphan settlement rows)',
+        );
+        return emptyHistoryResponse();
+      }
+      where.settlementId = { in: settlementIdsHavingBets };
     }
 
-    // Debug: Check total settlements before filtering
-    const totalSettlementsCount = await this.prisma.settlement.count({});
-    this.logger.log(`[GET ALL SETTLEMENTS] Total settlements in database: ${totalSettlementsCount}`);
+    const totalSettlementsCount = await this.prisma.settlement.count({ where });
+    this.logger.log(`[GET ALL SETTLEMENTS] Settlements matching where: ${totalSettlementsCount}`);
 
     const settlements = await this.prisma.settlement.findMany({
       where,
@@ -8543,6 +8703,7 @@ export class SettlementService {
           settledBy: settlement.settledBy,
           isRollback: settlement.isRollback,
           createdAt: settlement.createdAt,
+          createdAtPkt: this.formatInstantPkt(settlement.createdAt),
           match: matchInfo
             ? {
                 id: matchInfo.id,
@@ -8588,6 +8749,9 @@ export class SettlementService {
               settledAt: bet.settledAt,
               rollbackAt: bet.rollbackAt,
               createdAt: bet.createdAt,
+              settledAtPkt: this.formatInstantPkt(bet.settledAt),
+              rollbackAtPkt: this.formatInstantPkt(bet.rollbackAt),
+              createdAtPkt: this.formatInstantPkt(bet.createdAt),
               decisionRun,
             };
           }),
@@ -8604,6 +8768,11 @@ export class SettlementService {
 
     return {
       success: true,
+      meta: {
+        timeZone: tz,
+        nowUtc: new Date().toISOString(),
+        todayPkt: formatInTimeZone(new Date(), tz, 'yyyy-MM-dd'),
+      },
       data: settlementsWithDetails,
       pagination: {
         total: totalCount,
@@ -8684,8 +8853,14 @@ export class SettlementService {
 
     const matchInfo = bets[0]?.match || null;
 
+    const tz = SettlementService.SETTLEMENT_HISTORY_FILTER_TZ;
     return {
       success: true,
+      meta: {
+        timeZone: tz,
+        nowUtc: new Date().toISOString(),
+        todayPkt: formatInTimeZone(new Date(), tz, 'yyyy-MM-dd'),
+      },
       data: {
         id: settlement.id,
         settlementId: settlement.settlementId,
@@ -8696,6 +8871,7 @@ export class SettlementService {
         settledBy: settlement.settledBy,
         isRollback: settlement.isRollback,
         createdAt: settlement.createdAt,
+        createdAtPkt: this.formatInstantPkt(settlement.createdAt),
         match: matchInfo
           ? {
               id: matchInfo.id,
@@ -8729,6 +8905,9 @@ export class SettlementService {
           settledAt: bet.settledAt,
           rollbackAt: bet.rollbackAt,
           createdAt: bet.createdAt,
+          settledAtPkt: this.formatInstantPkt(bet.settledAt),
+          rollbackAtPkt: this.formatInstantPkt(bet.rollbackAt),
+          createdAtPkt: this.formatInstantPkt(bet.createdAt),
         })),
       },
     };
