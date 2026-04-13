@@ -7,8 +7,10 @@ import {
   calculateMatchOddsPosition, 
   calculateBookmakerPosition,
   calculateFancyPosition,
+  type FancyPosition,
 } from '../positions/position.service';
 import { CricketIdService } from '../cricketid/cricketid.service';
+import { RedisService } from '../common/redis/redis.service';
 import { MatchOddsExposureService } from './matchodds-exposure.service';
 import { BookmakerExposureService } from './bookmaker-exposure.service';
 import { FancyExposureService } from './fancy-exposure.service';
@@ -18,6 +20,12 @@ import { BetProcessingQueue } from './bet-processing.queue';
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
   private readonly MATCH_ODDS_BLOCKED_EVENTS_KEY = 'blocked_matchodds_event_ids';
+  /** Max winning validation (Match Odds): reject if max(runner.net) exceeds this */
+  private readonly MATCH_ODDS_MAX_WINNING = 500_000;
+  /** Max winning validation (Fancy): reject if max(YES, NO) exceeds this */
+  private readonly FANCY_MAX_WINNING = 200_000;
+  /** Redis TTL for pos:{userId}:{matchId}:{marketType} snapshots */
+  private readonly POS_MAX_WINNING_CACHE_TTL_SEC = 7 * 24 * 3600;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -26,7 +34,23 @@ export class BetsService {
     private readonly bookmakerExposureService: BookmakerExposureService,
     private readonly fancyExposureService: FancyExposureService,
     private readonly betProcessingQueue: BetProcessingQueue,
+    private readonly redisService: RedisService,
   ) {}
+
+  /**
+   * Match odds only: normalize scaled feeds/client values to decimal odds (e.g. 1.03, 7.0, 10.5).
+   * Not used for bookmaker (percentage) or fancy (line).
+   *
+   * - raw >= 100 → hundredths (103 → 1.03)
+   * - 10 <= raw < 100 → divide by 10
+   * - else → already decimal
+   */
+  private normalizeMatchOddsToDecimal(odds: number): number {
+    if (!Number.isFinite(odds) || odds <= 0) return odds;
+    if (odds >= 100) return odds / 100;
+    if (odds >= 10) return odds / 10;
+    return odds;
+  }
 
   private parseBlockedMatchOddsEventIds(rawValue: string | null | undefined): Set<string> {
     if (!rawValue) return new Set<string>();
@@ -82,9 +106,9 @@ export class BetsService {
    * 
    * Official Exchange Rules:
    * - FANCY: liability = stake (for both BACK and LAY)
-   * - MATCH ODDS & BOOKMAKER: 
+   * - MATCH ODDS & BOOKMAKER (decimal odds for match odds; bookmaker uses stored rate as today):
    *   - BACK: liability = stake
-   *   - LAY: liability = (odds - 1) × stake
+   *   - LAY: liability = (decimalOdds - 1) × stake
    * 
    * @param gtype - Market type: 'fancy' | 'bookmaker' | 'matchodds'
    * @param betType - Bet type: 'BACK' | 'LAY'
@@ -158,6 +182,218 @@ export class BetsService {
         `[fancy_exposures] upsert failed (observability only): ${(err as Error)?.message}`,
         { userId: params.userId, marketId: params.marketId, selectionId: params.selectionId },
       );
+    }
+  }
+
+  /** Snapshot of pending bet ids for cache coherence (same DB read, no extra queries). */
+  private pendingBetsSnapshot(bets: { id: string }[]): string {
+    if (!bets.length) return '0:';
+    const ids = [...new Set(bets.map((b) => b.id))].sort();
+    return `${bets.length}:${ids.join('|')}`;
+  }
+
+  private buildMoMarketSelectionsFromBets(
+    rows: Array<{ selectionId: number | null | undefined }>,
+  ): string[] {
+    return Array.from(
+      new Set(
+        rows
+          .map((b) => b.selectionId)
+          .filter((id): id is number => id !== null && id !== undefined)
+          .map((id) => String(id)),
+      ),
+    );
+  }
+
+  /**
+   * ALL runners in the Match Odds market are required for correct max(runner.net).
+   * Bet-only selection ids miss outcomes (e.g. draw / third runner) and under-state max winning → limits fail.
+   */
+  private async resolveMoMarketSelectionsForLimit(
+    marketId: string,
+    fallbackRows: Array<{ selectionId: number | null | undefined }>,
+  ): Promise<string[]> {
+    const fromBets = this.buildMoMarketSelectionsFromBets(fallbackRows);
+    try {
+      const detail = await this.cricketIdService.getMatchDetailByMarketId(marketId);
+      const markets = Array.isArray(detail) ? detail : [];
+      const targetMid = String(marketId).trim();
+      const market =
+        markets.find((m: { marketId?: string }) => String(m?.marketId ?? '').trim() === targetMid) ??
+        markets[0];
+      const runners = Array.isArray(market?.runners) ? market.runners : [];
+      const fromApi = runners
+        .map((r: { selectionId?: unknown }) => r?.selectionId)
+        .filter((id: unknown) => id !== null && id !== undefined)
+        .map((id: unknown) => String(id));
+      const merged = new Set<string>([...fromApi, ...fromBets]);
+      if (fromApi.length === 0 && fromBets.length > 0) {
+        this.logger.warn(
+          `[max_winning_mo] No runners from API for marketId=${marketId}; using bet selections only — max-winning cap may be inaccurate`,
+        );
+      }
+      if (merged.size > 0) {
+        return Array.from(merged);
+      }
+    } catch (err) {
+      this.logger.debug(
+        `[max_winning_mo] getMatchDetailByMarketId failed, using bet selections: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    return fromBets;
+  }
+
+  private maxMatchOddsNetWinning(runners: Record<string, { net: number }>): number {
+    let m = 0;
+    for (const v of Object.values(runners)) {
+      const n = Number(v?.net ?? 0);
+      if (n > m) m = n;
+    }
+    return m;
+  }
+
+  /**
+   * Max winning limits. Match Odds: full calculateMatchOddsPosition with all market runners (vendor).
+   * Fancy: Redis cache + incremental when valid snapshot. Does not alter exposure formulas.
+   */
+  private async enforceMaxWinningLimitsWithCache(params: {
+    userId: string;
+    matchIdStr: string;
+    marketId: string;
+    actualMarketType: string;
+    allPendingBets: Array<{
+      id: string;
+      gtype: string | null;
+      marketId: string | null;
+      eventId: string | null;
+      selectionId: number | null;
+      betType: string | null;
+      betValue: unknown;
+      amount: unknown;
+      betRate: unknown;
+      odds: unknown;
+      winAmount: unknown;
+      lossAmount: unknown;
+      status: BetStatus;
+    }>;
+    newBet: {
+      gtype: string;
+      marketId: string;
+      eventId: string | null;
+      selectionId: number;
+      betType: string;
+      betValue: number;
+      amount: number;
+      betRate: number;
+      odds: number;
+      winAmount: number;
+      lossAmount: number;
+    };
+    eventId: string | undefined | null;
+    normalizedSelectionId: number;
+  }): Promise<void> {
+    const { userId, matchIdStr, marketId, actualMarketType, allPendingBets, newBet, eventId, normalizedSelectionId } =
+      params;
+
+    if (actualMarketType === 'bookmaker') {
+      return;
+    }
+
+    if (actualMarketType === 'matchodds') {
+      const marketSelections = await this.resolveMoMarketSelectionsForLimit(marketId, [
+        ...allPendingBets,
+        newBet,
+      ]);
+      if (marketSelections.length === 0) {
+        return;
+      }
+
+      // Single full position (pending + new bet) with ALL market runners — avoids cache/merge drift
+      // and matches exchange definition of max outcome P/L per runner.
+      const simulatedPos = calculateMatchOddsPosition(
+        [...allPendingBets, newBet] as Bet[],
+        marketId,
+        marketSelections,
+      );
+      const maxWin = this.maxMatchOddsNetWinning(simulatedPos?.runners ?? {});
+      if (maxWin > this.MATCH_ODDS_MAX_WINNING) {
+        throw new HttpException(
+          {
+            success: false,
+            error: `Maximum Match Odds winning (${this.MATCH_ODDS_MAX_WINNING}) would be exceeded.`,
+            code: 'MAX_MATCH_ODDS_WINNING_EXCEEDED',
+            maxWinning: maxWin,
+            limit: this.MATCH_ODDS_MAX_WINNING,
+          },
+          400,
+        );
+      }
+      return;
+    }
+
+    if (actualMarketType === 'fancy') {
+      const snapshot = this.pendingBetsSnapshot(allPendingBets);
+      const cacheKey = this.redisService.getMaxWinningPositionKey(userId, matchIdStr, 'fancy');
+      const cached = await this.redisService.get<{
+        marketId?: string;
+        snapshot?: string;
+        lines?: FancyPosition[];
+      }>(cacheKey);
+
+      // Must match calculateFancyPosition: `${bet.eventId}_${bet.selectionId}` (null → "null" in template)
+      const evForFancyId = eventId ?? null;
+      const fancyId = `${evForFancyId}_${normalizedSelectionId}`;
+
+      const cacheUsable =
+        cached &&
+        cached.marketId === marketId &&
+        cached.snapshot === snapshot &&
+        Array.isArray(cached.lines);
+
+      let baseYes = 0;
+      let baseNo = 0;
+      if (cacheUsable) {
+        const line = cached!.lines!.find((l) => l.fancyId === fancyId);
+        baseYes = line?.positions?.YES ?? 0;
+        baseNo = line?.positions?.NO ?? 0;
+      } else {
+        const lines = calculateFancyPosition(allPendingBets as Bet[]);
+        const line = lines.find((l) => l.fancyId === fancyId);
+        baseYes = line?.positions?.YES ?? 0;
+        baseNo = line?.positions?.NO ?? 0;
+      }
+
+      const newBetForPos = {
+        ...newBet,
+        gtype: 'fancy' as const,
+        status: BetStatus.PENDING,
+        eventId: eventId ?? null,
+        marketId,
+        selectionId: normalizedSelectionId,
+      };
+      const incLines = calculateFancyPosition([newBetForPos as Bet]);
+      const incLine = incLines.find((l) => l.fancyId === fancyId);
+      const dY = incLine?.positions?.YES ?? 0;
+      const dN = incLine?.positions?.NO ?? 0;
+
+      const simYes = baseYes + dY;
+      const simNo = baseNo + dN;
+      const maxFancy = Math.max(simYes, simNo);
+
+      if (maxFancy > this.FANCY_MAX_WINNING) {
+        throw new HttpException(
+          {
+            success: false,
+            error: `Maximum Fancy winning (${this.FANCY_MAX_WINNING}) would be exceeded.`,
+            code: 'MAX_FANCY_WINNING_EXCEEDED',
+            maxWinning: maxFancy,
+            limit: this.FANCY_MAX_WINNING,
+          },
+          400,
+        );
+      }
     }
   }
 
@@ -454,7 +690,7 @@ export class BetsService {
     perfLog('after_input_parsing');
 
     const normalizedBetValue = Number(betvalue) || 0;
-    let normalizedBetRate = Number(bet_rate) || 0;
+    const rawBetRate = Number(bet_rate) || 0;
     const normalizedSelectionId = Number(selection_id) || 0;
     
     // Validate bet value range: minimum 500, maximum 200000
@@ -479,11 +715,6 @@ export class BetsService {
         400,
       );
     }
-    
-    perfLog('after_bet_value_validation', {
-      betValue: normalizedBetValue,
-      betRate: normalizedBetRate,
-    });
 
     // 1. VALIDATE MARKET ID (REQUIRED FOR EXCHANGE EXPOSURE)
     if (!marketId) {
@@ -497,50 +728,14 @@ export class BetsService {
       );
     }
 
-    // ✅ EXCHANGE LOGIC: Calculate winAmount/lossAmount BEFORE transaction
-    // REAL CRICKET EXCHANGE RULES:
-    // - FANCY: liability = stake (for both BACK and LAY)
-    // - MATCH ODDS / BOOKMAKER:
-    //   - BACK bet: liability = stake
-    //   - LAY bet: liability = (odds - 1) * stake
-    // - Loss amount = liability (for settlement purposes)
-    // - Win amount = stake * odds for BACK, stake for LAY
-    const normalizedBetType = (bet_type || '').toUpperCase();
-    const isBackBet = normalizedBetType === 'BACK';
-    const isLayBet = normalizedBetType === 'LAY' || normalizedBetType === 'NO';
-    
-    // Normalize win amount from input (defensive: handle null/undefined)
-    let normalizedWinAmount = Number(win_amount) || 0;
-    let normalizedLossAmount = 0;
-    
-    // Calculate winAmount if not provided or invalid
-    if (normalizedBetValue > 0 && normalizedBetRate > 0) {
-      if (isBackBet) {
-        // BACK bet: winAmount = stake * odds (total return)
-        normalizedWinAmount = normalizedWinAmount || normalizedBetValue * normalizedBetRate;
-      } else if (isLayBet) {
-        // LAY bet: winAmount = stake (if bet wins, we keep the stake)
-        normalizedWinAmount = normalizedWinAmount || normalizedBetValue;
-      }
-    }
-
-    // Generate unique selection ID for bet tracking
-    const selid = Math.floor(Math.random() * 90000000) + 10000000;
-    // Create settlement ID for bet settlement tracking
-    const settlement_id = `${match_id}_${selection_id}`;
-
-    // Determine market type BEFORE transaction (required for exposure calculation)
-    // Normalize inputs defensively to handle null/undefined
+    // Determine market type before normalizing odds (match odds vs bookmaker vs fancy)
     const normalizedGtype = (gtype || '').toLowerCase();
     const marketName = (input.market_name || '').toLowerCase();
-    // Start with gtype as default, will be refined based on business rules below
     let actualMarketType = normalizedGtype;
     
-    // Handle "match1", "match2", etc. as bookmaker (numbered match markets are bookmaker)
     if (normalizedGtype.startsWith('match') && normalizedGtype !== 'match' && normalizedGtype !== 'matchodds') {
       actualMarketType = 'bookmaker';
     }
-    // Fallback: Check market_name if gtype is ambiguous
     else if (!normalizedGtype || normalizedGtype === '') {
       if (marketName.includes('bookmaker')) {
         actualMarketType = 'bookmaker';
@@ -551,12 +746,10 @@ export class BetsService {
       }
     }
 
-    // Handle "match" as alias for "matchodds"
     if (actualMarketType === 'matchodds' || actualMarketType === 'match') {
       actualMarketType = 'matchodds';
     }
 
-    // Global admin control: stop Match Odds betting for a specific event across all clients.
     if (actualMarketType === 'matchodds') {
       const normalizedEventId = String(eventId || match_id || '').trim();
       if (normalizedEventId) {
@@ -583,13 +776,51 @@ export class BetsService {
       );
     }
 
-    // Set gtype for bet based on actual market type
     let betGtype = 'matchodds';
     if (actualMarketType === 'fancy') {
       betGtype = 'fancy';
     } else if (actualMarketType === 'bookmaker') {
       betGtype = 'bookmaker';
     }
+
+    const normalizedBetRate =
+      betGtype === 'matchodds' ? this.normalizeMatchOddsToDecimal(rawBetRate) : rawBetRate;
+
+    perfLog('after_bet_value_validation', {
+      betValue: normalizedBetValue,
+      betRateRaw: rawBetRate,
+      betRate: normalizedBetRate,
+    });
+
+    // ✅ EXCHANGE LOGIC: win/loss use decimal odds for match odds (after normalization).
+    // Match odds: BACK win = stake×(decimalOdds−1), loss = stake; LAY win = stake, loss = stake×(decimalOdds−1).
+    // Fancy/bookmaker: unchanged win fallback formulas; fancy BACK still overridden below.
+    const normalizedBetType = (bet_type || '').toUpperCase();
+    const isBackBet = normalizedBetType === 'BACK';
+    const isLayBet = normalizedBetType === 'LAY' || normalizedBetType === 'NO';
+    
+    let normalizedWinAmount = Number(win_amount) || 0;
+    let normalizedLossAmount = 0;
+    
+    if (normalizedBetValue > 0 && normalizedBetRate > 0) {
+      if (betGtype === 'matchodds') {
+        if (isBackBet) {
+          normalizedWinAmount =
+            normalizedWinAmount || normalizedBetValue * (normalizedBetRate - 1);
+        } else if (isLayBet) {
+          normalizedWinAmount = normalizedWinAmount || normalizedBetValue;
+        }
+      } else {
+        if (isBackBet) {
+          normalizedWinAmount = normalizedWinAmount || normalizedBetValue * normalizedBetRate;
+        } else if (isLayBet) {
+          normalizedWinAmount = normalizedWinAmount || normalizedBetValue;
+        }
+      }
+    }
+
+    const selid = Math.floor(Math.random() * 90000000) + 10000000;
+    const settlement_id = `${match_id}_${selection_id}`;
 
     // if (betGtype === 'fancy' && isBackBet) {
     //   normalizedWinAmount = (normalizedBetValue * normalizedBetRate) / 100;
@@ -669,6 +900,21 @@ export class BetsService {
       const txStart = Date.now();
       const transactionResult = await this.prisma.$transaction(
         async (tx) => {
+          let maxWinningCacheWrite:
+            | {
+                userId: string;
+                matchId: string;
+                posMarketType: 'matchodds' | 'fancy';
+                payload: {
+                  v: number;
+                  marketId: string;
+                  snapshot: string;
+                  runners?: Record<string, { net: number }>;
+                  lines?: FancyPosition[];
+                };
+              }
+            | undefined;
+
           // ✅ COMBINED: Check user status, betting_enabled, AND wallet in parallel within transaction
           const [user, wallet] = await Promise.all([
             tx.user.findUnique({
@@ -794,6 +1040,17 @@ export class BetsService {
             lossAmount: normalizedLossAmount, // Calculated loss amount (liability)
             isRangeConsumed: false, // Fancy range consumption flag (not used in current model)
           };
+
+          await this.enforceMaxWinningLimitsWithCache({
+            userId,
+            matchIdStr: String(match_id),
+            marketId,
+            actualMarketType,
+            allPendingBets,
+            newBet,
+            eventId,
+            normalizedSelectionId,
+          });
            
           // 🔐 STEP 3: Calculate isolated deltas
           let matchOddsDelta = 0;
@@ -1027,6 +1284,78 @@ export class BetsService {
             `New Exposure: MO=${newExposure.matchOdds}, Fancy=${newExposure.fancy}, BM=${newExposure.bookmaker} (Net: ${newNetExposure}).`,
           );
 
+          const snapshotAfterBet = this.pendingBetsSnapshot([...allPendingBets, { id: createdBet.id }]);
+          if (actualMarketType === 'matchodds') {
+            const finalRowsForMo = [
+              ...allPendingBets,
+              {
+                id: createdBet.id,
+                userId: createdBet.userId,
+                gtype: createdBet.gtype,
+                marketId: createdBet.marketId,
+                eventId: createdBet.eventId,
+                selectionId: createdBet.selectionId,
+                betType: createdBet.betType,
+                betValue: createdBet.betValue,
+                amount: createdBet.amount,
+                betRate: createdBet.betRate,
+                odds: createdBet.odds,
+                winAmount: createdBet.winAmount,
+                lossAmount: createdBet.lossAmount,
+                status: createdBet.status,
+              },
+            ];
+            const moSelections = await this.resolveMoMarketSelectionsForLimit(marketId, finalRowsForMo);
+            if (moSelections.length > 0) {
+              const moPos = calculateMatchOddsPosition(finalRowsForMo as Bet[], marketId, moSelections);
+              if (moPos) {
+                maxWinningCacheWrite = {
+                  userId,
+                  matchId: String(match_id),
+                  posMarketType: 'matchodds',
+                  payload: {
+                    v: 1,
+                    marketId,
+                    snapshot: snapshotAfterBet,
+                    runners: moPos.runners,
+                  },
+                };
+              }
+            }
+          } else if (actualMarketType === 'fancy') {
+            const finalRowsForFancy = [
+              ...allPendingBets,
+              {
+                id: createdBet.id,
+                userId: createdBet.userId,
+                gtype: createdBet.gtype,
+                marketId: createdBet.marketId,
+                eventId: createdBet.eventId,
+                selectionId: createdBet.selectionId,
+                betType: createdBet.betType,
+                betValue: createdBet.betValue,
+                amount: createdBet.amount,
+                betRate: createdBet.betRate,
+                odds: createdBet.odds,
+                winAmount: createdBet.winAmount,
+                lossAmount: createdBet.lossAmount,
+                status: createdBet.status,
+                betName: createdBet.betName,
+              },
+            ];
+            maxWinningCacheWrite = {
+              userId,
+              matchId: String(match_id),
+              posMarketType: 'fancy',
+              payload: {
+                v: 1,
+                marketId,
+                snapshot: snapshotAfterBet,
+                lines: calculateFancyPosition(finalRowsForFancy as Bet[]),
+              },
+            };
+          }
+
           // Return bet info - position calculation happens AFTER transaction commits
           return {
             success: true,
@@ -1035,6 +1364,7 @@ export class BetsService {
             available_balance: updatedBalance,
             marketType: actualMarketType,
             marketId,
+            maxWinningCacheWrite,
           };
         },
         {
@@ -1042,6 +1372,22 @@ export class BetsService {
           timeout: 30000,
         },
       );
+
+      if (transactionResult.maxWinningCacheWrite) {
+        const w = transactionResult.maxWinningCacheWrite;
+        try {
+          await this.redisService.set(
+            this.redisService.getMaxWinningPositionKey(w.userId, w.matchId, w.posMarketType),
+            w.payload,
+            this.POS_MAX_WINNING_CACHE_TTL_SEC,
+          );
+        } catch (err) {
+          this.logger.debug(
+            `[max_winning_cache] set skipped: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
       const txMs = Date.now() - txStart;
       this.logger.log('[PERF][placeBet] transaction', {
         ms: txMs,
@@ -1349,7 +1695,11 @@ export class BetsService {
 
     // Calculate bet liability
     const stake = bet.betValue ?? bet.amount ?? 0;
-    const odds = bet.betRate ?? bet.odds ?? 0;
+    let odds = bet.betRate ?? bet.odds ?? 0;
+    const gtypeLower = (bet.gtype || '').toLowerCase();
+    if (gtypeLower === 'matchodds' || gtypeLower === 'match') {
+      odds = this.normalizeMatchOddsToDecimal(odds);
+    }
     const betLiability = this.calculateLiability(bet.gtype, bet.betType, stake, odds);
 
     // Check if user has sufficient balance

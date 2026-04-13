@@ -123,11 +123,38 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Max winning / position cache for bet validation (per user, match, market type).
+   * Format: pos:{userId}:{matchId}:{marketType}
+   */
+  getMaxWinningPositionKey(userId: string, matchId: string, marketType: 'matchodds' | 'fancy'): string {
+    return `pos:${userId}:${matchId}:${marketType}`;
+  }
+
+  /**
+   * Delete all keys with prefix (SCAN, non-blocking batch). Used for pos:{userId}:*
+   */
+  private async delKeysWithPrefix(prefix: string): Promise<void> {
+    try {
+      let cursor = '0';
+      do {
+        const [next, keys] = await this.client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 128);
+        cursor = next;
+        if (keys.length > 0) {
+          await this.client.del(...keys);
+        }
+      } while (cursor !== '0');
+    } catch {
+      // optional cache
+    }
+  }
+
+  /**
    * Invalidate user positions cache
    */
   async invalidateUserPositions(userId: string): Promise<void> {
     const key = this.getUserPositionsKey(userId);
     this.del(key);
+    await this.delKeysWithPrefix(`pos:${userId}:`);
   }
 
   /**

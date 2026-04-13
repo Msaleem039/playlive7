@@ -2855,6 +2855,35 @@ export class SettlementService {
   private isTiedMatchSelectionId(selectionId: number | null | undefined): boolean {
     return this.normalizeTiedMatchSide(selectionId) !== null;
   }
+
+  /** Vendor/API may send "Tied Match", "TIED_MATCH", "tied-match", etc. */
+  private isTiedMatchMarketName(marketName: string | null | undefined): boolean {
+    if (!marketName) return false;
+    const n = marketName.toLowerCase();
+    return (
+      n.includes('tied match') ||
+      n.includes('tied_match') ||
+      n.includes('tied-match')
+    );
+  }
+
+  /**
+   * Yes/No side for settlement: Diamond ids 1/2 or legacy 37302/37303, OR vendor runner id with betName Yes/No on TIED_MATCH market.
+   */
+  private getTiedMatchBetSide(bet: {
+    selectionId?: number | null;
+    betName?: string | null;
+    marketName?: string | null;
+  }): 'yes' | 'no' | null {
+    const fromSel = this.normalizeTiedMatchSide(bet.selectionId);
+    if (fromSel !== null) return fromSel;
+    if (!this.isTiedMatchMarketName(bet.marketName)) return null;
+    const name = (bet.betName || '').trim().toLowerCase();
+    if (name === 'yes') return 'yes';
+    if (name === 'no') return 'no';
+    return null;
+  }
+
   /**
    * @deprecated This method uses legacy fallback matching which violates strict identity rules.
    * Use strict matching in settleMarketManual instead (bet.eventId === eventId AND bet.marketId === marketId).
@@ -4104,6 +4133,34 @@ export class SettlementService {
               ],
             },
             { selectionId: { in: [1, 2] } },
+            // Vendor runner ids (e.g. 920691) with Yes/No on TIED_MATCH / "tied match" market name
+            {
+              AND: [
+                { betName: { in: ['Yes', 'No', 'yes', 'no'] } },
+                {
+                  OR: [
+                    {
+                      marketName: {
+                        contains: 'tied match',
+                        mode: 'insensitive',
+                      },
+                    },
+                    {
+                      marketName: {
+                        contains: 'tied_match',
+                        mode: 'insensitive',
+                      },
+                    },
+                    {
+                      marketName: {
+                        contains: 'tied-match',
+                        mode: 'insensitive',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
           ],
           ...(betIds && betIds.length > 0 && { id: { in: betIds } }),
         },
@@ -4115,11 +4172,18 @@ export class SettlementService {
         if (bet.settlementId?.startsWith('CRICKET:FANCY:')) {
           return false;
         }
+        if ((bet.gtype || '').toLowerCase() === 'fancy') {
+          return false;
+        }
         if (this.isTiedMatchSelectionId(bet.selectionId)) {
           return true;
         }
         // Include if settlementId matches Tied Match pattern
         if (bet.settlementId?.startsWith('CRICKET:TIED_MATCH:')) {
+          return true;
+        }
+        const bn = (bet.betName || '').toLowerCase();
+        if ((bn === 'yes' || bn === 'no') && this.isTiedMatchMarketName(bet.marketName)) {
           return true;
         }
         return false;
@@ -4142,7 +4206,7 @@ export class SettlementService {
         throw new BadRequestException(
           `No pending Tied Match bets found for strict settlement criteria. ` +
           `eventId: ${eventId}, marketId: ${marketId}, winnerSelectionId: ${winnerSelectionId}. ` +
-          `Settlement requires matching bets: selectionId in [1,2,37302,37303] (Yes/No) for this market.`,
+          `Expected pending bets: settlementId CRICKET:TIED_MATCH:*, or selectionId 1/2/37302/37303, or Yes/No on a TIED_MATCH / tied_match market.`,
         );
       }
 
@@ -4293,17 +4357,22 @@ export class SettlementService {
           }
 
           const betType = (bet.betType || '').toUpperCase();
-          if (betType !== 'BACK' && betType !== 'YES' && betType !== 'LAY') {
+          if (
+            betType !== 'BACK' &&
+            betType !== 'YES' &&
+            betType !== 'LAY' &&
+            betType !== 'NO'
+          ) {
             throw new BadRequestException(
               `CRITICAL: Bet ${bet.id} has invalid betType: ${bet.betType}. ` +
-              `Tied Match supports BACK, YES, or LAY.`,
+              `Tied Match supports BACK, YES, LAY, or NO.`,
             );
           }
 
-          if (!this.isTiedMatchSelectionId(bet.selectionId)) {
+          if (this.getTiedMatchBetSide(bet) === null) {
             throw new BadRequestException(
-              `CRITICAL: Bet ${bet.id} has invalid selectionId: ${bet.selectionId}. ` +
-                `Tied Match expects Yes (1 or 37302) or No (2 or 37303).`,
+              `CRITICAL: Bet ${bet.id} is not a resolvable Tied Match side (selectionId=${bet.selectionId}, betName=${bet.betName}, marketName=${bet.marketName}). ` +
+                `Use Yes/No selection ids 1, 2, 37302, 37303, or betName Yes/No on a TIED_MATCH market.`,
             );
           }
 
@@ -4334,91 +4403,54 @@ export class SettlementService {
             const stake = Number(bet.betValue ?? bet.amount ?? 0);
             const odds = Number(bet.betRate ?? bet.odds ?? 0);
             const betType = (bet.betType || '').toUpperCase();
-            const betSide = this.normalizeTiedMatchSide(bet.selectionId);
+            const betSide = this.getTiedMatchBetSide(bet);
             if (betSide === null) {
               throw new BadRequestException(
-                `CRITICAL: Bet ${bet.id} has invalid selectionId: ${bet.selectionId}.`,
+                `CRITICAL: Bet ${bet.id} has invalid Tied Match side (selectionId: ${bet.selectionId}).`,
               );
             }
             const outcomeMatchesBetSide = betSide === winnerSide;
 
-            if (betType === 'BACK' || betType === 'YES') {
-              if (outcomeMatchesBetSide) {
-                const winAmount = Number(bet.winAmount ?? 0);
-                balanceDelta += winAmount;
+            if (
+              betType === 'BACK' ||
+              betType === 'YES' ||
+              betType === 'LAY' ||
+              betType === 'NO'
+            ) {
+              const isBackLike = betType === 'BACK' || betType === 'YES';
+              const bookmakerStyle = this.isTiedMatchBookmakerStyleBet(bet);
+              const computedLiability = isBackLike
+                ? stake
+                : bookmakerStyle
+                  ? this.bookmakerLayLiability(stake, odds)
+                  : this.layLiability(stake, odds);
+              const fullLiability = Number(bet.lossAmount ?? computedLiability);
+              const winAmount = Number(bet.winAmount ?? 0);
+              const isWin = isBackLike ? outcomeMatchesBetSide : !outcomeMatchesBetSide;
+
+              // Custom tied-match rule: always release full liability.
+              liabilityDelta -= fullLiability;
+
+              if (isWin) {
+                const creditAmount = winAmount + stake;
+                balanceDelta += creditAmount;
                 betUpdates.push({
                   id: bet.id,
                   status: BetStatus.WON,
                   pnl: winAmount,
                 });
                 this.logger.log(
-                  `Tied Match BACK WIN: betId=${bet.id}, userId=${userId}, winAmount=${winAmount}`,
+                  `Tied Match ${betType} WIN: betId=${bet.id}, userId=${userId}, credit=${creditAmount}, liabilityRelease=${fullLiability}`,
                 );
               } else {
                 betUpdates.push({
                   id: bet.id,
                   status: BetStatus.LOST,
-                  pnl: -stake,
+                  pnl: -fullLiability,
                 });
                 this.logger.log(
-                  `Tied Match BACK LOSS: betId=${bet.id}, userId=${userId}, stake=${stake}`,
+                  `Tied Match ${betType} LOSS: betId=${bet.id}, userId=${userId}, liabilityRelease=${fullLiability}`,
                 );
-              }
-              continue;
-            }
-
-            // LAY — same rules as bookmaker strict vs match-odds settleMarket
-            if (betType === 'LAY') {
-              const bookmakerStyle = this.isTiedMatchBookmakerStyleBet(bet);
-              if (bookmakerStyle) {
-                const layLiability = this.bookmakerLayLiability(stake, odds);
-                if (!outcomeMatchesBetSide) {
-                  liabilityDelta -= layLiability;
-                  betUpdates.push({
-                    id: bet.id,
-                    status: BetStatus.WON,
-                    pnl: stake,
-                  });
-                  this.logger.log(
-                    `Tied Match LAY WIN (bookmaker): betId=${bet.id}, userId=${userId}, liabilityRelease=${layLiability}`,
-                  );
-                } else {
-                  balanceDelta -= layLiability;
-                  liabilityDelta -= layLiability;
-                  betUpdates.push({
-                    id: bet.id,
-                    status: BetStatus.LOST,
-                    pnl: -layLiability,
-                  });
-                  this.logger.log(
-                    `Tied Match LAY LOSS (bookmaker): betId=${bet.id}, userId=${userId}, pay=${layLiability}`,
-                  );
-                }
-              } else {
-                const layLiability = this.layLiability(stake, odds);
-                if (outcomeMatchesBetSide) {
-                  balanceDelta -= layLiability;
-                  liabilityDelta -= layLiability;
-                  betUpdates.push({
-                    id: bet.id,
-                    status: BetStatus.LOST,
-                    pnl: -layLiability,
-                  });
-                  this.logger.log(
-                    `Tied Match LAY LOSS (match odds): betId=${bet.id}, userId=${userId}, pay=${layLiability}`,
-                  );
-                } else {
-                  balanceDelta += stake + layLiability;
-                  liabilityDelta -= layLiability;
-                  betUpdates.push({
-                    id: bet.id,
-                    status: BetStatus.WON,
-                    pnl: stake,
-                  });
-                  this.logger.log(
-                    `Tied Match LAY WIN (match odds): betId=${bet.id}, userId=${userId}, creditNet=${stake + layLiability}`,
-                  );
-                }
               }
             }
           }
@@ -8982,6 +9014,18 @@ export class SettlementService {
                   },
                 },
                 {
+                  marketName: {
+                    contains: 'tied_match',
+                    mode: 'insensitive',
+                  },
+                },
+                {
+                  marketName: {
+                    contains: 'tied-match',
+                    mode: 'insensitive',
+                  },
+                },
+                {
                   selectionId: {
                     in: [1, 2, 37302, 37303],
                   },
@@ -9040,12 +9084,12 @@ export class SettlementService {
       if (marketType === 'tied-match') {
         // For tied-match, ensure it's actually a tied match bet
         const betName = (bet.betName || '').toLowerCase();
-        const marketName = (bet.marketName || '').toLowerCase();
         const selectionId = bet.selectionId ? Number(bet.selectionId) : null;
 
         return (
           (betName === 'yes' || betName === 'no') &&
-          (this.isTiedMatchSelectionId(selectionId) || marketName.includes('tied match'))
+          (this.isTiedMatchSelectionId(selectionId) ||
+            this.isTiedMatchMarketName(bet.marketName))
         );
       } else if (marketType === 'match-odds') {
         // For match-odds, exclude tied match and match odds including tie
@@ -9056,7 +9100,7 @@ export class SettlementService {
           betName !== 'no' &&
           betName !== 'tie' &&
           betName !== 'the draw' &&
-          !marketName.includes('tied match') &&
+          !this.isTiedMatchMarketName(bet.marketName) &&
           !marketName.includes('match odds including tie')
         );
       }
