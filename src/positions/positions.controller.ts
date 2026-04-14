@@ -36,6 +36,16 @@ export class PositionsController {
     private readonly redisService: RedisService, // ✅ PERFORMANCE: Redis for position snapshots
   ) {}
 
+  private isTiedMatchMarketName(marketName: string | null | undefined): boolean {
+    const normalized = String(marketName || '').trim().toLowerCase();
+    if (!normalized) return false;
+    return (
+      normalized.includes('tied_match') ||
+      normalized.includes('tied match') ||
+      normalized.includes('tied-match')
+    );
+  }
+
   /**
    * ✅ GET /positions?eventId={eventId}
    * 
@@ -90,6 +100,7 @@ export class PositionsController {
           id: true,
           gtype: true,
           marketId: true,
+          marketName: true,
           eventId: true,
           selectionId: true,
           betType: true,
@@ -306,6 +317,12 @@ export class PositionsController {
 
       // ✅ Transform response to new format: group by eventId, flatten structure
       const response: any = {};
+      const tiedMatchMarketIds = new Set(
+        openBets
+          .filter((bet) => this.isTiedMatchMarketName(bet.marketName))
+          .map((bet) => bet.marketId)
+          .filter((id): id is string => Boolean(id)),
+      );
       
       // Determine eventId (from query param or from bets)
       // If eventId query param provided, use it; otherwise use first bet's eventId
@@ -327,15 +344,23 @@ export class PositionsController {
       // Transform Match Odds: flatten runners to selectionId -> net
       if (allPositions.matchOdds && allPositions.matchOdds.length > 0) {
         // Merge all Match Odds markets (if multiple, combine their runners)
+        // Keep TIED_MATCH markets separate from regular MATCH_ODDS.
         const matchOddsFlat: Record<string, number> = {};
+        const tieMatchFlat: Record<string, number> = {};
         for (const matchOddsPos of allPositions.matchOdds) {
+          const targetBucket = tiedMatchMarketIds.has(matchOddsPos.marketId)
+            ? tieMatchFlat
+            : matchOddsFlat;
           for (const [selectionId, runner] of Object.entries(matchOddsPos.runners)) {
             // If multiple markets have same selectionId, sum them
-            matchOddsFlat[selectionId] = (matchOddsFlat[selectionId] || 0) + runner.net;
+            targetBucket[selectionId] = (targetBucket[selectionId] || 0) + runner.net;
           }
         }
         if (Object.keys(matchOddsFlat).length > 0) {
           response.matchOdds = matchOddsFlat;
+        }
+        if (Object.keys(tieMatchFlat).length > 0) {
+          response.tieMatch = tieMatchFlat;
         }
       }
       

@@ -63,6 +63,16 @@ export class BetsService {
     }
   }
 
+  private isTiedMatchMarketName(marketName: string | null | undefined): boolean {
+    const normalized = String(marketName || '').trim().toLowerCase();
+    if (!normalized) return false;
+    return (
+      normalized.includes('tied_match') ||
+      normalized.includes('tied match') ||
+      normalized.includes('tied-match')
+    );
+  }
+
   async setMatchOddsBlockedForEvent(eventId: string, blocked: boolean) {
     const normalizedEventId = String(eventId || '').trim();
     if (!normalizedEventId) {
@@ -731,6 +741,7 @@ export class BetsService {
     // Determine market type before normalizing odds (match odds vs bookmaker vs fancy)
     const normalizedGtype = (gtype || '').toLowerCase();
     const marketName = (input.market_name || '').toLowerCase();
+    const isTiedMatchMarket = this.isTiedMatchMarketName(input.market_name);
     let actualMarketType = normalizedGtype;
     
     if (normalizedGtype.startsWith('match') && normalizedGtype !== 'match' && normalizedGtype !== 'matchodds') {
@@ -1439,7 +1450,37 @@ export class BetsService {
 
         // ✅ MARKET ISOLATION: Use market-specific position functions
         // Position calculation is read-only and does not affect wallet or bet status
-        if (transactionResult.marketType === 'matchodds' || transactionResult.marketType === 'match') {
+        if (isTiedMatchMarket) {
+          // TIED_MATCH should be calculated in tied market bucket, not match odds.
+          const marketSelections = Array.from(
+            new Set(
+              pendingBets
+                .map((bet) => bet.selectionId)
+                .filter((id): id is number => id !== null && id !== undefined)
+                .map((id) => String(id))
+            )
+          );
+
+          if (marketSelections.length > 0) {
+            const tiedMatchPosition = calculateBookmakerPosition(
+              pendingBets as Bet[],
+              marketId,
+              marketSelections,
+            );
+            if (tiedMatchPosition && tiedMatchPosition.runners) {
+              for (const [selectionId, runner] of Object.entries(tiedMatchPosition.runners)) {
+                const net = runner?.net ?? 0;
+                positions[selectionId] = {
+                  win: net > 0 ? net : 0,
+                  lose: net < 0 ? Math.abs(net) : 0,
+                };
+              }
+              this.logger.debug(
+                `Tied Match position calculated: ${JSON.stringify(positions)}`,
+              );
+            }
+          }
+        } else if (transactionResult.marketType === 'matchodds' || transactionResult.marketType === 'match') {
           // ⚠️ TODO: Get marketSelections from market source (DB/API), not from bets
           // For now, derive minimal set from bets as fallback
           // Filter out null/undefined selectionIds defensively
