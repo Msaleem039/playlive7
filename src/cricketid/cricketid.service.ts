@@ -780,10 +780,10 @@ export class CricketIdService {
   async getEventsBySportId(sportId: string | number) {
     const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
 
-    // v11: MATCH_ODDS only.
+    // v12: MATCH_ODDS only; extended cricket competition allow-list.
     // - Cricket (4): allow-list selected competitionIds
     // - Others: return only top 5 matches
-    const cacheKey = this.redisService.getVendorKey('events-by-sport-v11', String(sid));
+    const cacheKey = this.redisService.getVendorKey('events-by-sport-v12', String(sid));
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
       this.logger.debug(`Redis cache HIT for events-by-sport: sportId=${sid}`);
@@ -834,7 +834,9 @@ export class CricketIdService {
     const ALLOWED_CRICKET_COMPETITION_IDS = new Set([
       '101480',
       '10693181',
+      '12072774',
       '12649673',
+      '9962116',
       '9992899',
     ]);
     const listCompetitionId = (item: any) =>

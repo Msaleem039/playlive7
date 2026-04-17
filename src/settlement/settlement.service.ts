@@ -6605,11 +6605,7 @@ export class SettlementService {
         ) {
           // This is Tied Match market (Yes/No)
           marketType = 'tiedMatch';
-        } else if (
-          marketName.includes('match odds including tie') ||
-          betName === 'tie' ||
-          betName === 'the draw'
-        ) {
+        } else if (marketName.includes('match odds including tie')) {
           // This is Match Odds Including Tie (has Tie runner)
           marketType = 'matchOddsIncludingTie';
         } else if (marketName.includes('completed match')) {
@@ -6642,11 +6638,7 @@ export class SettlementService {
             marketName.includes('tied match')
           ) {
             marketType = 'tiedMatch';
-          } else if (
-            marketName.includes('match odds including tie') ||
-            betName === 'tie' ||
-            betName === 'the draw'
-          ) {
+          } else if (marketName.includes('match odds including tie')) {
             marketType = 'matchOddsIncludingTie';
           } else if (marketName.includes('completed match')) {
             continue;
@@ -6675,11 +6667,7 @@ export class SettlementService {
               marketName.includes('tied match')
             ) {
               marketType = 'tiedMatch';
-            } else if (
-              marketName.includes('match odds including tie') ||
-              betName === 'tie' ||
-              betName === 'the draw'
-            ) {
+            } else if (marketName.includes('match odds including tie')) {
               marketType = 'matchOddsIncludingTie';
             } else if (marketName.includes('completed match')) {
               continue;
@@ -7497,11 +7485,7 @@ export class SettlementService {
         ) {
           // This is Tied Match market (Yes/No)
           marketType = 'tiedMatch';
-        } else if (
-          marketName.includes('match odds including tie') ||
-          betName === 'tie' || 
-          betName === 'the draw'
-        ) {
+        } else if (marketName.includes('match odds including tie')) {
           // This is Match Odds Including Tie (has Tie runner)
           marketType = 'matchOddsIncludingTie';
         } else if (marketName.includes('completed match')) {
@@ -7542,11 +7526,7 @@ export class SettlementService {
             marketName.includes('tied match')
           ) {
             marketType = 'tiedMatch';
-          } else if (
-            marketName.includes('match odds including tie') ||
-            betName === 'tie' || 
-            betName === 'the draw'
-          ) {
+          } else if (marketName.includes('match odds including tie')) {
             marketType = 'matchOddsIncludingTie';
           } else if (marketName.includes('completed match')) {
             continue;
@@ -7577,11 +7557,7 @@ export class SettlementService {
               marketName.includes('tied match')
             ) {
               marketType = 'tiedMatch';
-            } else if (
-              marketName.includes('match odds including tie') ||
-              betName === 'tie' || 
-              betName === 'the draw'
-            ) {
+            } else if (marketName.includes('match odds including tie')) {
               marketType = 'matchOddsIncludingTie';
             } else if (marketName.includes('completed match')) {
               continue;

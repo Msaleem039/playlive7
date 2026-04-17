@@ -697,7 +697,11 @@ export class AuthService {
         });
 
         const totalNetPnl = statementEntries.reduce((s, e) => s + (e.netPnl || 0), 0);
-        const openingBalance = balance - totalNetPnl;
+        // Use settled cash baseline for statement running balance.
+        // balance can move on bet placement, while liability represents open exposure.
+        // balance + liability reflects cash before unsettled exposure impact.
+        const settledCashBalance = balance + (user.wallet?.liability ?? 0);
+        const openingBalance = settledCashBalance - totalNetPnl;
 
         // Compute running balance: sort by oldest first, then cumulative
         const byOldest = [...statementEntries].sort((a, b) => {
