@@ -3,6 +3,7 @@ import {
   ExecutionContext,
   ForbiddenException,
   Injectable,
+  Logger,
 } from '@nestjs/common';
 import { Request } from 'express';
 
@@ -11,6 +12,8 @@ const ALLOWED_HOST = 'playlive24.com';
 
 @Injectable()
 export class Playlive24OriginGuard implements CanActivate {
+  private readonly logger = new Logger(Playlive24OriginGuard.name);
+
   canActivate(context: ExecutionContext): boolean {
     const req = context.switchToHttp().getRequest<Request>();
 
@@ -31,6 +34,10 @@ export class Playlive24OriginGuard implements CanActivate {
       return true;
     }
 
+    this.logger.warn(
+      `Blocked placeBet request by origin guard: origin=${String(origin || '')}, referer=${String(referer || '')}`,
+    );
+
     throw new ForbiddenException({
       success: false,
       error: 'Bet placement is only allowed from allowed hosts',
@@ -42,7 +49,10 @@ export class Playlive24OriginGuard implements CanActivate {
     if (!value || Array.isArray(value)) return false;
     try {
       const u = new URL(value);
-      return u.protocol === 'https:' && u.hostname.toLowerCase() === ALLOWED_HOST;
+      const host = u.hostname.toLowerCase();
+      const isApex = host === ALLOWED_HOST;
+      const isSubdomain = host.endsWith(`.${ALLOWED_HOST}`);
+      return u.protocol === 'https:' && (isApex || isSubdomain);
     } catch {
       return false;
     }
