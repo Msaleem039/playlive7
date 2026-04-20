@@ -121,8 +121,13 @@ export function calculateMatchOddsPosition(
   marketId: string,
   marketSelections: string[],
 ): MatchOddsPosition | null {
+  // Safeguard: never trust raw arrays from the wire — dedupe and drop empties so we do not
+  // silently skip runners or double-iterate duplicate ids (runner list must still come from API/DB/caller, not bets).
+  const uniqueMarketSelections = [
+    ...new Set((marketSelections || []).map((id) => String(id).trim()).filter(Boolean)),
+  ];
   // ✅ CRITICAL: marketSelections is REQUIRED - contains ALL runners in market
-  if (!marketSelections || marketSelections.length === 0) {
+  if (uniqueMarketSelections.length === 0) {
     return null;
   }
 
@@ -147,7 +152,7 @@ export function calculateMatchOddsPosition(
 
   // ✅ Exchange Standard: Calculate NET P/L for EACH runner in market
   // Loop through ALL runners (from marketSelections), not just runners with bets
-  for (const runnerSelectionId of marketSelections) {
+  for (const runnerSelectionId of uniqueMarketSelections) {
     let netPnL = 0; // Net P/L if THIS runner wins (can be positive or negative)
 
     // Calculate impact of ALL bets on this runner
@@ -333,8 +338,12 @@ export function calculateBookmakerPosition(
   marketId: string,
   marketSelections: string[],
 ): BookmakerPosition | null {
+  // Safeguard: dedupe / trim only — full runner list must still be supplied by API/DB/caller (not derived from bets).
+  const uniqueMarketSelections = [
+    ...new Set((marketSelections || []).map((id) => String(id).trim()).filter(Boolean)),
+  ];
   // ✅ CRITICAL: marketSelections is REQUIRED - contains ALL runners in market
-  if (!marketSelections || marketSelections.length === 0) {
+  if (uniqueMarketSelections.length === 0) {
     return null;
   }
 
@@ -358,7 +367,7 @@ export function calculateBookmakerPosition(
 
   // ✅ Exchange Standard: Calculate NET P/L for EACH runner in market
   // Loop through ALL runners (from marketSelections), not just runners with bets
-  for (const runnerSelectionId of marketSelections) {
+  for (const runnerSelectionId of uniqueMarketSelections) {
     let netPnL = 0; // Net P/L if THIS runner wins (can be positive or negative)
 
     // Calculate impact of ALL bets on this runner
@@ -419,8 +428,8 @@ export function calculateBookmakerPosition(
  * Calculates positions for all market types from open bets.
  * Markets are completely isolated - no mixing.
  * 
- * ⚠️ NOTE: Match Odds and Bookmaker positions require marketSelections.
- * If not provided, those markets will be skipped.
+ * ⚠️ NOTE: Match Odds and Bookmaker positions require marketSelections from a market catalog
+ * (e.g. Detail Match API). If not provided for a market, that market is skipped — runners are never inferred from bets.
  * 
  * @param bets - Array of ALL open bets
  * @param marketSelectionsMap - Optional map of marketId -> runner IDs array
@@ -498,31 +507,20 @@ export function calculateAllPositions(
   
   for (const [marketId, marketBets] of bookmakerBetsByMarket.entries()) {
     const marketSelections = marketSelectionsMap?.get(marketId);
-    
-    // ✅ CRITICAL: If marketSelections not provided, derive from bets as fallback
-    // This ensures newly placed bets are included even if not in marketSelectionsMap
-    let finalMarketSelections = marketSelections;
-    if (!finalMarketSelections || finalMarketSelections.length === 0) {
-      // Derive from bets as fallback
-      finalMarketSelections = Array.from(
-        new Set(
-          marketBets
-            .map((bet) => bet.selectionId)
-            .filter((id): id is number => id !== null && id !== undefined)
-            .map((id) => String(id))
-        )
-      );
+
+    // ✅ Same rule as Match Odds: runner list must come from market data (map), never from bets.
+    // Incomplete lists omit third runners and mis-state P/L; callers must populate the map from getMatchDetail (or equivalent).
+    if (!marketSelections || marketSelections.length === 0) {
+      continue;
     }
-    
-    if (finalMarketSelections && finalMarketSelections.length > 0) {
-      const bookmakerPosition = calculateBookmakerPosition(
-        marketBets,
-        marketId,
-        finalMarketSelections,
-      );
-      if (bookmakerPosition) {
-        bookmakerPositions.push(bookmakerPosition);
-      }
+
+    const bookmakerPosition = calculateBookmakerPosition(
+      marketBets,
+      marketId,
+      marketSelections,
+    );
+    if (bookmakerPosition) {
+      bookmakerPositions.push(bookmakerPosition);
     }
   }
   

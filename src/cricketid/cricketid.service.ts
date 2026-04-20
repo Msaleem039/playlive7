@@ -44,7 +44,7 @@ export class CricketIdService {
    */
   private readonly REDIS_TTL = {
     // Odds / Fancy / Bookmaker → very frequent updates (prices move in real time)
-    VENDOR_ODDS: 4,       // 4s: Betfair odds change constantly; short TTL for accurate live betting.
+    VENDOR_ODDS: 3,       // 3s: Match-odds polling cadence + fresh enough for live betting.
     VENDOR_FANCY: 4,      // 4s: Fancy markets update frequently; balance freshness vs API load.
     VENDOR_BOOKMAKER: 4,  // 4s: Bookmaker lines move often; keep cache brief for responsiveness.
 
@@ -838,6 +838,7 @@ export class CricketIdService {
       '12649673',
       '9962116',
       '9992899',
+      '9886504',
     ]);
     const listCompetitionId = (item: any) =>
       String(
@@ -1016,13 +1017,17 @@ export class CricketIdService {
    * 
    * @param marketIds - Comma-separated market IDs (e.g., "1.250049502,1.250049500")
    */
-  async getBetfairOdds(marketIds: string) {
+  async getBetfairOdds(marketIds: string, options?: { skipCache?: boolean }) {
     // ✅ PERFORMANCE: Try Redis cache first
     const cacheKey = this.redisService.getVendorKey('odds-v2', marketIds);
-    const cached = await this.redisService.get<any>(cacheKey);
-    if (cached) {
-      this.logger.debug(`Redis cache HIT for odds: ${marketIds}`);
-      return cached;
+    if (options?.skipCache) {
+      await this.redisService.delAwait(cacheKey);
+    } else {
+      const cached = await this.redisService.get<any>(cacheKey);
+      if (cached) {
+        this.logger.debug(`Redis cache HIT for odds: ${marketIds}`);
+        return cached;
+      }
     }
 
     // Cache miss - fetch from fair-demo API (old vendor removed)

@@ -546,116 +546,95 @@ export class BetsService {
 
   // ---------------------------------- MAIN LOGIC (CENTRALIZED MASTER FUNCTION) ---------------------------------- //
 
+  /** Same shape as GET /cricketid/odds (fair-demo / Betfair runners). */
+  private unwrapBetfairOddsMarkets(payload: unknown): any[] {
+    if (Array.isArray(payload)) return payload;
+    if (payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data)) {
+      return (payload as { data: any[] }).data;
+    }
+    return [];
+  }
+
+  private extractBetfairBestPrices(runner: any): { bestBack: number | null; bestLay: number | null } {
+    const ex = runner?.ex;
+    const backs = Array.isArray(ex?.availableToBack) ? ex.availableToBack : [];
+    const lays = Array.isArray(ex?.availableToLay) ? ex.availableToLay : [];
+    const backPrices = backs
+      .map((x: { price?: unknown; p?: unknown }) => Number(x?.price ?? x?.p ?? 0))
+      .filter((n: number) => Number.isFinite(n) && n > 0);
+    const layPrices = lays
+      .map((x: { price?: unknown; p?: unknown }) => Number(x?.price ?? x?.p ?? 0))
+      .filter((n: number) => Number.isFinite(n) && n > 0);
+    return {
+      bestBack: backPrices.length ? Math.max(...backPrices) : null,
+      bestLay: layPrices.length ? Math.min(...layPrices) : null,
+    };
+  }
+
   /**
-   * ✅ VALIDATE RATE AVAILABILITY
-   * Checks if the requested rate/odds is currently available in the market
-   * 
-   * @param eventId - Event ID
-   * @param marketId - Market ID
-   * @param marketType - Market type: 'matchodds' | 'fancy' | 'bookmaker'
-   * @param requestedRate - The rate/odds being requested
-   * @param selectionId - Selection ID (for match odds and fancy)
-   * @param betType - Bet type: 'BACK' | 'LAY' (to match otype)
-   * @throws HttpException if rate is not available
+   * Match Odds only: ensure client price is still achievable on the same Betfair feed as GET /cricketid/odds.
+   * Fancy / bookmaker are not validated here (different feeds and line models).
    */
-  private async validateRateAvailability(
-    eventId: string,
-    marketId: string,
-    marketType: string,
-    requestedRate: number,
-    selectionId: number,
-    betType?: string,
-  ): Promise<number> {
+  private async assertMatchOddsRateAgainstBetfair(params: {
+    marketId: string;
+    selectionId: number;
+    betType: string;
+    requestedDecimal: number;
+  }): Promise<void> {
+    const { marketId, selectionId, betType, requestedDecimal } = params;
+    const eps = 1e-4;
     try {
-      const marketData = await this.cricketIdService.getBookmakerFancy(eventId);
-  
-      if (!marketData?.data || !Array.isArray(marketData.data)) {
+      const oddsPayload = await this.cricketIdService.getBetfairOdds(marketId, { skipCache: true });
+      const markets = this.unwrapBetfairOddsMarkets(oddsPayload);
+      const mid = String(marketId).trim();
+      const market = markets.find((m: any) => String(m?.marketId ?? '').trim() === mid);
+      if (!market) {
         throw new HttpException(
           { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
           400,
         );
       }
-  
-      const expectedOtype = betType?.toUpperCase() === 'LAY' ? 'lay' : 'back';
-      const side = betType?.toUpperCase();
-  
-      let marketFound = false;
-      let acceptedRate: number | null = null;
-  
-      for (const market of marketData.data) {
-        const mname = (market.mname || '').toUpperCase();
-  
-        if (marketType === 'matchodds' && mname !== 'MATCH_ODDS') continue;
-        if (marketType === 'bookmaker' && !mname.includes('BOOKMAKER')) continue;
-        if (
-          marketType === 'fancy' &&
-          (mname === 'MATCH_ODDS' || mname === 'BOOKMAKER' || mname === 'TIED_MATCH')
-        ) {
-          continue;
-        }
-  
-        marketFound = true;
-  
-        if (!Array.isArray(market.section)) continue;
-  
-        for (const section of market.section) {
-          const sectionSid = Number(section.sid || 0);
-          if (selectionId > 0 && sectionSid !== selectionId) continue;
-  
-          if (!Array.isArray(section.odds)) continue;
-  
-          for (const odd of section.odds) {
-            const availableRate = Number(odd.odds || 0);
-            const oddOtype = (odd.otype || '').toLowerCase();
-  
-            if (availableRate <= 0) continue;
-            if (betType && oddOtype !== expectedOtype) continue;
-  
-            // 🎯 CLIENT REQUIREMENT:
-            // Always accept CURRENT market rate
-            // Direction check only (BACK / LAY safety)
-  
-            if (side === 'BACK' && availableRate >= requestedRate) {
-              acceptedRate = availableRate;
-              break;
-            }
-  
-            if (side === 'LAY' && availableRate <= requestedRate) {
-              acceptedRate = availableRate;
-              break;
-            }
-          }
-  
-          if (acceptedRate !== null) break;
-        }
-  
-        if (acceptedRate !== null) break;
-      }
-  
-      if (!marketFound || acceptedRate === null) {
+      const runners = Array.isArray(market?.runners) ? market.runners : [];
+      const sid = String(selectionId);
+      const runner = runners.find(
+        (r: any) => String(r?.selectionId ?? r?.id ?? '').trim() === sid,
+      );
+      if (!runner) {
         throw new HttpException(
           { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
           400,
         );
       }
-  
-      // ✅ RETURN latest market rate (not requestedRate)
-      return acceptedRate;
+      const { bestBack, bestLay } = this.extractBetfairBestPrices(runner);
+      const side = (betType || '').toUpperCase();
+      if (side === 'BACK') {
+        if (bestBack === null || bestBack + eps < requestedDecimal) {
+          throw new HttpException(
+            { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
+            400,
+          );
+        }
+      } else if (side === 'LAY' || side === 'NO') {
+        if (bestLay === null || bestLay - eps > requestedDecimal) {
+          throw new HttpException(
+            { success: false, error: 'Rate not matched', code: 'RATE_NOT_MATCHED' },
+            400,
+          );
+        }
+      }
     } catch (error) {
       if (error instanceof HttpException) throw error;
-  
       this.logger.error(
-        `Error validating rate availability: eventId=${eventId}, requestedRate=${requestedRate}`,
+        `Match Odds rate validation failed: marketId=${marketId}, selectionId=${selectionId}, requested=${requestedDecimal}`,
         error,
       );
-  
       throw new HttpException(
         { success: false, error: 'Rate not matched', code: 'RATE_VALIDATION_ERROR' },
         400,
       );
     }
   }
-  
+
 
   async placeBet(input: PlaceBetDto) {
     // 🔍 PERF: Start timing IMMEDIATELY at function entry
@@ -905,6 +884,16 @@ export class BetsService {
       lossAmount: normalizedLossAmount,
       marketType: actualMarketType,
     });
+
+    // Match Odds only: live price check against same Betfair feed as GET /cricketid/odds (not bookmaker-fancy).
+    if (betGtype === 'matchodds' && normalizedSelectionId > 0) {
+      await this.assertMatchOddsRateAgainstBetfair({
+        marketId,
+        selectionId: normalizedSelectionId,
+        betType: bet_type,
+        requestedDecimal: normalizedBetRate,
+      });
+    }
 
     try {
       // 🔐 STEP 1: Load wallet & ALL pending bets (SNAPSHOT STATE)

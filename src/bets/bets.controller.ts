@@ -12,6 +12,7 @@ import {
 import { PlaceBetDto } from './bets.dto';
 import { BetsService } from './bets.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { Playlive24OriginGuard } from '../common/guards/playlive24-origin.guard';
 
 @Controller('bf_placeBet_api')
 export class BetsController {
@@ -20,7 +21,7 @@ export class BetsController {
   constructor(private readonly betsService: BetsService) {}
 
   @Post()
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, Playlive24OriginGuard)
   async placeBet(@Body() dto: PlaceBetDto) {
     try {
       return await this.betsService.placeBet(dto);

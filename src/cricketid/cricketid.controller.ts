@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Logger, Param, Post, Query, HttpException, HttpStatus, BadRequestException } from '@nestjs/common';
+import { Body, Controller, Get, Header, Logger, Param, Post, Query, HttpException, HttpStatus, BadRequestException } from '@nestjs/common';
 import { CricketIdService } from './cricketid.service';
 
 @Controller('cricketid')
@@ -109,8 +109,12 @@ export class CricketIdController {
    * - GET /cricketid/odds?eventId=…&sportId=1   (1=soccer, 2=tennis, 4=cricket; omit = try 4→1→2)
    *
    * When eventId is provided, Match Odds marketId(s) are resolved automatically.
+   *
+   * Response includes header `X-Match-Odds-Poll-Seconds: 3` — recommended minimum interval
+   * before the next Match Odds odds refresh (aligned with server-side odds cache TTL).
    */
   @Get('odds')
+  @Header('X-Match-Odds-Poll-Seconds', '3')
   async getBetfairOdds(@Query() query: Record<string, string | number | undefined>) {
     const marketIds = query?.marketIds;
     if (marketIds) {

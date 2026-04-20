@@ -87,6 +87,15 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     this.client.del(key).catch(() => {});
   }
 
+  /** Await cache key removal (e.g. force-fresh vendor read on bet placement). */
+  async delAwait(key: string): Promise<void> {
+    try {
+      await this.client.del(key);
+    } catch {
+      // ignore — cache is optional
+    }
+  }
+
   // ❌ REMOVED: delPattern() - Redis KEYS command is blocking and causes latency
   // Use explicit key deletion instead: del(`user:${userId}:positions`)
 

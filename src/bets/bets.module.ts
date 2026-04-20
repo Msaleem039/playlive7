@@ -7,11 +7,13 @@ import { BookmakerExposureService } from './bookmaker-exposure.service';
 import { FancyExposureService } from './fancy-exposure.service';
 import { BetProcessingQueue } from './bet-processing.queue';
 import { BetProcessingWorker } from './bet-processing.worker';
+import { Playlive24OriginGuard } from '../common/guards/playlive24-origin.guard';
 
 @Module({
   imports: [CricketIdModule],
   controllers: [BetsController],
   providers: [
+    Playlive24OriginGuard,
     BetsService,
     MatchOddsExposureService,
     BookmakerExposureService,
