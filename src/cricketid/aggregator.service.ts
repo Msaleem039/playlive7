@@ -426,27 +426,39 @@ export class AggregatorService {
    * 
    * @param eventId - Event ID
    */
-  async getMatchDetail(eventId: string) {
+  async getMatchDetail(eventId: string, sportId?: string | number) {
+    const hasExplicitSportId =
+      sportId !== undefined && sportId !== null && String(sportId).trim() !== '';
+    const normalizedSportId = hasExplicitSportId ? String(sportId) : 'auto';
     // ✅ PERFORMANCE: Try Redis cache first
-    const cacheKey = this.redisService.getVendorKey('match-detail', eventId);
+    const cacheKey = this.redisService.getVendorKey('match-detail', `${normalizedSportId}:${eventId}`);
     const cached = await this.redisService.get<any>(cacheKey);
     if (cached) {
-      this.logger.debug(`Redis cache HIT for match-detail: ${eventId}`);
+      this.logger.debug(`Redis cache HIT for match-detail: eventId=${eventId}, sportId=${normalizedSportId}`);
       return cached;
     }
 
     // Cache miss - fetch from CricketIdService (marketId/eventId normalized flow)
-    this.logger.debug(`Redis cache MISS for match-detail: ${eventId} - fetching from CricketIdService`);
+    this.logger.debug(
+      `Redis cache MISS for match-detail: eventId=${eventId}, sportId=${normalizedSportId} - fetching from CricketIdService`,
+    );
     try {
-      const response = await this.cricketIdService.getMatchDetails(eventId);
+      const response = await this.cricketIdService.getMatchDetails(
+        eventId,
+        hasExplicitSportId ? String(sportId) : undefined,
+      );
       
       // ✅ PERFORMANCE: Store in Redis for future requests (await to ensure it's set)
       try {
         await this.redisService.set(cacheKey, response, this.REDIS_TTL.VENDOR_MATCH_DETAIL);
-        this.logger.debug(`Redis cache SET for match-detail: ${eventId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`);
+        this.logger.debug(
+          `Redis cache SET for match-detail: eventId=${eventId}, sportId=${normalizedSportId} (TTL: ${this.REDIS_TTL.VENDOR_MATCH_DETAIL}s)`,
+        );
       } catch (error) {
         // Log but don't fail - cache is optional
-        this.logger.warn(`Failed to set Redis cache for match-detail ${eventId}: ${error instanceof Error ? error.message : String(error)}`);
+        this.logger.warn(
+          `Failed to set Redis cache for match-detail eventId=${eventId}, sportId=${normalizedSportId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
       
       return response;
@@ -456,11 +468,14 @@ export class AggregatorService {
       if (status === 400) {
         // Log as debug instead of error - these are expected when eventIds are expired/invalid
         this.logger.debug(
-          `EventId ${eventId} is invalid or expired (expected): ${error?.message || 'Invalid resource'}`,
+          `EventId ${eventId} is invalid or expired for sportId=${normalizedSportId} (expected): ${error?.message || 'Invalid resource'}`,
         );
       } else {
         // Log other errors (5xx, network errors, etc.) as errors
-        this.logger.error(`Error fetching match detail for eventId ${eventId}:`, error);
+        this.logger.error(
+          `Error fetching match detail for eventId=${eventId}, sportId=${normalizedSportId}:`,
+          error,
+        );
       }
       throw error;
     }

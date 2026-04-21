@@ -616,18 +616,41 @@ export class AuthService {
       const limit = statementFilters?.limit ?? 1000;
       const offset = statementFilters?.offset ?? 0;
 
-      return users.map((user) => {
+      return Promise.all(users.map(async (user) => {
         const balance = user.wallet?.balance ?? 0;
         const betHistory = betHistoryMap.get(user.id);
         const bets: any[] = (betHistory?.data ?? []) as any[];
 
-        // Group bets by marketId + selectionId
-        const groupKey = (b: any) => `${b.marketId ?? ''}|${b.selectionId ?? ''}`;
+        // Group bets by marketId so each statement line includes both winner + loser bets.
+        const groupKey = (b: any) =>
+          `${b.marketId ?? ''}|${b.eventId ?? ''}|${b.marketName ?? ''}|${b.settlementId ?? ''}`;
         const groups = new Map<string, any[]>();
         for (const b of bets) {
           const key = groupKey(b);
           if (!groups.has(key)) groups.set(key, []);
           groups.get(key)!.push(b);
+        }
+
+        // Build settlement winner map to resolve winner team name for description.
+        const settlementIds = [
+          ...new Set(
+            bets
+              .map((b) => (typeof b?.settlementId === 'string' ? b.settlementId.trim() : ''))
+              .filter((sid) => sid.length > 0),
+          ),
+        ];
+        const settlementWinnerById = new Map<string, string | null>();
+        if (settlementIds.length > 0) {
+          const settlements = await this.prisma.settlement.findMany({
+            where: { settlementId: { in: settlementIds } },
+            select: {
+              settlementId: true,
+              winnerId: true,
+            },
+          });
+          for (const s of settlements) {
+            settlementWinnerById.set(s.settlementId, s.winnerId ?? null);
+          }
         }
 
         const statementEntries: any[] = [];
@@ -652,7 +675,15 @@ export class AuthService {
             const t = b.settledAt ? new Date(b.settledAt).getTime() : 0;
             return t > max ? t : max;
           }, 0);
+          const winnerSelectionIdRaw = groupBets
+            .map((b) => settlementWinnerById.get(String(b?.settlementId ?? '')))
+            .find((winnerId) => winnerId !== null && winnerId !== undefined && String(winnerId).trim() !== '');
+          const winnerSelectionId = Number(winnerSelectionIdRaw);
+          const winnerBet =
+            Number.isFinite(winnerSelectionId) &&
+            groupBets.find((b) => Number(b?.selectionId) === winnerSelectionId);
           const description =
+            winnerBet?.betName ||
             first?.betName ||
             first?.marketName ||
             first?.match?.eventName ||
@@ -660,7 +691,9 @@ export class AuthService {
             'Market';
           statementEntries.push({
             marketId: first?.marketId ?? null,
-            selectionId: first?.selectionId ?? null,
+            selectionId: Number.isFinite(winnerSelectionId)
+              ? winnerSelectionId
+              : (first?.selectionId ?? null),
             description,
             totalStake,
             amount,
@@ -765,7 +798,7 @@ export class AuthService {
             totalRecords,
           },
         };
-      });
+      }));
     }
 
     // Return basic subordinate information with optional transactions and bet history

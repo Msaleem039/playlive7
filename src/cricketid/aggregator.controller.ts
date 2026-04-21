@@ -22,8 +22,11 @@ export class AggregatorController {
 
   // GET /cricketid/aggregator/match/35044997
   @Get('match/:eventId')
-  async getMatch(@Param('eventId') eventId: string) {
-    return this.service.getMatchDetail(eventId);
+  async getMatch(
+    @Param('eventId') eventId: string,
+    @Query('sportId') sportId?: string | number,
+  ) {
+    return this.service.getMatchDetail(eventId, sportId);
   }
 
   // GET /cricketid/aggregator/odds?eventId=34917574&marketIds=1.250049502,1.250049500

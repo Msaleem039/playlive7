@@ -445,18 +445,25 @@ export class CricketIdService {
   // }
   async getMatchDetails(
     eventId: string,
-    sportId: string | number = this.DEFAULT_SPORT_ID,
+    sportId?: string | number | null,
   ) {
-    const sid = this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID);
     const eid = String(eventId);
+    const trySports: number[] =
+      sportId !== undefined && sportId !== null && String(sportId).trim() !== ''
+        ? [this.normalizeSportId(sportId, this.DEFAULT_SPORT_ID)]
+        : [4, 1, 2];
 
-    // Source of truth: listeventsbysport feed (same data you show in frontend list)
-    const match: any = await this.getEventDetailFromSportFeed(eid, sid);
-    if (!match) return null;
-    // Keep response format consistent with marketId flow (normalized array).
-    const marketId = String(match?.MarketId ?? match?.marketId ?? '').trim();
-    if (!marketId) return [];
-    return this.getMatchDetailByMarketId(marketId);
+    for (const sid of trySports) {
+      // Source of truth: listeventsbysport feed (same data shown in frontend list)
+      const match: any = await this.getEventDetailFromSportFeed(eid, sid);
+      if (!match) continue;
+      // Keep response format consistent with marketId flow (normalized array).
+      const marketId = String(match?.MarketId ?? match?.marketId ?? '').trim();
+      if (!marketId) return [];
+      return this.getMatchDetailByMarketId(marketId);
+    }
+
+    return null;
   }
 
   /**
