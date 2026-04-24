@@ -885,8 +885,9 @@ export class BetsService {
       marketType: actualMarketType,
     });
 
-    // Match Odds only: live price check against same Betfair feed as GET /cricketid/odds (not bookmaker-fancy).
-    if (betGtype === 'matchodds' && normalizedSelectionId > 0) {
+    // Match Odds only: live price check against same Betfair feed as GET /cricketid/odds.
+    // Tied Match runs on a different market source (Yes/No), so skip Betfair runner-rate validation.
+    if (betGtype === 'matchodds' && normalizedSelectionId > 0 && !isTiedMatchMarket) {
       await this.assertMatchOddsRateAgainstBetfair({
         marketId,
         selectionId: normalizedSelectionId,
@@ -1440,7 +1441,8 @@ export class BetsService {
         // ✅ MARKET ISOLATION: Use market-specific position functions
         // Position calculation is read-only and does not affect wallet or bet status
         if (isTiedMatchMarket) {
-          // TIED_MATCH should be calculated in tied market bucket, not match odds.
+          // TIED_MATCH is still a match-odds style position (decimal odds math),
+          // but we keep it separate in the response/UI bucket.
           const marketSelections = Array.from(
             new Set(
               pendingBets
@@ -1451,7 +1453,7 @@ export class BetsService {
           );
 
           if (marketSelections.length > 0) {
-            const tiedMatchPosition = calculateBookmakerPosition(
+            const tiedMatchPosition = calculateMatchOddsPosition(
               pendingBets as Bet[],
               marketId,
               marketSelections,

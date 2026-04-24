@@ -306,14 +306,22 @@ export class PositionsController {
               const matchOddsMarket = this.resolveCatalogMarketNode(markets, marketId, marketBets, 'matchOdds');
               
               if (matchOddsMarket && matchOddsMarket.runners && Array.isArray(matchOddsMarket.runners)) {
+                const isTiedMatchCatalogMarket = this.isTiedMatchMarketName(matchOddsMarket.marketName);
                 // Extract selectionIds from runners (same structure as pending bets API)
                 const apiSelectionIds = matchOddsMarket.runners
                   .map((runner: any) => {
                     const selectionId = runner.selectionId;
                     const runnerName = (runner.runnerName || runner.name || '').toLowerCase();
-                    // Skip Yes/No runners (Tied Match market) and Tie/Draw runners (Match Odds Including Tie)
-                    if (runnerName === 'yes' || runnerName === 'no' || 
-                        runnerName === 'tie' || runnerName === 'the draw' || runnerName === 'draw') {
+                    // For regular Match Odds, skip Tie/Draw outcomes.
+                    // For Tied Match markets, keep Yes/No runners.
+                    if (
+                      !isTiedMatchCatalogMarket &&
+                      (runnerName === 'yes' ||
+                        runnerName === 'no' ||
+                        runnerName === 'tie' ||
+                        runnerName === 'the draw' ||
+                        runnerName === 'draw')
+                    ) {
                       return null;
                     }
                     return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;

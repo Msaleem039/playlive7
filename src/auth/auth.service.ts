@@ -664,6 +664,7 @@ export class AuthService {
           const netPnl = totalCredit - totalDebit;
           const amount = Math.abs(netPnl);
           const amountType = netPnl >= 0 ? 'credit' : 'debit';
+          const result = netPnl >= 0 ? 'win' : 'loss';
           const decisionRunCandidate = groupBets.find(
             (b) => b?.decisionRun !== null && b?.decisionRun !== undefined,
           );
@@ -698,19 +699,57 @@ export class AuthService {
             totalStake,
             amount,
             amountType,
+            result,
             decisionRun,
             netPnl,
             runningBalance: 0, // filled below
             win: totalCredit,
             loss: totalDebit,
+            netWinLoss: amount,
             latestSettledAt: latestSettledAt ? new Date(latestSettledAt).toISOString() : null,
             bets: groupBets.map((b: any) => ({
               id: b.id,
               time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
               betType: b.betType,
+              betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
               odds: b.odds,
               stake: Number(b.amount) || 0,
               pnl: Number(b.pnl) ?? 0,
+              result: (Number(b.pnl) || 0) >= 0 ? 'win' : 'loss',
+              decisionRun:
+                b?.decisionRun !== null &&
+                b?.decisionRun !== undefined &&
+                Number.isFinite(Number(b.decisionRun))
+                  ? Number(b.decisionRun)
+                  : null,
+              status: b.status,
+            })),
+            winBets: wins.map((b: any) => ({
+              id: b.id,
+              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
+              betType: b.betType,
+              betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
+              odds: b.odds,
+              stake: Number(b.amount) || 0,
+              pnl: Number(b.pnl) ?? 0,
+              result: 'win',
+              decisionRun:
+                b?.decisionRun !== null &&
+                b?.decisionRun !== undefined &&
+                Number.isFinite(Number(b.decisionRun))
+                  ? Number(b.decisionRun)
+                  : null,
+              status: b.status,
+            })),
+            lossBets: losses.map((b: any) => ({
+              id: b.id,
+              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
+              betType: b.betType,
+              betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
+              odds: b.odds,
+              stake: Number(b.amount) || 0,
+              pnl: Number(b.pnl) ?? 0,
+              result: 'loss',
               decisionRun:
                 b?.decisionRun !== null &&
                 b?.decisionRun !== undefined &&
