@@ -683,19 +683,21 @@ export class AuthService {
           const winnerBet =
             Number.isFinite(winnerSelectionId) &&
             groupBets.find((b) => Number(b?.selectionId) === winnerSelectionId);
-          const description =
+          const marketDescription =
             winnerBet?.betName ||
             first?.betName ||
             first?.marketName ||
             first?.match?.eventName ||
             (first?.match ? `${first.match.homeTeam || ''} - ${first.match.awayTeam || ''}`.trim() : '') ||
             'Market';
+          const betLabel = netPnl >= 0 ? 'Bet Win' : 'Bet Loss';
           statementEntries.push({
+            type: 'bet',
             marketId: first?.marketId ?? null,
             selectionId: Number.isFinite(winnerSelectionId)
               ? winnerSelectionId
               : (first?.selectionId ?? null),
-            description,
+            description: `${betLabel} - ${marketDescription}`,
             totalStake,
             amount,
             amountType,
@@ -703,6 +705,7 @@ export class AuthService {
             decisionRun,
             netPnl,
             runningBalance: 0, // filled below
+            date: latestSettledAt ? new Date(latestSettledAt).toISOString() : null,
             win: totalCredit,
             loss: totalDebit,
             netWinLoss: amount,
@@ -761,42 +764,59 @@ export class AuthService {
           });
         }
 
-        // Sort by latestSettledAt desc (newest first)
+        // Merge transfer logs (cash in/out) into statement timeline.
+        const transferLogs = transferLogsMap.get(user.id) || [];
+        for (const log of transferLogs) {
+          const isCashIn = log.type === TransferLogType.TOPUP && log.toUserId === user.id;
+          const isCashOut = log.type === TransferLogType.TOPDOWN && log.fromUserId === user.id;
+          if (!isCashIn && !isCashOut) continue;
+
+          statementEntries.push({
+            type: isCashIn ? 'cashIn' : 'cashOut',
+            amount: Number(log.amount) || 0,
+            netPnl: 0,
+            date: log.createdAt ? new Date(log.createdAt).toISOString() : null,
+            latestSettledAt: log.createdAt ? new Date(log.createdAt).toISOString() : null,
+            description: isCashIn ? 'Cash In' : 'Cash Out',
+            runningBalance: 0, // filled below
+            id: log.id,
+            transferType: log.type,
+            result: null,
+            credit: isCashIn ? Number(log.amount) || 0 : 0,
+            debit: isCashOut ? Number(log.amount) || 0 : 0,
+          });
+        }
+
+        // Sort by date ASC for running-balance calculation.
         statementEntries.sort((a, b) => {
-          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
-          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
-          return tb - ta;
-        });
-
-        const totalNetPnl = statementEntries.reduce((s, e) => s + (e.netPnl || 0), 0);
-        // Use settled cash baseline for statement running balance.
-        // balance can move on bet placement, while liability represents open exposure.
-        // balance + liability reflects cash before unsettled exposure impact.
-        const settledCashBalance = balance + (user.wallet?.liability ?? 0);
-        const openingBalance = settledCashBalance - totalNetPnl;
-
-        // Compute running balance: sort by oldest first, then cumulative
-        const byOldest = [...statementEntries].sort((a, b) => {
-          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
-          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
+          const ta = a.date ? new Date(a.date).getTime() : (a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0);
+          const tb = b.date ? new Date(b.date).getTime() : (b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0);
           return ta - tb;
         });
-        let run = openingBalance;
-        for (const e of byOldest) {
-          e.runningBalance = run + (e.netPnl || 0);
-          run = e.runningBalance;
+
+        // Running balance starts from zero and evolves naturally by entry type.
+        let run = 0;
+        for (const e of statementEntries) {
+          if (e.type === 'cashIn') {
+            run += Number(e.amount) || 0;
+          } else if (e.type === 'cashOut') {
+            run -= Number(e.amount) || 0;
+          } else {
+            run += Number(e.netPnl) || 0;
+          }
+          e.runningBalance = run;
         }
-        // Re-sort by newest first for response
+
+        // Reverse to DESC order for API response.
         statementEntries.sort((a, b) => {
-          const ta = a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0;
-          const tb = b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0;
+          const ta = a.date ? new Date(a.date).getTime() : (a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0);
+          const tb = b.date ? new Date(b.date).getTime() : (b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0);
           return tb - ta;
         });
 
         const totalRecords = statementEntries.length;
         const page = Math.floor(offset / limit) + 1;
         const paginatedStatement = statementEntries.slice(offset, offset + limit);
-        const transferLogs = transferLogsMap.get(user.id) || [];
         const transactions = transferLogs.map((log) => {
           const isCashIn = log.type === TransferLogType.TOPUP && log.toUserId === user.id;
           const isCashOut = log.type === TransferLogType.TOPDOWN && log.fromUserId === user.id;
@@ -827,7 +847,7 @@ export class AuthService {
             liability: user.wallet?.liability ?? 0,
             availableBalance: balance - (user.wallet?.liability ?? 0),
             profitLoss: pnlMap[user.id] ?? 0,
-            openingBalance,
+            openingBalance: 0,
           },
           statement: paginatedStatement,
           transactions,

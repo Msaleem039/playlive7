@@ -46,6 +46,14 @@ export class PositionsController {
     );
   }
 
+  private isBinaryYesNoMarket(runners: any[] | null | undefined): boolean {
+    if (!Array.isArray(runners) || runners.length !== 2) return false;
+    const names = runners
+      .map((r: any) => String(r?.runnerName || r?.name || '').trim().toLowerCase())
+      .filter(Boolean);
+    return names.includes('yes') && names.includes('no');
+  }
+
   /**
    * Match a catalog market node from getMatchDetail(eventId) to open bets on bet.marketId.
    *
@@ -58,7 +66,7 @@ export class PositionsController {
   private resolveCatalogMarketNode(
     markets: any[],
     betMarketId: string,
-    marketBets: Array<{ selectionId: number | null | undefined }>,
+    marketBets: Array<{ selectionId: number | null | undefined; marketName?: string | null }>,
     kind: 'matchOdds' | 'bookmaker',
   ): any | null {
     if (!Array.isArray(markets) || markets.length === 0) {
@@ -71,6 +79,58 @@ export class PositionsController {
     }
 
     if (kind === 'matchOdds') {
+      const betLooksTiedMatch = marketBets.some((b) => this.isTiedMatchMarketName(b.marketName));
+      if (betLooksTiedMatch) {
+        // For tied-match bets, map ONLY via tied/Yes-No candidates or selection overlap.
+        // Do not fall back to generic "match odds" name, which can mis-route to 2-runner market.
+        const betSelections = new Set(
+          marketBets
+            .map((b) => b.selectionId)
+            .filter((id): id is number => id !== null && id !== undefined)
+            .map((id) => String(id)),
+        );
+        const runnerIdSet = (m: any): Set<string> =>
+          new Set(
+            (Array.isArray(m?.runners) ? m.runners : [])
+              .map((r: any) => (r?.selectionId != null && r?.selectionId !== undefined ? String(r.selectionId) : null))
+              .filter((id): id is string => id !== null),
+          );
+        const tiedCandidates = markets.filter(
+          (m: any) =>
+            this.isTiedMatchMarketName(m?.marketName) ||
+            this.isBinaryYesNoMarket(Array.isArray(m?.runners) ? m.runners : []),
+        );
+        if (tiedCandidates.length > 0) {
+          const tiedByExact = tiedCandidates.find(
+            (m: any) => String(m?.marketId) === String(betMarketId),
+          );
+          if (tiedByExact && Array.isArray(tiedByExact.runners) && tiedByExact.runners.length > 0) {
+            return tiedByExact;
+          }
+          tiedCandidates.sort((a, b) => (b.runners?.length || 0) - (a.runners?.length || 0));
+          return tiedCandidates[0];
+        }
+
+        if (betSelections.size > 0) {
+          const containsAll = markets.filter((m) => {
+            const rs = runnerIdSet(m);
+            if (rs.size === 0) return false;
+            return [...betSelections].every((id) => rs.has(id));
+          });
+          const overlap = markets.filter((m) => {
+            const rs = runnerIdSet(m);
+            return [...betSelections].some((id) => rs.has(id));
+          });
+          const pool = containsAll.length > 0 ? containsAll : overlap;
+          if (pool.length > 0) {
+            pool.sort((a, b) => (b.runners?.length || 0) - (a.runners?.length || 0));
+            return pool[0];
+          }
+        }
+
+        return null;
+      }
+
       const isMoLikeName = (marketName: string) => {
         const n = String(marketName || '').trim().toLowerCase();
         if (!n) return false;
@@ -214,9 +274,17 @@ export class PositionsController {
         );
       }
 
-      // ✅ CRITICAL: Use selectionIds from bets (these match UI/Match Detail API selectionIds)
-      // This ensures Position API returns selectionIds that match what the UI expects
+      // ✅ CRITICAL: runner ids must come from getMatchDetail API (source of truth)
       const marketSelectionsMap = new Map<string, string[]>();
+      // Pre-register tied markets from bet payload itself so tie calculation still runs
+      // even when catalog mapping fails for that marketId.
+      const tiedMatchMarketIds = new Set<string>(
+        openBets
+          .filter((bet) => this.isTiedMatchMarketName(bet.marketName))
+          .map((bet) => bet.marketId)
+          .filter((id): id is string => Boolean(id)),
+      );
+      const tiedMarketYesNoSelections = new Map<string, { yesSelectionId: string; noSelectionId: string }>();
       
       // Group Match Odds bets by eventId and marketId
       const matchOddsBetsByEvent = new Map<string, Map<string, typeof openBets>>();
@@ -306,24 +374,14 @@ export class PositionsController {
               const matchOddsMarket = this.resolveCatalogMarketNode(markets, marketId, marketBets, 'matchOdds');
               
               if (matchOddsMarket && matchOddsMarket.runners && Array.isArray(matchOddsMarket.runners)) {
-                const isTiedMatchCatalogMarket = this.isTiedMatchMarketName(matchOddsMarket.marketName);
-                // Extract selectionIds from runners (same structure as pending bets API)
+                const isBinaryYesNo = this.isBinaryYesNoMarket(matchOddsMarket.runners);
+                const isTiedMatchCatalogMarket =
+                  this.isTiedMatchMarketName(matchOddsMarket.marketName) || isBinaryYesNo;
+
+                // Extract selectionIds from runners - keep full list from API.
                 const apiSelectionIds = matchOddsMarket.runners
                   .map((runner: any) => {
                     const selectionId = runner.selectionId;
-                    const runnerName = (runner.runnerName || runner.name || '').toLowerCase();
-                    // For regular Match Odds, skip Tie/Draw outcomes.
-                    // For Tied Match markets, keep Yes/No runners.
-                    if (
-                      !isTiedMatchCatalogMarket &&
-                      (runnerName === 'yes' ||
-                        runnerName === 'no' ||
-                        runnerName === 'tie' ||
-                        runnerName === 'the draw' ||
-                        runnerName === 'draw')
-                    ) {
-                      return null;
-                    }
                     return selectionId !== null && selectionId !== undefined ? String(selectionId) : null;
                   })
                   .filter((id): id is string => id !== null);
@@ -332,12 +390,50 @@ export class PositionsController {
                   `Match Odds API (eventId ${eventId}, marketId ${marketId}): Found ${apiSelectionIds.length} runners from getMatchDetail. ` +
                   `SelectionIds: [${apiSelectionIds.join(', ')}]`,
                 );
+                if (apiSelectionIds.length === 3) {
+                  const runnerNames = matchOddsMarket.runners
+                    .map((runner: any) => String(runner?.runnerName || runner?.name || '').trim())
+                    .filter(Boolean);
+                  this.logger.debug(
+                    `3-runner Match Odds detected (eventId ${eventId}, marketId ${marketId}): ` +
+                    `runners=[${runnerNames.join(', ')}], selectionIds=[${apiSelectionIds.join(', ')}]`,
+                  );
+                }
                 
-                // ✅ Use ONLY API selectionIds (source of truth for market runners)
-                marketSelectionsMap.set(marketId, apiSelectionIds);
-                this.logger.debug(
-                  `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${apiSelectionIds.length} selectionIds from API: [${apiSelectionIds.join(', ')}]`,
-                );
+                if (isTiedMatchCatalogMarket) {
+                  tiedMatchMarketIds.add(marketId);
+                  if (isBinaryYesNo) {
+                    const yesRunner = matchOddsMarket.runners.find(
+                      (r: any) => String(r?.runnerName || r?.name || '').trim().toLowerCase() === 'yes',
+                    );
+                    const noRunner = matchOddsMarket.runners.find(
+                      (r: any) => String(r?.runnerName || r?.name || '').trim().toLowerCase() === 'no',
+                    );
+                    const yesSelectionId =
+                      yesRunner?.selectionId !== null && yesRunner?.selectionId !== undefined
+                        ? String(yesRunner.selectionId)
+                        : null;
+                    const noSelectionId =
+                      noRunner?.selectionId !== null && noRunner?.selectionId !== undefined
+                        ? String(noRunner.selectionId)
+                        : null;
+                    if (yesSelectionId && noSelectionId) {
+                      tiedMarketYesNoSelections.set(marketId, { yesSelectionId, noSelectionId });
+                      this.logger.debug(
+                        `Tied Match YES/NO mapping (eventId ${eventId}, marketId ${marketId}): ` +
+                        `YES=${yesSelectionId}, NO=${noSelectionId}`,
+                      );
+                    }
+                  }
+                  this.logger.debug(
+                    `Tied Match (eventId ${eventId}, marketId ${marketId}): Using API runners: [${apiSelectionIds.join(', ')}]`,
+                  );
+                } else {
+                  marketSelectionsMap.set(marketId, apiSelectionIds);
+                  this.logger.debug(
+                    `Match Odds (eventId ${eventId}, marketId ${marketId}): Using ${apiSelectionIds.length} selectionIds from API: [${apiSelectionIds.join(', ')}]`,
+                  );
+                }
               } else {
                 this.logger.warn(
                   `Match Odds market (marketId ${marketId}) could not be mapped to getMatchDetail nodes for eventId ${eventId}. Skipping MO runner list (do not fall back to bets).`,
@@ -371,8 +467,15 @@ export class PositionsController {
         }
       }
 
-      // ✅ Calculate positions using pure function (no side effects)
-      const allPositions = calculateAllPositions(openBets, marketSelectionsMap);
+      // Keep tied-match markets fully separated from Match Odds calculation.
+      const betsForStandardPosition = openBets.filter((bet) => {
+        const betGtype = (bet.gtype || '').toLowerCase();
+        const isMatchOdds = betGtype === 'matchodds' || betGtype === 'match';
+        return !(isMatchOdds && bet.marketId && tiedMatchMarketIds.has(bet.marketId));
+      });
+
+      // ✅ Calculate positions using existing logic for non-tied markets
+      const allPositions = calculateAllPositions(betsForStandardPosition, marketSelectionsMap);
       
       // Log calculated positions for debugging
       this.logger.debug(
@@ -384,13 +487,6 @@ export class PositionsController {
 
       // ✅ Transform response to new format: group by eventId, flatten structure
       const response: any = {};
-      const tiedMatchMarketIds = new Set(
-        openBets
-          .filter((bet) => this.isTiedMatchMarketName(bet.marketName))
-          .map((bet) => bet.marketId)
-          .filter((id): id is string => Boolean(id)),
-      );
-      
       // Determine eventId (from query param or from bets)
       // If eventId query param provided, use it; otherwise use first bet's eventId
       let responseEventId: string | null = null;
@@ -411,23 +507,97 @@ export class PositionsController {
       // Transform Match Odds: flatten runners to selectionId -> net
       if (allPositions.matchOdds && allPositions.matchOdds.length > 0) {
         // Merge all Match Odds markets (if multiple, combine their runners)
-        // Keep TIED_MATCH markets separate from regular MATCH_ODDS.
+        // Keep regular Match Odds only (tied markets are calculated separately).
         const matchOddsFlat: Record<string, number> = {};
-        const tieMatchFlat: Record<string, number> = {};
         for (const matchOddsPos of allPositions.matchOdds) {
-          const targetBucket = tiedMatchMarketIds.has(matchOddsPos.marketId)
-            ? tieMatchFlat
-            : matchOddsFlat;
           for (const [selectionId, runner] of Object.entries(matchOddsPos.runners)) {
             // If multiple markets have same selectionId, sum them
-            targetBucket[selectionId] = (targetBucket[selectionId] || 0) + runner.net;
+            matchOddsFlat[selectionId] = (matchOddsFlat[selectionId] || 0) + runner.net;
           }
         }
         if (Object.keys(matchOddsFlat).length > 0) {
           response.matchOdds = matchOddsFlat;
         }
-        if (Object.keys(tieMatchFlat).length > 0) {
-          response.tieMatch = tieMatchFlat;
+      }
+
+      // Tied Match (Yes/No) position using Match-Odds-style net P/L logic.
+      if (tiedMatchMarketIds.size > 0) {
+        // Fallback mapping for tied markets when catalog mapping is unavailable:
+        // derive YES/NO selection ids from bet names in the same tied market.
+        for (const marketId of tiedMatchMarketIds) {
+          if (tiedMarketYesNoSelections.has(marketId)) continue;
+          const marketBets = openBets.filter((b) => b.marketId === marketId);
+          const yesBet = marketBets.find((b) => String(b.betName || '').trim().toLowerCase() === 'yes');
+          const noBet = marketBets.find((b) => String(b.betName || '').trim().toLowerCase() === 'no');
+          const yesSelectionId =
+            yesBet?.selectionId !== null && yesBet?.selectionId !== undefined
+              ? String(yesBet.selectionId)
+              : null;
+          const noSelectionId =
+            noBet?.selectionId !== null && noBet?.selectionId !== undefined
+              ? String(noBet.selectionId)
+              : null;
+          if (yesSelectionId && noSelectionId) {
+            tiedMarketYesNoSelections.set(marketId, { yesSelectionId, noSelectionId });
+            this.logger.debug(
+              `Tied Match fallback YES/NO mapping from bets (marketId ${marketId}): YES=${yesSelectionId}, NO=${noSelectionId}`,
+            );
+          }
+        }
+
+        let yesNet = 0;
+        let noNet = 0;
+
+        for (const bet of openBets) {
+          const betGtype = (bet.gtype || '').toLowerCase();
+          const isMatchOdds = betGtype === 'matchodds' || betGtype === 'match';
+          if (!isMatchOdds || !bet.marketId || !tiedMatchMarketIds.has(bet.marketId)) {
+            continue;
+          }
+          const yesNoSelections = tiedMarketYesNoSelections.get(bet.marketId);
+          if (!yesNoSelections || bet.selectionId === null || bet.selectionId === undefined) {
+            continue;
+          }
+          const selectionId = String(bet.selectionId);
+          const stake = Number(bet.betValue ?? bet.amount ?? 0);
+          const betType = String(bet.betType || '').toUpperCase();
+          const odds = Number(bet.betRate ?? bet.odds ?? 0);
+          if (!Number.isFinite(stake) || stake <= 0 || (betType !== 'BACK' && betType !== 'LAY') || odds <= 0) {
+            continue;
+          }
+
+          const profit = (odds - 1) * stake;
+          const isYesSelection = selectionId === yesNoSelections.yesSelectionId;
+          const isNoSelection = selectionId === yesNoSelections.noSelectionId;
+          if (!isYesSelection && !isNoSelection) {
+            continue;
+          }
+
+          if (betType === 'BACK') {
+            if (isYesSelection) {
+              yesNet += profit;
+              noNet -= stake;
+            } else {
+              noNet += profit;
+              yesNet -= stake;
+            }
+          } else {
+            // LAY
+            if (isYesSelection) {
+              yesNet -= profit;
+              noNet += stake;
+            } else {
+              noNet -= profit;
+              yesNet += stake;
+            }
+          }
+        }
+
+        if (yesNet !== 0 || noNet !== 0) {
+          response.tieMatch = {
+            YES: Math.round(yesNet * 100) / 100,
+            NO: Math.round(noNet * 100) / 100,
+          };
         }
       }
       
