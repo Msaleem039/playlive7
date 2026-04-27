@@ -547,6 +547,7 @@ export class PositionsController {
 
         let yesNet = 0;
         let noNet = 0;
+        let tieBetsProcessed = 0;
 
         for (const bet of openBets) {
           const betGtype = (bet.gtype || '').toLowerCase();
@@ -554,11 +555,6 @@ export class PositionsController {
           if (!isMatchOdds || !bet.marketId || !tiedMatchMarketIds.has(bet.marketId)) {
             continue;
           }
-          const yesNoSelections = tiedMarketYesNoSelections.get(bet.marketId);
-          if (!yesNoSelections || bet.selectionId === null || bet.selectionId === undefined) {
-            continue;
-          }
-          const selectionId = String(bet.selectionId);
           const stake = Number(bet.betValue ?? bet.amount ?? 0);
           const betType = String(bet.betType || '').toUpperCase();
           const odds = Number(bet.betRate ?? bet.odds ?? 0);
@@ -567,12 +563,25 @@ export class PositionsController {
           }
 
           const profit = (odds - 1) * stake;
-          const isYesSelection = selectionId === yesNoSelections.yesSelectionId;
-          const isNoSelection = selectionId === yesNoSelections.noSelectionId;
+          const betName = String(bet.betName || '').trim().toLowerCase();
+          let isYesSelection = betName === 'yes';
+          let isNoSelection = betName === 'no';
+
+          // If betName is not reliable, use resolved YES/NO selection ids as fallback.
+          if (!isYesSelection && !isNoSelection && bet.selectionId !== null && bet.selectionId !== undefined) {
+            const yesNoSelections = tiedMarketYesNoSelections.get(bet.marketId);
+            if (yesNoSelections) {
+              const selectionId = String(bet.selectionId);
+              isYesSelection = selectionId === yesNoSelections.yesSelectionId;
+              isNoSelection = selectionId === yesNoSelections.noSelectionId;
+            }
+          }
+
           if (!isYesSelection && !isNoSelection) {
             continue;
           }
 
+          tieBetsProcessed++;
           if (betType === 'BACK') {
             if (isYesSelection) {
               yesNet += profit;
@@ -593,11 +602,14 @@ export class PositionsController {
           }
         }
 
-        if (yesNet !== 0 || noNet !== 0) {
+        if (tieBetsProcessed > 0) {
           response.tieMatch = {
             YES: Math.round(yesNet * 100) / 100,
             NO: Math.round(noNet * 100) / 100,
           };
+          this.logger.debug(
+            `Tied Match position calculated from ${tieBetsProcessed} bets: YES=${response.tieMatch.YES}, NO=${response.tieMatch.NO}`,
+          );
         }
       }
       
