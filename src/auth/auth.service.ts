@@ -758,34 +758,12 @@ export class AuthService {
           });
         }
 
-        // Sort by date ASC for running-balance calculation.
+        // Sort by date ASC first (chronological base).
         statementEntries.sort((a, b) => {
           const ta = a.date ? new Date(a.date).getTime() : (a.latestSettledAt ? new Date(a.latestSettledAt).getTime() : 0);
           const tb = b.date ? new Date(b.date).getTime() : (b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0);
           return ta - tb;
         });
-
-        // Start from opening wallet value before the listed entries so
-        // each row reflects true balance progression in chronological order.
-        const totalStatementEffect = statementEntries.reduce((sum, e) => {
-          if (e.type === 'cashIn') return sum + (Number(e.amount) || 0);
-          if (e.type === 'cashOut') return sum - (Number(e.amount) || 0);
-          return sum + (Number(e.netPnl) || 0);
-        }, 0);
-        const openingWalletBalance = walletTotal - totalStatementEffect;
-        let run = openingWalletBalance;
-        for (const e of statementEntries) {
-          if (e.type === 'cashIn') {
-            run += Number(e.amount) || 0;
-          } else if (e.type === 'cashOut') {
-            run -= Number(e.amount) || 0;
-          } else {
-            run += Number(e.netPnl) || 0;
-          }
-          e.runningBalance = run;
-          // Keep a plain `balance` field so UI balance column can bind per-entry value.
-          e.balance = run;
-        }
 
         // Reverse to DESC order for API response.
         statementEntries.sort((a, b) => {
@@ -793,6 +771,21 @@ export class AuthService {
           const tb = b.date ? new Date(b.date).getTime() : (b.latestSettledAt ? new Date(b.latestSettledAt).getTime() : 0);
           return tb - ta;
         });
+
+        // Ledger style: start from current available balance and walk backward.
+        // This keeps latest row aligned with current wallet, like bank statements.
+        let run = walletTotal;
+        for (const e of statementEntries) {
+          e.runningBalance = run;
+          e.balance = run;
+          if (e.type === 'cashIn') {
+            run -= Number(e.amount) || 0;
+          } else if (e.type === 'cashOut') {
+            run += Number(e.amount) || 0;
+          } else {
+            run -= Number(e.netPnl) || 0;
+          }
+        }
 
         const totalRecords = statementEntries.length;
         const page = Math.floor(offset / limit) + 1;
