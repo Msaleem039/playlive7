@@ -618,6 +618,8 @@ export class AuthService {
 
       return Promise.all(users.map(async (user) => {
         const balance = user.wallet?.balance ?? 0;
+        const liability = user.wallet?.liability ?? 0;
+        const walletTotal = balance + liability;
         const betHistory = betHistoryMap.get(user.id);
         const bets: any[] = (betHistory?.data ?? []) as any[];
 
@@ -712,7 +714,7 @@ export class AuthService {
             latestSettledAt: latestSettledAt ? new Date(latestSettledAt).toISOString() : null,
             bets: groupBets.map((b: any) => ({
               id: b.id,
-              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
+              time: b.settledAt ? new Date(b.settledAt).toISOString() : null,
               betType: b.betType,
               betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
               odds: b.odds,
@@ -727,40 +729,9 @@ export class AuthService {
                   : null,
               status: b.status,
             })),
-            winBets: wins.map((b: any) => ({
-              id: b.id,
-              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
-              betType: b.betType,
-              betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
-              odds: b.odds,
-              stake: Number(b.amount) || 0,
-              pnl: Number(b.pnl) ?? 0,
-              result: 'win',
-              decisionRun:
-                b?.decisionRun !== null &&
-                b?.decisionRun !== undefined &&
-                Number.isFinite(Number(b.decisionRun))
-                  ? Number(b.decisionRun)
-                  : null,
-              status: b.status,
-            })),
-            lossBets: losses.map((b: any) => ({
-              id: b.id,
-              time: (b.settledAt || b.createdAt) ? new Date(b.settledAt || b.createdAt).toISOString() : null,
-              betType: b.betType,
-              betName: b.betName || b.runnerName || b.selectionName || b.marketName || 'Unknown',
-              odds: b.odds,
-              stake: Number(b.amount) || 0,
-              pnl: Number(b.pnl) ?? 0,
-              result: 'loss',
-              decisionRun:
-                b?.decisionRun !== null &&
-                b?.decisionRun !== undefined &&
-                Number.isFinite(Number(b.decisionRun))
-                  ? Number(b.decisionRun)
-                  : null,
-              status: b.status,
-            })),
+            // Keep blocks but show only summarized amount per market side.
+            winBets: totalCredit > 0 ? [{ amount: totalCredit }] : [],
+            lossBets: totalDebit > 0 ? [{ amount: totalDebit }] : [],
           });
         }
 
@@ -794,8 +765,15 @@ export class AuthService {
           return ta - tb;
         });
 
-        // Running balance starts from zero and evolves naturally by entry type.
-        let run = 0;
+        // Start from opening wallet value before the listed entries so
+        // each row reflects true balance progression in chronological order.
+        const totalStatementEffect = statementEntries.reduce((sum, e) => {
+          if (e.type === 'cashIn') return sum + (Number(e.amount) || 0);
+          if (e.type === 'cashOut') return sum - (Number(e.amount) || 0);
+          return sum + (Number(e.netPnl) || 0);
+        }, 0);
+        const openingWalletBalance = walletTotal - totalStatementEffect;
+        let run = openingWalletBalance;
         for (const e of statementEntries) {
           if (e.type === 'cashIn') {
             run += Number(e.amount) || 0;
@@ -805,6 +783,8 @@ export class AuthService {
             run += Number(e.netPnl) || 0;
           }
           e.runningBalance = run;
+          // Keep a plain `balance` field so UI balance column can bind per-entry value.
+          e.balance = run;
         }
 
         // Reverse to DESC order for API response.
@@ -817,6 +797,44 @@ export class AuthService {
         const totalRecords = statementEntries.length;
         const page = Math.floor(offset / limit) + 1;
         const paginatedStatement = statementEntries.slice(offset, offset + limit);
+        const marketGroupsMap = new Map<string, any>();
+        for (const entry of paginatedStatement) {
+          const marketKey = entry?.marketId ? String(entry.marketId) : null;
+          if (!marketKey) continue;
+          if (!marketGroupsMap.has(marketKey)) {
+            marketGroupsMap.set(marketKey, {
+              marketId: marketKey,
+              entries: [],
+              totalProfit: 0,
+              totalLoss: 0,
+            });
+          }
+          const group = marketGroupsMap.get(marketKey);
+          group.entries.push(entry);
+
+          // Ignore pending bets in market P/L summary.
+          const hasPendingBet =
+            Array.isArray(entry?.bets) &&
+            entry.bets.some((b: any) => String(b?.status ?? '').toUpperCase() === 'PENDING');
+          if (hasPendingBet) continue;
+
+          group.totalProfit += Number(entry?.win) || 0;
+          group.totalLoss += Number(entry?.loss) || 0;
+        }
+        const statementMarketGroups = Array.from(marketGroupsMap.values()).map((group) => {
+          const netResult = group.totalProfit - group.totalLoss;
+          return {
+            marketId: group.marketId,
+            entries: group.entries,
+            marketSummary: {
+              marketId: group.marketId,
+              totalProfit: group.totalProfit,
+              totalLoss: group.totalLoss,
+              netResult,
+              resultStatus: netResult > 0 ? 'PROFIT' : netResult < 0 ? 'LOSS' : 'BREAKEVEN',
+            },
+          };
+        });
         const transactions = transferLogs.map((log) => {
           const isCashIn = log.type === TransferLogType.TOPUP && log.toUserId === user.id;
           const isCashOut = log.type === TransferLogType.TOPDOWN && log.fromUserId === user.id;
@@ -844,12 +862,18 @@ export class AuthService {
             username: user.username,
             role: user.role,
             balance,
-            liability: user.wallet?.liability ?? 0,
-            availableBalance: balance - (user.wallet?.liability ?? 0),
+            liability,
+            availableBalance: walletTotal,
             profitLoss: pnlMap[user.id] ?? 0,
             openingBalance: 0,
+            userWalletSummary: {
+              walletBalance: balance,
+              liability,
+              walletTotal,
+            },
           },
           statement: paginatedStatement,
+          statementMarketGroups,
           transactions,
           pagination: {
             page,
@@ -878,7 +902,7 @@ export class AuthService {
         // 💰 WALLET (Betfair standard)
         balance, // Already includes settled P/L
         liability, // Exposure from open bets
-        availableBalance: balance - liability, // Playable balance
+        availableBalance: balance, // Playable balance (balance is already net of locked liability)
 
         // 📊 REPORTING ONLY (not cash)
         profitLoss, // Settled P/L from userPnl (for reporting/display)
