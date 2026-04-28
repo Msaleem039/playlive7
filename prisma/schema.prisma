@@ -85,10 +85,6 @@ model Match {
   marketName String?     @map("market_name")
   createdAt  DateTime    @default(now()) @map("created_at") @db.Timestamp(6)
   updatedAt  DateTime    @default(now()) @map("updated_at") @db.Timestamp(6)
-  eventId    String?
-  eventName  String?
-  marketId   String?
-  marketName String?
   bets       Bet[]
 
   @@index([eventId], map: "idx_matches_event_id")
@@ -125,10 +121,6 @@ model Bet {
   rollbackAt      DateTime? @map("rollback_at") @db.Timestamp(6)
   createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamp(6)
   updatedAt       DateTime  @default(now()) @map("updated_at") @db.Timestamp(6)
-  isRangeConsumed Boolean   @default(false)
-  selId           Int?
-  marketId        String?
-  eventId         String?
   isRefunded      Boolean   @default(false) @map("is_refunded")
   refundAmount    Float?    @map("refund_amount")
   refundedByBetId String?   @map("refunded_by_bet_id")
