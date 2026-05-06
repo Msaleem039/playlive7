@@ -21,6 +21,7 @@ model User {
   createdAt                                                       DateTime              @default(now()) @map("created_at") @db.Timestamp(6)
   updatedAt                                                       DateTime              @default(now()) @map("updated_at") @db.Timestamp(6)
   bettingEnabled                                                  Boolean               @default(true) @map("betting_enabled")
+  maxWinAmount                                                    Float?                @map("max_win_amount")
   bets                                                            Bet[]
   fancyExposures                                                  FancyExposure[]
   positions                                                       Position[]

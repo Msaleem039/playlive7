@@ -303,9 +303,24 @@ export class BetsService {
     };
     eventId: string | undefined | null;
     normalizedSelectionId: number;
+    userMaxWinAmount?: number | null;
   }): Promise<void> {
-    const { userId, matchIdStr, marketId, actualMarketType, allPendingBets, newBet, eventId, normalizedSelectionId } =
+    const {
+      userId,
+      matchIdStr,
+      marketId,
+      actualMarketType,
+      allPendingBets,
+      newBet,
+      eventId,
+      normalizedSelectionId,
+      userMaxWinAmount,
+    } =
       params;
+    const effectiveMaxWinAmount =
+      Number.isFinite(Number(userMaxWinAmount)) && Number(userMaxWinAmount) > 0
+        ? Number(userMaxWinAmount)
+        : null;
 
     if (actualMarketType === 'bookmaker') {
       return;
@@ -328,14 +343,18 @@ export class BetsService {
         marketSelections,
       );
       const maxWin = this.maxMatchOddsNetWinning(simulatedPos?.runners ?? {});
-      if (maxWin > this.MATCH_ODDS_MAX_WINNING) {
+      const moLimit =
+        effectiveMaxWinAmount !== null
+          ? Math.min(this.MATCH_ODDS_MAX_WINNING, effectiveMaxWinAmount)
+          : this.MATCH_ODDS_MAX_WINNING;
+      if (maxWin > moLimit) {
         throw new HttpException(
           {
             success: false,
-            error: `Maximum Match Odds winning (${this.MATCH_ODDS_MAX_WINNING}) would be exceeded.`,
+            error: `Maximum Match Odds winning (${moLimit}) would be exceeded.`,
             code: 'MAX_MATCH_ODDS_WINNING_EXCEEDED',
             maxWinning: maxWin,
-            limit: this.MATCH_ODDS_MAX_WINNING,
+            limit: moLimit,
           },
           400,
         );
@@ -392,14 +411,18 @@ export class BetsService {
       const simNo = baseNo + dN;
       const maxFancy = Math.max(simYes, simNo);
 
-      if (maxFancy > this.FANCY_MAX_WINNING) {
+      const fancyLimit =
+        effectiveMaxWinAmount !== null
+          ? Math.min(this.FANCY_MAX_WINNING, effectiveMaxWinAmount)
+          : this.FANCY_MAX_WINNING;
+      if (maxFancy > fancyLimit) {
         throw new HttpException(
           {
             success: false,
-            error: `Maximum Fancy winning (${this.FANCY_MAX_WINNING}) would be exceeded.`,
+            error: `Maximum Fancy winning (${fancyLimit}) would be exceeded.`,
             code: 'MAX_FANCY_WINNING_EXCEEDED',
             maxWinning: maxFancy,
-            limit: this.FANCY_MAX_WINNING,
+            limit: fancyLimit,
           },
           400,
         );
@@ -917,10 +940,14 @@ export class BetsService {
             | undefined;
 
           // ✅ COMBINED: Check user status, betting_enabled, AND wallet in parallel within transaction
-          const [user, wallet] = await Promise.all([
+          const [user, userWinLimit, wallet] = await Promise.all([
             tx.user.findUnique({
               where: { id: userId },
               select: { id: true, isActive: true, bettingEnabled: true },
+            }),
+            (tx as any).user.findUnique({
+              where: { id: userId },
+              select: { maxWinAmount: true },
             }),
             tx.wallet.findUnique({
               where: { userId },
@@ -1042,6 +1069,8 @@ export class BetsService {
             isRangeConsumed: false, // Fancy range consumption flag (not used in current model)
           };
 
+          const userMaxWinAmount = (userWinLimit as { maxWinAmount?: number | null } | null)?.maxWinAmount;
+
           await this.enforceMaxWinningLimitsWithCache({
             userId,
             matchIdStr: String(match_id),
@@ -1051,6 +1080,7 @@ export class BetsService {
             newBet,
             eventId,
             normalizedSelectionId,
+            userMaxWinAmount,
           });
            
           // 🔐 STEP 3: Calculate isolated deltas

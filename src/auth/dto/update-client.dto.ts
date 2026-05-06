@@ -22,6 +22,12 @@ export class UpdateClientDto {
   @IsOptional()
   @IsNumber()
   @Min(0)
+  maxWinAmount?: number;
+
+  // Backward compatibility with old payload key.
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
   maxWinLimit?: number;
 }
 

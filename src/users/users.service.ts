@@ -63,6 +63,7 @@ export class UsersService {
     balance?: number;
     parentId?: string;
     commissionPercentage?: number;
+    maxWinAmount?: number;
   }): Promise<User> {
     const { balance, ...userData } = data;
 

@@ -44,4 +44,9 @@ export class CreateUserDto {
   @IsNumber()
   @Min(0)
   initialBalance?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  maxWinAmount?: number;
 }

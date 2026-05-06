@@ -207,7 +207,7 @@ export class AuthService {
     // Removed console.log to avoid exposing user creation details
     
     try {
-      const { name, username, email, password, role, balance, initialBalance, commissionPercentage } = createUserDto;
+      const { name, username, email, password, role, balance, initialBalance, commissionPercentage, maxWinAmount } = createUserDto;
       const resolvedBalance =
         (typeof balance === 'number' ? balance : undefined) ??
         (typeof initialBalance === 'number' ? initialBalance : undefined) ??
@@ -312,6 +312,7 @@ export class AuthService {
           role: UserRole.SUPER_ADMIN,
           parentId: undefined,
           commissionPercentage: commissionPercentage ?? 0,
+          maxWinAmount,
           balance: resolvedBalance, // Pass balance so wallet is created with correct balance
         });
       } else if (role === UserRole.SETTLEMENT_ADMIN) {
@@ -324,6 +325,7 @@ export class AuthService {
           role: UserRole.SETTLEMENT_ADMIN,
           parentId: undefined,
           commissionPercentage: 0,
+          maxWinAmount,
           // No balance - wallet will not be created
         });
       } else {
@@ -374,6 +376,7 @@ export class AuthService {
           role,
           parentId: creator.id,
           commissionPercentage: finalCommissionPercentage ?? 0, // Store what THIS USER keeps from downline PnL (0 for CLIENT)
+          maxWinAmount,
           balance: resolvedBalance, // Pass balance so wallet is created with correct balance
         });
       }
@@ -1259,7 +1262,7 @@ export class AuthService {
 
   /**
    * Update client details (Agent only)
-   * Allows agents to update their client's name, password, commission, and maxWinLimit
+   * Allows agents/admins to update client profile including maxWinAmount
    * Username cannot be changed
    */
   async updateClient(currentUser: User, clientId: string, updateClientDto: UpdateClientDto) {
@@ -1307,8 +1310,13 @@ export class AuthService {
       updateData.commissionPercentage = updateClientDto.commissionPercentage;
     }
 
-    // Note: maxWinLimit is not in the User model, so we'll skip it for now
-    // If it needs to be added, it would require a database migration
+    const resolvedMaxWinAmount =
+      updateClientDto.maxWinAmount !== undefined
+        ? updateClientDto.maxWinAmount
+        : updateClientDto.maxWinLimit;
+    if (resolvedMaxWinAmount !== undefined) {
+      updateData.maxWinAmount = resolvedMaxWinAmount;
+    }
 
     // Update user
     const updatedUser = await this.prisma.user.update({
