@@ -8,7 +8,6 @@ import { UsersModule } from './users/users.module';
 import { AdminModule } from './admin/admin.module';
 
 import { RolesModule } from './roles/roles.module';
-import { BettingGateway } from './betting/betting.gateway';
 import { CricketIdModule } from './cricketid/cricketid.module';
 import { BetfairController } from './betting/beffair.controller';
 import { BalanceTransferModule } from './balancetransfer/balancetransfer.module';
@@ -50,6 +49,6 @@ import { BackgroundProcessorModule } from './common/background/background-proces
     NewsModule,
   ],
   controllers: [AppController, BetfairController],
-  providers: [AppService, BettingGateway],
+  providers: [AppService],
 })
 export class AppModule {}

@@ -51,12 +51,40 @@ export class CricketIdService {
     // Market / Match details → medium update frequency (markets open/close, status changes)
     VENDOR_MATCH_DETAIL: 12, // 12s: Market list and match metadata; less volatile than odds.
 
+    // After match/market is closed, response becomes stable.
+    MATCH_DETAIL_AFTER_END: 3600, // 1 hour
+
     // Match list per competition → occasional updates (new matches, start times, cancellations)
     MATCH_LIST: 180, // 3 min: List of matches in a competition changes occasionally.
 
     // Series list / competitions → rarely change (tournament structure is static for the season)
     SERIES_LIST: 600, // 10 min: Competitions/series list changes rarely; longer TTL cuts API calls.
   };
+
+  private isMatchDetailClosed(vendor: any): boolean {
+    const normalizeStatus = (v: unknown) => String(v ?? '').trim().toUpperCase();
+
+    const eventTypeNode = Array.isArray(vendor?.eventTypes) ? vendor.eventTypes[0] : null;
+    const eventNode = Array.isArray(eventTypeNode?.eventNodes) ? eventTypeNode.eventNodes[0] : null;
+
+    const eventStatus =
+      normalizeStatus(eventNode?.state?.status) ||
+      normalizeStatus(eventNode?.event?.status) ||
+      normalizeStatus(eventNode?.status);
+    if (['CLOSED', 'FINISHED', 'COMPLETED', 'SETTLED'].includes(eventStatus)) return true;
+
+    const marketNodes = Array.isArray(eventNode?.marketNodes) ? eventNode.marketNodes : [];
+    if (marketNodes.length === 0) return false;
+
+    const closedCount = marketNodes.filter((m: any) => {
+      const ms =
+        normalizeStatus(m?.state?.status) ||
+        normalizeStatus(m?.marketState?.status) ||
+        normalizeStatus(m?.status);
+      return ['CLOSED', 'SETTLED'].includes(ms);
+    }).length;
+    return closedCount === marketNodes.length;
+  }
 
   constructor(
     private readonly http: HttpService,
@@ -558,6 +586,13 @@ export class CricketIdService {
         null;
     }
 
+    const cacheKey = this.redisService.getVendorKey('match-detail-market-v1', resolvedMarketId);
+    const cached = await this.redisService.get<any[]>(cacheKey);
+    if (cached) {
+      this.logger.debug(`Redis cache HIT for match-detail-market: marketId=${resolvedMarketId}`);
+      return cached;
+    }
+
     const vendor = await this.fetch<any>(`/${resolvedMarketId}`);
     const eventTypeNode = Array.isArray(vendor?.eventTypes) ? vendor.eventTypes[0] : null;
     const eventNode = Array.isArray(eventTypeNode?.eventNodes) ? eventTypeNode.eventNodes[0] : null;
@@ -609,6 +644,21 @@ export class CricketIdService {
         marketStartTime: startTime || null,
       };
     });
+
+    const isClosed = this.isMatchDetailClosed(vendor);
+    const ttl = isClosed ? this.REDIS_TTL.MATCH_DETAIL_AFTER_END : this.REDIS_TTL.VENDOR_MATCH_DETAIL;
+    try {
+      await this.redisService.set(cacheKey, normalized, ttl);
+      this.logger.debug(
+        `Redis cache SET for match-detail-market: marketId=${resolvedMarketId} (TTL: ${ttl}s)`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to set Redis cache for match-detail-market marketId=${resolvedMarketId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
 
     return normalized;
   }
@@ -841,11 +891,12 @@ export class CricketIdService {
     const ALLOWED_CRICKET_COMPETITION_IDS = new Set([
       '101480',
       '10693181',
-      '12072774',
+      // '12072774',
       // '12649673',
       '9962116',
-      '9992899',
+      // '9992899',
       '9886504',
+      '11365612',
     ]);
     const listCompetitionId = (item: any) =>
       String(

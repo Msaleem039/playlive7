@@ -5,6 +5,7 @@ import { firstValueFrom } from 'rxjs';
 import { AggregatorService } from './aggregator.service';
 import { CricketIdService } from './cricketid.service';
 import { RedisService } from '../common/redis/redis.service';
+import { BettingGateway } from '../betting/betting.gateway';
 
 @Injectable()
 export class AggregatorCronService {
@@ -17,6 +18,7 @@ export class AggregatorCronService {
     private readonly http: HttpService,
     private readonly cricketIdService: CricketIdService, // Inject service directly instead of HTTP calls
     private readonly redisService: RedisService, // ✅ PERFORMANCE: Redis for storing vendor data
+    private readonly bettingGateway: BettingGateway,
   ) {}
 
   /**
@@ -37,8 +39,8 @@ export class AggregatorCronService {
    * - No business logic affected - only removed unnecessary cron polling
    */
 
-  @Cron('*/4 * * * * *') // Every 4 seconds
-  async fetchBookmakerFancyAndOdds() {
+  @Cron('*/1 * * * * *') // Every 1 second (vendor limits permitting)
+  async fetchOddsFast() {
     try {
       const activeMatches = this.aggregatorService.getActiveMatches();
       
@@ -46,78 +48,104 @@ export class AggregatorCronService {
         return;
       }
 
-      // ✅ PERFORMANCE: Fetch vendor data and store in Redis (background job)
-      // This pre-warms Redis cache so user requests are fast
-      const fetchPromises = activeMatches.flatMap((match) => [
-        // Call service directly - it will cache in Redis automatically
-        this.cricketIdService.getBookmakerFancy(match.eventId)
-          .then((response) => {
-            // Response structure: { success, msg, status, data: [...] }
-            // data array contains only filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH
-            // ✅ PERFORMANCE: Response is already cached in Redis by cricketIdService
-            const responseData = response?.data || [];
-            const marketCount = Array.isArray(responseData) ? responseData.length : 0;
-            
-            return {
-              type: 'fancy' as const,
-              eventId: match.eventId,
-              success: true,
-              data: responseData,
-              marketCount, // Number of filtered markets returned
-            };
-          })
-          .catch((error: any) => ({
-            type: 'fancy' as const,
-            eventId: match.eventId,
-            success: false,
-            error: error?.message || String(error),
-          })),
-        // Fetch odds and cache in Redis
+      // Fast lane: odds only (1s). Service still uses Redis caching.
+      const fetchPromises = activeMatches.map((match) =>
         this.cricketIdService.getBetfairOdds(match.marketIds)
           .then((response) => {
-            // ✅ PERFORMANCE: Response is already cached in Redis by cricketIdService
+            const emitted = this.bettingGateway.emitOddsIfChanged(
+              match.eventId,
+              match.marketIds,
+              response,
+            );
             return {
               type: 'odds' as const,
+              eventId: match.eventId,
               marketIds: match.marketIds,
               success: true,
-              data: response,
+              emitted,
             };
           })
           .catch((error: any) => ({
             type: 'odds' as const,
+            eventId: match.eventId,
             marketIds: match.marketIds,
             success: false,
             error: error?.message || String(error),
           })),
-      ]);
+      );
 
       const results = await Promise.all(fetchPromises);
 
       // Log results
       results.forEach((result) => {
         if (result.success) {
-          if (result.type === 'fancy') {
-            const marketCount = 'marketCount' in result ? result.marketCount : 'unknown';
-            this.logger.debug(
-              `Successfully fetched bookmaker fancy for eventId ${result.eventId} (${marketCount} filtered markets: Normal, MATCH_ODDS, Bookmaker, TIED_MATCH)`,
-            );
-          } else if (result.type === 'odds') {
-            this.logger.debug(`Successfully fetched odds for marketIds ${result.marketIds}`);
-          }
+          this.logger.debug(
+            `Fetched odds for eventId=${result.eventId} marketIds=${result.marketIds} (emitted=${
+              'emitted' in result ? result.emitted : false
+            })`,
+          );
         } else {
           const errorMsg = 'error' in result ? result.error : 'Unknown error';
-          if (result.type === 'fancy') {
-            this.logger.warn(`Failed to fetch bookmaker fancy for eventId ${result.eventId}: ${errorMsg}`);
-          } else if (result.type === 'odds') {
-            this.logger.warn(`Failed to fetch odds for marketIds ${result.marketIds}: ${errorMsg}`);
-          }
+          this.logger.warn(`Failed to fetch odds for marketIds ${result.marketIds}: ${errorMsg}`);
         }
       });
 
-      this.logger.debug(`Fetched bookmaker fancy and odds for ${activeMatches.length} active matches`);
+      this.logger.debug(`Fetched odds for ${activeMatches.length} active matches`);
     } catch (error) {
       this.logger.error(
-        'Error in bookmaker fancy and odds cron job:',
+        'Error in odds cron job:',
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  @Cron('*/4 * * * * *') // Keep bookmaker/fancy on safer cadence
+  async fetchBookmakerFancy() {
+    try {
+      const activeMatches = this.aggregatorService.getActiveMatches();
+      if (activeMatches.length === 0) {
+        return;
+      }
+
+      const fetchPromises = activeMatches.map((match) =>
+        this.cricketIdService.getBookmakerFancy(match.eventId)
+          .then((response) => {
+            const emitted = this.bettingGateway.emitBookmakerFancyIfChanged(
+              match.eventId,
+              response,
+            );
+            const responseData = response?.data || [];
+            const marketCount = Array.isArray(responseData) ? responseData.length : 0;
+            return {
+              eventId: match.eventId,
+              success: true,
+              emitted,
+              marketCount,
+            };
+          })
+          .catch((error: any) => ({
+            eventId: match.eventId,
+            success: false,
+            error: error?.message || String(error),
+          })),
+      );
+
+      const results = await Promise.all(fetchPromises);
+      results.forEach((result) => {
+        if (result.success) {
+          const marketCount = 'marketCount' in result ? result.marketCount : 0;
+          const emitted = 'emitted' in result ? result.emitted : false;
+          this.logger.debug(
+            `Fetched bookmaker-fancy for eventId=${result.eventId} (markets=${marketCount}, emitted=${emitted})`,
+          );
+        } else {
+          const errorMsg = 'error' in result ? result.error : 'Unknown error';
+          this.logger.warn(`Failed to fetch bookmaker-fancy for eventId ${result.eventId}: ${errorMsg}`);
+        }
+      });
+    } catch (error) {
+      this.logger.error(
+        'Error in bookmaker-fancy cron job:',
         error instanceof Error ? error.message : String(error),
       );
     }

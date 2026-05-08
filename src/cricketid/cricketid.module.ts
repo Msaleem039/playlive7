@@ -7,6 +7,7 @@ import { AggregatorController } from './aggregator.controller';
 import { AggregatorCronService } from './aggregator.cron.service';
 import { MatchVisibilityService } from './match-visibility.service';
 import { RedisModule } from '../common/redis/redis.module';
+import { BettingGateway } from '../betting/betting.gateway';
 
 @Module({
   imports: [HttpModule, RedisModule], // ✅ PERFORMANCE: Redis module for vendor data caching
@@ -16,8 +17,9 @@ import { RedisModule } from '../common/redis/redis.module';
     AggregatorService,
     AggregatorCronService,
     MatchVisibilityService,
+    BettingGateway,
   ],
-  exports: [CricketIdService, AggregatorService, MatchVisibilityService],
+  exports: [CricketIdService, AggregatorService, MatchVisibilityService, BettingGateway],
 })
 export class CricketIdModule {}
 
