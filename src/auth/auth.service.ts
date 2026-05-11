@@ -732,9 +732,10 @@ export class AuthService {
                   : null,
               status: b.status,
             })),
-            // Keep blocks but show only summarized amount per market side.
-            winBets: totalCredit > 0 ? [{ amount: totalCredit }] : [],
-            lossBets: totalDebit > 0 ? [{ amount: totalDebit }] : [],
+            // Net summary only: gross wins minus gross losses (same market group).
+            // e.g. +1000 win bets and -500 loss bets → winBets [{ amount: 500 }], lossBets [].
+            winBets: netPnl > 0 ? [{ amount: netPnl }] : [],
+            lossBets: netPnl < 0 ? [{ amount: Math.abs(netPnl) }] : [],
           });
         }
 

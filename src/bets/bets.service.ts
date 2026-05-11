@@ -20,6 +20,12 @@ import { BetProcessingQueue } from './bet-processing.queue';
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
   private readonly MATCH_ODDS_BLOCKED_EVENTS_KEY = 'blocked_matchodds_event_ids';
+  /** @deprecated Legacy storage key — merged read with BET_ACCEPT_DELAY_OVERRIDES_KEY */
+  private readonly MATCH_ODDS_ACCEPT_DELAY_OVERRIDES_KEY = 'matchodds_accept_delay_overrides_sec';
+  /** Canonical key for per-event bet acceptance delay overrides (all bet types; see placeBet). */
+  private readonly BET_ACCEPT_DELAY_OVERRIDES_KEY = 'bet_accept_delay_overrides_sec';
+  /** Hard cap for fancy/bookmaker server-side delay (seconds). */
+  private readonly MAX_BET_ACCEPT_DELAY_SEC = 120;
   /** Max winning validation (Match Odds): reject if max(runner.net) exceeds this */
   private readonly MATCH_ODDS_MAX_WINNING = 500_000;
   /** Max winning validation (Fancy): reject if max(YES, NO) exceeds this */
@@ -60,6 +66,26 @@ export class BetsService {
       return new Set(parsed.map((v) => String(v).trim()).filter(Boolean));
     } catch {
       return new Set<string>();
+    }
+  }
+
+  private parseBetAcceptDelayOverrides(
+    rawValue: string | null | undefined,
+  ): Record<string, number> {
+    if (!rawValue) return {};
+    try {
+      const parsed = JSON.parse(rawValue);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        const eventId = String(k || '').trim();
+        const sec = Number(v);
+        if (!eventId || !Number.isFinite(sec) || sec <= 0) continue;
+        out[eventId] = sec;
+      }
+      return out;
+    } catch {
+      return {};
     }
   }
 
@@ -109,6 +135,82 @@ export class BetsService {
     });
     const blockedSet = this.parseBlockedMatchOddsEventIds(existing?.value);
     return Array.from(blockedSet);
+  }
+
+  async setMatchOddsAcceptDelayOverrideForEvent(eventId: string, delaySec: number | null) {
+    const normalizedEventId = String(eventId || '').trim();
+    if (!normalizedEventId) {
+      throw new BadRequestException('eventId is required');
+    }
+
+    const existing = await this.prisma.setting.findUnique({
+      where: { key: this.BET_ACCEPT_DELAY_OVERRIDES_KEY },
+      select: { value: true },
+    });
+
+    const overrides = this.parseBetAcceptDelayOverrides(existing?.value);
+    if (delaySec === null) {
+      delete overrides[normalizedEventId];
+    } else {
+      const normalizedDelay = Number(delaySec);
+      if (!Number.isFinite(normalizedDelay) || normalizedDelay <= 0) {
+        throw new BadRequestException('delaySec must be a positive number or null');
+      }
+      overrides[normalizedEventId] = normalizedDelay;
+    }
+
+    const value = JSON.stringify(overrides);
+    await this.prisma.setting.upsert({
+      where: { key: this.BET_ACCEPT_DELAY_OVERRIDES_KEY },
+      update: { value },
+      create: { key: this.BET_ACCEPT_DELAY_OVERRIDES_KEY, value },
+    });
+    // Mirror deprecated key so older tooling stays consistent.
+    await this.prisma.setting.upsert({
+      where: { key: this.MATCH_ODDS_ACCEPT_DELAY_OVERRIDES_KEY },
+      update: { value },
+      create: { key: this.MATCH_ODDS_ACCEPT_DELAY_OVERRIDES_KEY, value },
+    });
+
+    return {
+      eventId: normalizedEventId,
+      delaySec: delaySec === null ? null : overrides[normalizedEventId],
+      hasOverride: delaySec !== null,
+      totalOverrides: Object.keys(overrides).length,
+    };
+  }
+
+  async getMatchOddsAcceptDelayOverrides() {
+    return this.getBetAcceptDelayOverridesMerged();
+  }
+
+  /** Merged map: canonical key wins over legacy key on duplicate eventIds. */
+  private async getBetAcceptDelayOverridesMerged(): Promise<Record<string, number>> {
+    const [legacyRow, canonicalRow] = await Promise.all([
+      this.prisma.setting.findUnique({
+        where: { key: this.MATCH_ODDS_ACCEPT_DELAY_OVERRIDES_KEY },
+        select: { value: true },
+      }),
+      this.prisma.setting.findUnique({
+        where: { key: this.BET_ACCEPT_DELAY_OVERRIDES_KEY },
+        select: { value: true },
+      }),
+    ]);
+    const legacy = this.parseBetAcceptDelayOverrides(legacyRow?.value);
+    const canonical = this.parseBetAcceptDelayOverrides(canonicalRow?.value);
+    return { ...legacy, ...canonical };
+  }
+
+  private async getBetAcceptDelayOverrideSec(eventId: string | null | undefined): Promise<number | null> {
+    const normalizedEventId = String(eventId || '').trim();
+    if (!normalizedEventId) return null;
+    const overrides = await this.getBetAcceptDelayOverridesMerged();
+    const sec = Number(overrides[normalizedEventId]);
+    return Number.isFinite(sec) && sec > 0 ? sec : null;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -600,14 +702,18 @@ export class BetsService {
    */
   private async assertMatchOddsRateAgainstBetfair(params: {
     marketId: string;
+    eventId?: string | null;
     selectionId: number;
     betType: string;
     requestedDecimal: number;
   }): Promise<void> {
-    const { marketId, selectionId, betType, requestedDecimal } = params;
+    const { marketId, eventId, selectionId, betType, requestedDecimal } = params;
     const eps = 1e-4;
-    try {
-      const oddsPayload = await this.cricketIdService.getBetfairOdds(marketId, { skipCache: true });
+    const normalizedEventId = String(eventId || '').trim();
+    const overrideDelaySec = await this.getBetAcceptDelayOverrideSec(normalizedEventId);
+    const snapshotKey = this.redisService.getVendorKey('matchodds-rate-snapshot', String(marketId).trim());
+
+    const assertFromOddsPayload = (oddsPayload: any) => {
       const markets = this.unwrapBetfairOddsMarkets(oddsPayload);
       const mid = String(marketId).trim();
       const market = markets.find((m: any) => String(m?.marketId ?? '').trim() === mid);
@@ -645,7 +751,36 @@ export class BetsService {
           );
         }
       }
+    };
+
+    try {
+      const liveOddsPayload = await this.cricketIdService.getBetfairOdds(marketId, { skipCache: true });
+
+      if (overrideDelaySec) {
+        try {
+          await this.redisService.set(snapshotKey, liveOddsPayload, overrideDelaySec);
+        } catch {
+          // cache is optional, strict live validation still applies below
+        }
+      }
+
+      assertFromOddsPayload(liveOddsPayload);
     } catch (error) {
+      if (error instanceof HttpException && overrideDelaySec) {
+        const snap = await this.redisService.get<any>(snapshotKey);
+        if (snap) {
+          try {
+            assertFromOddsPayload(snap);
+            this.logger.debug(
+              `[matchodds_accept_delay_override] Accepted from snapshot eventId=${normalizedEventId || 'n/a'} marketId=${marketId} delaySec=${overrideDelaySec}`,
+            );
+            return;
+          } catch {
+            // keep original strict error below
+          }
+        }
+      }
+
       if (error instanceof HttpException) throw error;
       this.logger.error(
         `Match Odds rate validation failed: marketId=${marketId}, selectionId=${selectionId}, requested=${requestedDecimal}`,
@@ -913,9 +1048,28 @@ export class BetsService {
     if (betGtype === 'matchodds' && normalizedSelectionId > 0 && !isTiedMatchMarket) {
       await this.assertMatchOddsRateAgainstBetfair({
         marketId,
+        eventId: String(eventId || match_id || ''),
         selectionId: normalizedSelectionId,
         betType: bet_type,
         requestedDecimal: normalizedBetRate,
+      });
+    }
+
+    // Fancy / bookmaker: optional admin-configured per-event delay before wallet transaction only.
+    // Match Odds uses delay only as Redis snapshot TTL inside rate validation (no sleep here).
+    const delayEventKey = String(eventId ?? match_id ?? '').trim();
+    const acceptDelaySec = await this.getBetAcceptDelayOverrideSec(delayEventKey);
+    if (
+      acceptDelaySec !== null &&
+      acceptDelaySec > 0 &&
+      (betGtype === 'fancy' || betGtype === 'bookmaker')
+    ) {
+      const cappedSec = Math.min(acceptDelaySec, this.MAX_BET_ACCEPT_DELAY_SEC);
+      await this.sleep(cappedSec * 1000);
+      perfLog('bet_accept_delay_applied', {
+        eventId: delayEventKey,
+        delaySec: cappedSec,
+        betGtype,
       });
     }
 

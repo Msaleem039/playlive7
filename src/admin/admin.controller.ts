@@ -198,4 +198,61 @@ export class AdminController {
       eventIds,
     };
   }
+
+  /**
+   * PATCH /admin/matchodds/accept-delay/:eventId
+   * Per-event bet acceptance delay override (seconds). Applies to all bet types on that match:
+   * - Match Odds: snapshot TTL when live rate check fails (grace window; existing strict path unchanged).
+   * - Fancy / Bookmaker: waits up to delaySec (capped server-side) before wallet transaction when override is set.
+   * Matches without override behave exactly as before.
+   * - delaySec > 0 => enable override
+   * - delaySec = null => remove override (fallback to existing/default behavior)
+   */
+  @Patch('matchodds/accept-delay/:eventId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  async setMatchOddsAcceptDelay(
+    @Param('eventId') eventId: string,
+    @Body() body: { delaySec?: number | null },
+  ) {
+    const rawDelay = body?.delaySec;
+    const delaySec =
+      rawDelay === null || rawDelay === undefined
+        ? null
+        : Number(rawDelay);
+
+    if (delaySec !== null && (!Number.isFinite(delaySec) || delaySec <= 0)) {
+      return {
+        success: false,
+        message: 'delaySec must be a positive number or null',
+      };
+    }
+
+    const result = await this.betsService.setMatchOddsAcceptDelayOverrideForEvent(
+      eventId,
+      delaySec,
+    );
+    return {
+      success: true,
+      message:
+        delaySec === null
+          ? `Acceptance delay override removed for eventId ${result.eventId}`
+          : `Acceptance delay override set to ${result.delaySec}s for eventId ${result.eventId}`,
+      ...result,
+    };
+  }
+
+  /**
+   * GET /admin/matchodds/accept-delay
+   * List all per-event bet acceptance delay overrides (all bet types).
+   */
+  @Get('matchodds/accept-delay')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  async getMatchOddsAcceptDelayOverrides() {
+    const overrides = await this.betsService.getMatchOddsAcceptDelayOverrides();
+    return {
+      success: true,
+      total: Object.keys(overrides).length,
+      overrides,
+    };
+  }
 }

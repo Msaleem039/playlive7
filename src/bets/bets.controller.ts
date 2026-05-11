@@ -21,7 +21,7 @@ export class BetsController {
   constructor(private readonly betsService: BetsService) {}
 
   @Post()
-  //  @UseGuards(JwtAuthGuard, Playlive24OriginGuard)
+   @UseGuards(JwtAuthGuard, Playlive24OriginGuard)
   async placeBet(@Body() dto: PlaceBetDto) {
     try {
       return await this.betsService.placeBet(dto);
