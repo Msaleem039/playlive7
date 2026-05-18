@@ -34,34 +34,55 @@ async function bootstrap() {
   
   // CORS configuration - environment aware
   // ✅ Use Fastify CORS plugin for better compatibility with Fastify
-  const allowedOrigins = process.env.CORS_ORIGINS 
-    ? process.env.CORS_ORIGINS.split(',').map(origin => origin.trim())
+  const allowedOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
     : ['*'];
-  
+
   const isWildcard = allowedOrigins.includes('*');
-  
+
+  const isPlaylive24Host = (hostname: string) =>
+    hostname === 'playlive24.com' || hostname.endsWith('.playlive24.com');
+
   await app.register(cors, {
-    origin: isWildcard ? true : (origin, cb) => {
-      // Allow requests with no origin (like mobile apps or curl requests)
-      if (!origin) {
-        return cb(null, true);
-      }
-      // Check if origin is in allowed list
-      if (allowedOrigins.includes(origin)) {
-        return cb(null, true);
-      }
-      // For production, also allow subdomains
-      const originHost = new URL(origin).hostname;
-      const isAllowed = allowedOrigins.some(allowed => {
-        try {
-          const allowedHost = new URL(allowed).hostname;
-          return originHost === allowedHost || originHost.endsWith('.' + allowedHost);
-        } catch {
-          return false;
-        }
-      });
-      cb(null, isAllowed);
-    },
+    origin: isWildcard
+      ? true
+      : (origin, cb) => {
+          if (!origin) {
+            return cb(null, true);
+          }
+          if (allowedOrigins.includes(origin)) {
+            return cb(null, true);
+          }
+          try {
+            const originHost = new URL(origin).hostname.toLowerCase();
+            // Any *.playlive24.com frontend may call API subdomains (www, aws, api, …)
+            const allowsPlayliveFamily = allowedOrigins.some((allowed) => {
+              try {
+                const allowedHost = new URL(allowed).hostname.toLowerCase();
+                return isPlaylive24Host(allowedHost);
+              } catch {
+                return false;
+              }
+            });
+            if (allowsPlayliveFamily && isPlaylive24Host(originHost)) {
+              return cb(null, true);
+            }
+            const isAllowed = allowedOrigins.some((allowed) => {
+              try {
+                const allowedHost = new URL(allowed).hostname.toLowerCase();
+                return (
+                  originHost === allowedHost ||
+                  originHost.endsWith('.' + allowedHost)
+                );
+              } catch {
+                return false;
+              }
+            });
+            return cb(null, isAllowed);
+          } catch {
+            return cb(null, false);
+          }
+        },
     credentials: !isWildcard, // Can't use credentials with wildcard
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: [
