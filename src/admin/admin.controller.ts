@@ -138,30 +138,53 @@ export class AdminController {
   }
 
   /**
+   * GET /admin/matchodds/stop/:eventId
+   * Current block status for one match (same shape as PATCH response).
+   */
+  @Get('matchodds/stop/:eventId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getMatchOddsStopForEvent(@Param('eventId') eventId: string) {
+    const eventIds = await this.betsService.getBlockedMatchOddsEvents();
+    const normalizedEventId = String(eventId || '').trim();
+    const blocked = eventIds.includes(normalizedEventId);
+    return {
+      success: true,
+      totalBlockedEvents: eventIds.length,
+      ...this.matchOddsBlockDetail(normalizedEventId, blocked),
+    };
+  }
+
+  /**
+   * GET /admin/matchodds/stop
+   * All blocked match-odds events with per-event detail (same fields as PATCH).
+   */
+  @Get('matchodds/stop')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getStoppedMatchOddsEvents() {
+    const eventIds = await this.betsService.getBlockedMatchOddsEvents();
+    const items = eventIds.map((id) => this.matchOddsBlockDetail(id, true));
+    return {
+      success: true,
+      status: 'ACTIVE_BLOCKLIST',
+      total: eventIds.length,
+      totalBlockedEvents: eventIds.length,
+      eventIds,
+      items,
+    };
+  }
+
+  /**
    * PATCH /admin/matchodds/stop/:eventId
    * Stop/allow Match Odds betting for a specific match (all clients).
    * Body: { blocked: boolean }
    */
   @Patch('matchodds/stop/:eventId')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
   async setMatchOddsStopForEvent(
     @Param('eventId') eventId: string,
     @Body() body: { blocked?: boolean; status?: boolean | string },
   ) {
-    let blocked: boolean | null = null;
-    if (typeof body?.blocked === 'boolean') {
-      blocked = body.blocked;
-    } else if (typeof body?.status === 'boolean') {
-      blocked = body.status;
-    } else if (typeof body?.status === 'string') {
-      const normalized = body.status.trim().toLowerCase();
-      if (normalized === 'true' || normalized === 'stop' || normalized === 'stopped') {
-        blocked = true;
-      } else if (normalized === 'false' || normalized === 'allow' || normalized === 'allowed') {
-        blocked = false;
-      }
-    }
-
+    const blocked = this.parseBlockedBody(body);
     if (blocked === null) {
       return {
         success: false,
@@ -172,30 +195,71 @@ export class AdminController {
     const result = await this.betsService.setMatchOddsBlockedForEvent(eventId, blocked);
     return {
       success: true,
-      message: blocked
-        ? `Match Odds betting stopped for eventId ${result.eventId}`
-        : `Match Odds betting resumed for eventId ${result.eventId}`,
-      status: blocked ? 'STOPPED' : 'ALLOWED',
-      action: blocked ? 'STOP' : 'ALLOW',
-      isMatchOddsBlocked: blocked,
-      isMatchOddsAllowed: !blocked,
-      ...result,
+      ...this.matchOddsBlockDetail(result.eventId, blocked),
+      totalBlockedEvents: result.totalBlockedEvents,
     };
   }
 
   /**
-   * GET /admin/matchodds/stop
-   * Returns list of eventIds currently blocked for Match Odds.
+   * GET /admin/fancy/stop/:eventId
+   * Current block status for one match (same shape as PATCH response).
    */
-  @Get('matchodds/stop')
-  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
-  async getStoppedMatchOddsEvents() {
-    const eventIds = await this.betsService.getBlockedMatchOddsEvents();
+  @Get('fancy/stop/:eventId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getFancyStopForEvent(@Param('eventId') eventId: string) {
+    const eventIds = await this.betsService.getBlockedFancyEvents();
+    const normalizedEventId = String(eventId || '').trim();
+    const blocked = eventIds.includes(normalizedEventId);
+    return {
+      success: true,
+      totalBlockedEvents: eventIds.length,
+      ...this.fancyBlockDetail(normalizedEventId, blocked),
+    };
+  }
+
+  /**
+   * GET /admin/fancy/stop
+   * All blocked fancy events with per-event detail (same fields as PATCH).
+   */
+  @Get('fancy/stop')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async getStoppedFancyEvents() {
+    const eventIds = await this.betsService.getBlockedFancyEvents();
+    const items = eventIds.map((id) => this.fancyBlockDetail(id, true));
     return {
       success: true,
       status: 'ACTIVE_BLOCKLIST',
       total: eventIds.length,
+      totalBlockedEvents: eventIds.length,
       eventIds,
+      items,
+    };
+  }
+
+  /**
+   * PATCH /admin/fancy/stop/:eventId
+   * Stop/allow Fancy betting for a specific match (all clients).
+   * Body: { blocked: boolean } or { status: "STOPPED" | "ALLOWED" }
+   */
+  @Patch('fancy/stop/:eventId')
+  @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.AGENT)
+  async setFancyStopForEvent(
+    @Param('eventId') eventId: string,
+    @Body() body: { blocked?: boolean; status?: boolean | string },
+  ) {
+    const blocked = this.parseBlockedBody(body);
+    if (blocked === null) {
+      return {
+        success: false,
+        message: 'Provide blocked (boolean) or status ("true"/"false"/"STOPPED"/"ALLOWED")',
+      };
+    }
+
+    const result = await this.betsService.setFancyBlockedForEvent(eventId, blocked);
+    return {
+      success: true,
+      ...this.fancyBlockDetail(result.eventId, blocked),
+      totalBlockedEvents: result.totalBlockedEvents,
     };
   }
 
@@ -253,6 +317,56 @@ export class AdminController {
       success: true,
       total: Object.keys(overrides).length,
       overrides,
+    };
+  }
+
+  private parseBlockedBody(body: {
+    blocked?: boolean;
+    status?: boolean | string;
+  }): boolean | null {
+    if (typeof body?.blocked === 'boolean') {
+      return body.blocked;
+    }
+    if (typeof body?.status === 'boolean') {
+      return body.status;
+    }
+    if (typeof body?.status === 'string') {
+      const normalized = body.status.trim().toLowerCase();
+      if (normalized === 'true' || normalized === 'stop' || normalized === 'stopped') {
+        return true;
+      }
+      if (normalized === 'false' || normalized === 'allow' || normalized === 'allowed') {
+        return false;
+      }
+    }
+    return null;
+  }
+
+  private matchOddsBlockDetail(eventId: string, blocked: boolean) {
+    return {
+      message: blocked
+        ? `Match Odds betting stopped for eventId ${eventId}`
+        : `Match Odds betting allowed for eventId ${eventId}`,
+      status: blocked ? ('STOPPED' as const) : ('ALLOWED' as const),
+      action: blocked ? ('STOP' as const) : ('ALLOW' as const),
+      isMatchOddsBlocked: blocked,
+      isMatchOddsAllowed: !blocked,
+      eventId,
+      blocked,
+    };
+  }
+
+  private fancyBlockDetail(eventId: string, blocked: boolean) {
+    return {
+      message: blocked
+        ? `Fancy betting stopped for eventId ${eventId}`
+        : `Fancy betting allowed for eventId ${eventId}`,
+      status: blocked ? ('STOPPED' as const) : ('ALLOWED' as const),
+      action: blocked ? ('STOP' as const) : ('ALLOW' as const),
+      isFancyBlocked: blocked,
+      isFancyAllowed: !blocked,
+      eventId,
+      blocked,
     };
   }
 }

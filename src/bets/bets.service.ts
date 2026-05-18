@@ -20,6 +20,7 @@ import { BetProcessingQueue } from './bet-processing.queue';
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
   private readonly MATCH_ODDS_BLOCKED_EVENTS_KEY = 'blocked_matchodds_event_ids';
+  private readonly FANCY_BLOCKED_EVENTS_KEY = 'blocked_fancy_event_ids';
   /** @deprecated Legacy storage key — merged read with BET_ACCEPT_DELAY_OVERRIDES_KEY */
   private readonly MATCH_ODDS_ACCEPT_DELAY_OVERRIDES_KEY = 'matchodds_accept_delay_overrides_sec';
   /** Canonical key for per-event bet acceptance delay overrides (all bet types; see placeBet). */
@@ -58,7 +59,7 @@ export class BetsService {
     return odds;
   }
 
-  private parseBlockedMatchOddsEventIds(rawValue: string | null | undefined): Set<string> {
+  private parseBlockedEventIds(rawValue: string | null | undefined): Set<string> {
     if (!rawValue) return new Set<string>();
     try {
       const parsed = JSON.parse(rawValue);
@@ -110,7 +111,7 @@ export class BetsService {
       select: { value: true },
     });
 
-    const blockedSet = this.parseBlockedMatchOddsEventIds(existing?.value);
+    const blockedSet = this.parseBlockedEventIds(existing?.value);
     if (blocked) blockedSet.add(normalizedEventId);
     else blockedSet.delete(normalizedEventId);
 
@@ -133,7 +134,45 @@ export class BetsService {
       where: { key: this.MATCH_ODDS_BLOCKED_EVENTS_KEY },
       select: { value: true },
     });
-    const blockedSet = this.parseBlockedMatchOddsEventIds(existing?.value);
+    const blockedSet = this.parseBlockedEventIds(existing?.value);
+    return Array.from(blockedSet);
+  }
+
+  async setFancyBlockedForEvent(eventId: string, blocked: boolean) {
+    const normalizedEventId = String(eventId || '').trim();
+    if (!normalizedEventId) {
+      throw new BadRequestException('eventId is required');
+    }
+
+    const existing = await this.prisma.setting.findUnique({
+      where: { key: this.FANCY_BLOCKED_EVENTS_KEY },
+      select: { value: true },
+    });
+
+    const blockedSet = this.parseBlockedEventIds(existing?.value);
+    if (blocked) blockedSet.add(normalizedEventId);
+    else blockedSet.delete(normalizedEventId);
+
+    const value = JSON.stringify(Array.from(blockedSet));
+    await this.prisma.setting.upsert({
+      where: { key: this.FANCY_BLOCKED_EVENTS_KEY },
+      update: { value },
+      create: { key: this.FANCY_BLOCKED_EVENTS_KEY, value },
+    });
+
+    return {
+      eventId: normalizedEventId,
+      blocked,
+      totalBlockedEvents: blockedSet.size,
+    };
+  }
+
+  async getBlockedFancyEvents() {
+    const existing = await this.prisma.setting.findUnique({
+      where: { key: this.FANCY_BLOCKED_EVENTS_KEY },
+      select: { value: true },
+    });
+    const blockedSet = this.parseBlockedEventIds(existing?.value);
     return Array.from(blockedSet);
   }
 
@@ -898,18 +937,28 @@ export class BetsService {
       actualMarketType = 'matchodds';
     }
 
-    if (actualMarketType === 'matchodds') {
-      const normalizedEventId = String(eventId || match_id || '').trim();
-      if (normalizedEventId) {
-        const blockedEventIds = await this.getBlockedMatchOddsEvents();
-        if (blockedEventIds.includes(normalizedEventId)) {
-          throw new BadRequestException({
-            success: false,
-            error: 'rate not matched or rate is not available.',
-            code: 'RATE_NOT_MATCHED_OR_NOT_AVAILABLE',
-            eventId: normalizedEventId,
-          });
-        }
+    const normalizedEventId = String(eventId || match_id || '').trim();
+    if (actualMarketType === 'matchodds' && normalizedEventId) {
+      const blockedEventIds = await this.getBlockedMatchOddsEvents();
+      if (blockedEventIds.includes(normalizedEventId)) {
+        throw new BadRequestException({
+          success: false,
+          error: 'rate not matched or rate is not available.',
+          code: 'RATE_NOT_MATCHED_OR_NOT_AVAILABLE',
+          eventId: normalizedEventId,
+        });
+      }
+    }
+
+    if (actualMarketType === 'fancy' && normalizedEventId) {
+      const blockedFancyEventIds = await this.getBlockedFancyEvents();
+      if (blockedFancyEventIds.includes(normalizedEventId)) {
+        throw new BadRequestException({
+          success: false,
+          error: 'rate not matched or rate is not available.',
+          code: 'RATE_NOT_MATCHED_OR_NOT_AVAILABLE',
+          eventId: normalizedEventId,
+        });
       }
     }
 

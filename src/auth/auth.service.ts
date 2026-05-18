@@ -19,6 +19,8 @@ import { ChangePasswordDto } from './dto/change-password.dto';
 import { UpdateClientDto } from './dto/update-client.dto';
 import { UserRole, BetStatus, TransferLogType, type User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { signAccessToken } from './auth-token.util';
+import { JwtAuthUser } from './types/jwt-payload.interface';
 
 @Injectable()
 export class AuthService {
@@ -76,9 +78,13 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Generate JWT token with username included
-    const payload = { sub: user.id, username: user.username, role: user.role };
-    const accessToken = this.jwtService.sign(payload);
+    const accessToken = signAccessToken(this.jwtService, {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      name: user.name,
+      isActive: user.isActive,
+    });
 
     // Fetch wallet balance instead of relying on User.balance
     const wallet = await this.prisma.wallet.findUnique({
@@ -103,7 +109,7 @@ export class AuthService {
    * Super Admin only: issue a JWT as the target user (Agent or Client) for support / debugging.
    * Password is never read or returned. Token payload includes `impersonatedBy` (super admin id).
    */
-  async loginAsUser(superAdmin: User, targetUserId: string) {
+  async loginAsUser(superAdmin: JwtAuthUser, targetUserId: string) {
     if (superAdmin.role !== UserRole.SUPER_ADMIN) {
       throw new ForbiddenException('Only Super Admin can impersonate users');
     }
@@ -127,13 +133,14 @@ export class AuthService {
       throw new ForbiddenException('Cannot impersonate an inactive user');
     }
 
-    const payload = {
-      sub: target.id,
+    const accessToken = signAccessToken(this.jwtService, {
+      id: target.id,
       username: target.username,
       role: target.role,
+      name: target.name,
+      isActive: target.isActive,
       impersonatedBy: superAdmin.id,
-    };
-    const accessToken = this.jwtService.sign(payload);
+    });
 
     this.logger.warn(
       `Impersonation token issued: superAdminId=${superAdmin.id} → targetUserId=${target.id} role=${target.role}`,
@@ -160,7 +167,7 @@ export class AuthService {
   }
 
   async changePassword(
-    currentUser: User,
+    currentUser: JwtAuthUser,
     changePasswordDto: ChangePasswordDto
   ): Promise<{ message: string }> {
     const { password, confirmPassword } = changePasswordDto;
@@ -383,9 +390,13 @@ export class AuthService {
 
       // User created successfully - removed console.log to avoid exposing user details
 
-      // Generate JWT token with username included
-      const payload = { sub: user.id, username: user.username, role: user.role };
-      const accessToken = this.jwtService.sign(payload);
+      const accessToken = signAccessToken(this.jwtService, {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        name: user.name,
+        isActive: user.isActive,
+      });
 
       // Fetch the wallet that was created by usersService.create()
       // SETTLEMENT_ADMIN does not have a wallet

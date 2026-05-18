@@ -2,18 +2,16 @@ import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
-import { UsersService } from '../users/users.service';
+import { UserRole } from '@prisma/client';
+import { JwtAuthUser, JwtPayload } from './types/jwt-payload.interface';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   private readonly logger = new Logger(JwtStrategy.name);
 
-  constructor(
-    private configService: ConfigService,
-    private usersService: UsersService,
-  ) {
+  constructor(configService: ConfigService) {
     const jwtSecret = configService.get<string>('JWT_SECRET');
-    
+
     if (!jwtSecret) {
       const errorMsg = 'JWT_SECRET is not set in environment variables';
       Logger.error(errorMsg, 'JwtStrategy');
@@ -27,94 +25,58 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(payload: any) {
-    // Validate payload structure
-    if (!payload || !payload.sub) {
-      this.logger.warn('JWT payload missing required fields (sub)');
+  /**
+   * Stateless validation: trust signed JWT claims only (no DB query).
+   * Security: disabled users are rejected; role/isActive changes apply after re-login or token expiry.
+   * placeBet and other sensitive paths still re-check isActive/bettingEnabled in the database.
+   */
+  validate(payload: JwtPayload): JwtAuthUser {
+    if (!payload?.sub) {
+      this.logger.warn('JWT payload missing required field: sub');
       throw new UnauthorizedException('Invalid token: missing user identifier');
     }
 
-    // Check if token is expired (should be caught by passport-jwt, but double-check)
     if (payload.exp && payload.exp * 1000 < Date.now()) {
-      this.logger.warn(`JWT token expired for user ${payload.sub} (exp: ${new Date(payload.exp * 1000).toISOString()})`);
+      this.logger.warn(
+        `JWT token expired for user ${payload.sub} (exp: ${new Date(payload.exp * 1000).toISOString()})`,
+      );
       throw new UnauthorizedException('Token expired');
     }
 
-    try {
-      const user = await this.usersService.findById(payload.sub);
-      
-      if (!user) {
-        // Log user not found with context (safe to log user ID in this case)
-        this.logger.warn(`User not found for JWT payload sub: ${payload.sub}`);
-        throw new UnauthorizedException('Invalid token: user not found');
-      }
-
-      if (!user.isActive) {
-        this.logger.warn(`JWT rejected: inactive user ${payload.sub}`);
-        throw new UnauthorizedException('Unauthorized');
-      }
-
-      // Log successful validation in debug mode only
-      if (process.env.NODE_ENV === 'development') {
-        this.logger.debug(`JWT validated successfully for user: ${user.username} (${user.id})`);
-      }
-
-      const impersonatedBy =
-        typeof payload.impersonatedBy === 'string' && payload.impersonatedBy.length > 0
-          ? payload.impersonatedBy
-          : undefined;
-
-      if (impersonatedBy) {
-        return { ...user, impersonatedBy };
-      }
-
-      return user;
-    } catch (error) {
-      // If it's already an UnauthorizedException, re-throw it
-      if (error instanceof UnauthorizedException) {
-        throw error;
-      }
-
-      // Handle database errors
-      if (error instanceof Error) {
-        const errorMessage = error.message.toLowerCase();
-        
-        // Database connection errors
-        if (
-          errorMessage.includes("can't reach database") ||
-          errorMessage.includes('p1001') ||
-          errorMessage.includes('p2021') ||
-          errorMessage.includes('connection') ||
-          errorMessage.includes('timeout')
-        ) {
-          this.logger.error(`Database error during JWT validation for user ${payload.sub}: ${error.message}`);
-          
-          // In production, fail fast on database errors
-          if (process.env.NODE_ENV === 'production') {
-            throw new UnauthorizedException('Authentication service unavailable');
-          }
-          
-          // In development, allow fallback (but log warning)
-          this.logger.warn('Database unavailable - using payload data (development mode only)');
-          return {
-            id: payload.sub,
-            role: payload.role || 'USER',
-            name: 'Development User',
-            username: payload.username || 'dev',
-            email: null,
-            password: '',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-            ...(typeof payload.impersonatedBy === 'string'
-              ? { impersonatedBy: payload.impersonatedBy }
-              : {}),
-          };
-        }
-      }
-
-      // Unknown error - log and throw generic error
-      this.logger.error(`Unexpected error in JWT validation for user ${payload.sub}:`, error);
-      throw new UnauthorizedException('Invalid token: validation failed');
+    const username = String(payload.username || '').trim();
+    if (!username) {
+      throw new UnauthorizedException('Invalid token: missing username');
     }
+
+    const role = payload.role;
+    if (!role || !Object.values(UserRole).includes(role)) {
+      throw new UnauthorizedException('Invalid token: missing or invalid role');
+    }
+
+    // Explicit false only — legacy tokens without isActive still work until they expire
+    if (payload.isActive === false) {
+      this.logger.warn(`JWT rejected: inactive user ${payload.sub}`);
+      throw new UnauthorizedException('Unauthorized');
+    }
+
+    const impersonatedBy =
+      typeof payload.impersonatedBy === 'string' && payload.impersonatedBy.length > 0
+        ? payload.impersonatedBy
+        : undefined;
+
+    const user: JwtAuthUser = {
+      id: payload.sub,
+      username,
+      role,
+      name: String(payload.name || username).trim() || username,
+      isActive: payload.isActive ?? true,
+      ...(impersonatedBy ? { impersonatedBy } : {}),
+    };
+
+    if (process.env.NODE_ENV === 'development') {
+      this.logger.debug(`JWT validated (stateless) for user: ${user.username} (${user.id})`);
+    }
+
+    return user;
   }
 }

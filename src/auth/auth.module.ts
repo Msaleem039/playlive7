@@ -38,10 +38,12 @@ import { SettlementModule } from '../settlement/settlement.module';
           }
         }
 
+        const expiresIn = configService.get<string>('JWT_EXPIRES_IN') || '4h';
+
         return {
           secret: jwtSecret || 'your-super-secret-jwt-key-change-this-in-production-12345',
           signOptions: {
-            expiresIn: '7d',
+            expiresIn,
           },
         };
       },
