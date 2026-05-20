@@ -265,12 +265,11 @@ export class AdminController {
 
   /**
    * PATCH /admin/matchodds/accept-delay/:eventId
-   * Per-event bet acceptance delay override (seconds). Applies to all bet types on that match:
-   * - Match Odds: snapshot TTL when live rate check fails (grace window; existing strict path unchanged).
-   * - Fancy / Bookmaker: waits up to delaySec (capped server-side) before wallet transaction when override is set.
-   * Matches without override behave exactly as before.
-   * - delaySec > 0 => enable override
-   * - delaySec = null => remove override (fallback to existing/default behavior)
+   * Per-event Match Odds acceptance delay (seconds) only.
+   * Body: { "delaySec": 15 } — Match Odds bets for this event wait up to delaySec (capped) after live
+   * rate validation before the wallet transaction. Also used as Redis snapshot TTL when strict
+   * live odds fail but a just-fetched snapshot is acceptable.
+   * Body: { "delaySec": null } — remove override for this eventId.
    */
   @Patch('matchodds/accept-delay/:eventId')
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)
@@ -278,7 +277,15 @@ export class AdminController {
     @Param('eventId') eventId: string,
     @Body() body: { delaySec?: number | null },
   ) {
-    const rawDelay = body?.delaySec;
+    if (body == null || typeof body !== 'object' || !('delaySec' in body)) {
+      return {
+        success: false,
+        message:
+          'Body must include delaySec. Use a positive number of seconds, or null to remove. Example: {"delaySec":15}',
+      };
+    }
+
+    const rawDelay = body.delaySec;
     const delaySec =
       rawDelay === null || rawDelay === undefined
         ? null
@@ -307,7 +314,7 @@ export class AdminController {
 
   /**
    * GET /admin/matchodds/accept-delay
-   * List all per-event bet acceptance delay overrides (all bet types).
+   * List all per-event Match Odds acceptance delay overrides (seconds).
    */
   @Get('matchodds/accept-delay')
   @Roles(UserRole.SUPER_ADMIN, UserRole.ADMIN)

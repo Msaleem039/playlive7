@@ -248,13 +248,25 @@ export class BetsService {
     return Number.isFinite(sec) && sec > 0 ? sec : null;
   }
 
-  private sleep(ms: number): Promise<void> {
+  /** Same event key as admin PATCH /admin/matchodds/accept-delay/:eventId (prefer explicit eventId). */
+  private normalizeEventIdForAcceptDelay(
+    eventId?: string | null,
+    matchId?: number | string | null,
+  ): string {
+    const e = eventId != null ? String(eventId).trim() : '';
+    if (e) return e;
+    if (matchId === undefined || matchId === null) return '';
+    const m = String(matchId).trim();
+    return m === '' || m === 'undefined' || m === 'null' ? '' : m;
+  }
+
+  private sleepMs(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
    * ✅ EXCHANGE-ACCURATE LIABILITY CALCULATION
-   * 
+   *
    * Official Exchange Rules:
    * - FANCY: liability = stake (for both BACK and LAY)
    * - MATCH ODDS & BOOKMAKER (decimal odds for match odds; bookmaker uses stored rate as today):
@@ -937,7 +949,7 @@ export class BetsService {
       actualMarketType = 'matchodds';
     }
 
-    const normalizedEventId = String(eventId || match_id || '').trim();
+    const normalizedEventId = this.normalizeEventIdForAcceptDelay(eventId, match_id);
     if (actualMarketType === 'matchodds' && normalizedEventId) {
       const blockedEventIds = await this.getBlockedMatchOddsEvents();
       if (blockedEventIds.includes(normalizedEventId)) {
@@ -1097,29 +1109,25 @@ export class BetsService {
     if (betGtype === 'matchodds' && normalizedSelectionId > 0 && !isTiedMatchMarket) {
       await this.assertMatchOddsRateAgainstBetfair({
         marketId,
-        eventId: String(eventId || match_id || ''),
+        eventId: normalizedEventId,
         selectionId: normalizedSelectionId,
         betType: bet_type,
         requestedDecimal: normalizedBetRate,
       });
     }
 
-    // Fancy / bookmaker: optional admin-configured per-event delay before wallet transaction only.
-    // Match Odds uses delay only as Redis snapshot TTL inside rate validation (no sleep here).
-    const delayEventKey = String(eventId ?? match_id ?? '').trim();
-    const acceptDelaySec = await this.getBetAcceptDelayOverrideSec(delayEventKey);
-    if (
-      acceptDelaySec !== null &&
-      acceptDelaySec > 0 &&
-      (betGtype === 'fancy' || betGtype === 'bookmaker')
-    ) {
-      const cappedSec = Math.min(acceptDelaySec, this.MAX_BET_ACCEPT_DELAY_SEC);
-      await this.sleep(cappedSec * 1000);
-      perfLog('bet_accept_delay_applied', {
-        eventId: delayEventKey,
-        delaySec: cappedSec,
-        betGtype,
-      });
+    // Match Odds: when admin sets accept-delay for this eventId, wait before wallet transaction
+    // (after rate validation). Also used inside assertMatchOddsRateAgainstBetfair as Redis snapshot TTL.
+    if (betGtype === 'matchodds' && normalizedEventId) {
+      const acceptDelaySec = await this.getBetAcceptDelayOverrideSec(normalizedEventId);
+      if (acceptDelaySec !== null && acceptDelaySec > 0) {
+        const cappedSec = Math.min(acceptDelaySec, this.MAX_BET_ACCEPT_DELAY_SEC);
+        await this.sleepMs(cappedSec * 1000);
+        perfLog('matchodds_accept_delay_wait', {
+          eventId: normalizedEventId,
+          delaySec: cappedSec,
+        });
+      }
     }
 
     try {
